@@ -143,6 +143,7 @@ fn main() {
 
         // Struct bindings tests
         test_with_js_context(structs::test_struct_bindings).await;
+        test_with_js_context(structs::test_struct_typed_bindings).await;
 
         // Clamped type tests
         test_with_js_context(clamped::test_clamped_is_uint8clampedarray).await;

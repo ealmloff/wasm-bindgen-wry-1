@@ -26,6 +26,23 @@ fn clippy_allows() -> TokenStream {
     }
 }
 
+fn export_signature_generator(
+    param_encoders: Vec<TokenStream>,
+    return_encoder: TokenStream,
+    krate: &TokenStream,
+) -> TokenStream {
+    let param_count = param_encoders.len();
+    quote! {
+        || {
+            let mut buf = #krate::alloc::vec::Vec::new();
+            buf.push(#param_count as u8);
+            #(#param_encoders)*
+            #return_encoder
+            buf
+        }
+    }
+}
+
 /// Generate code for the entire program
 pub fn generate(program: &Program) -> syn::Result<TokenStream> {
     let mut tokens = TokenStream::new();
@@ -1194,6 +1211,29 @@ fn generate_field_accessor(
     let struct_name_str = struct_name.to_string();
     let getter_name = format!("{struct_name_str}::{js_field_name}_get");
     let setter_name = format!("{struct_name_str}::{js_field_name}_set");
+    let getter_signature = export_signature_generator(
+        vec![quote_spanned! {span=>
+            <#krate::object_store::ObjectHandle as #krate::EncodeTypeDef>::encode_type_def(&mut buf);
+        }],
+        quote_spanned! {span=>
+            <#field_ty as #krate::EncodeTypeDef>::encode_type_def(&mut buf);
+        },
+        krate,
+    );
+    let setter_signature = export_signature_generator(
+        vec![
+            quote_spanned! {span=>
+                <#krate::object_store::ObjectHandle as #krate::EncodeTypeDef>::encode_type_def(&mut buf);
+            },
+            quote_spanned! {span=>
+                <#field_ty as #krate::EncodeTypeDef>::encode_type_def(&mut buf);
+            },
+        ],
+        quote_spanned! {span=>
+            <() as #krate::EncodeTypeDef>::encode_type_def(&mut buf);
+        },
+        krate,
+    );
 
     // Generate getter
     let getter_body = if field.getter_with_clone {
@@ -1269,7 +1309,8 @@ fn generate_field_accessor(
                 #js_field_name,
                 #getter_name,
                 0,
-                #krate::JsClassMemberKind::Getter
+                #krate::JsClassMemberKind::Getter,
+                #getter_signature
             );
 
             #krate::inventory::submit! {
@@ -1288,7 +1329,8 @@ fn generate_field_accessor(
                     #js_field_name,
                     #setter_name,
                     1,
-                    #krate::JsClassMemberKind::Setter
+                    #krate::JsClassMemberKind::Setter,
+                    #setter_signature
                 );
 
                 #krate::inventory::submit! {
@@ -1334,6 +1376,15 @@ fn generate_inspectable(
     let struct_name_str = struct_name.to_string();
 
     let js_name_str = js_name.to_string();
+    let method_signature = export_signature_generator(
+        vec![quote_spanned! {span=>
+            <#krate::object_store::ObjectHandle as #krate::EncodeTypeDef>::encode_type_def(&mut buf);
+        }],
+        quote_spanned! {span=>
+            <::alloc::string::String as #krate::EncodeTypeDef>::encode_type_def(&mut buf);
+        },
+        krate,
+    );
 
     Ok(quote_spanned! {span=>
         const _: () = {
@@ -1372,7 +1423,8 @@ fn generate_inspectable(
                 "toJSON",
                 #to_json_name,
                 0,
-                #krate::JsClassMemberKind::Method
+                #krate::JsClassMemberKind::Method,
+                #method_signature
             );
 
             #krate::inventory::submit! {
@@ -1408,7 +1460,8 @@ fn generate_inspectable(
                 "toString",
                 #to_string_name,
                 0,
-                #krate::JsClassMemberKind::Method
+                #krate::JsClassMemberKind::Method,
+                #method_signature
             );
 
             #krate::inventory::submit! {
@@ -1646,6 +1699,92 @@ fn generate_export_method(method: &ExportMethod, krate: &TokenStream) -> syn::Re
         ),
     };
 
+    let export_signature = match &method.kind {
+        ExportMethodKind::Constructor => export_signature_generator(
+            arg_types
+                .iter()
+                .map(|ty| {
+                    quote_spanned! {span=>
+                        <#ty as #krate::EncodeTypeDef>::encode_type_def(&mut buf);
+                    }
+                })
+                .collect(),
+            quote_spanned! {span=>
+                <#krate::object_store::ObjectHandle as #krate::EncodeTypeDef>::encode_type_def(&mut buf);
+            },
+            krate,
+        ),
+        ExportMethodKind::Method { .. } => {
+            let mut params = vec![quote_spanned! {span=>
+                <#krate::object_store::ObjectHandle as #krate::EncodeTypeDef>::encode_type_def(&mut buf);
+            }];
+            params.extend(arg_types.iter().map(|ty| {
+                quote_spanned! {span=>
+                    <#ty as #krate::EncodeTypeDef>::encode_type_def(&mut buf);
+                }
+            }));
+            let return_encoder = if let Some(ret_ty) = &method.ret {
+                quote_spanned! {span=>
+                    <#ret_ty as #krate::EncodeTypeDef>::encode_type_def(&mut buf);
+                }
+            } else {
+                quote_spanned! {span=>
+                    <() as #krate::EncodeTypeDef>::encode_type_def(&mut buf);
+                }
+            };
+            export_signature_generator(params, return_encoder, krate)
+        }
+        ExportMethodKind::StaticMethod => {
+            let params = arg_types
+                .iter()
+                .map(|ty| {
+                    quote_spanned! {span=>
+                        <#ty as #krate::EncodeTypeDef>::encode_type_def(&mut buf);
+                    }
+                })
+                .collect();
+            let return_encoder = if let Some(ret_ty) = &method.ret {
+                quote_spanned! {span=>
+                    <#ret_ty as #krate::EncodeTypeDef>::encode_type_def(&mut buf);
+                }
+            } else {
+                quote_spanned! {span=>
+                    <() as #krate::EncodeTypeDef>::encode_type_def(&mut buf);
+                }
+            };
+            export_signature_generator(params, return_encoder, krate)
+        }
+        ExportMethodKind::Getter { .. } => export_signature_generator(
+            vec![quote_spanned! {span=>
+                <#krate::object_store::ObjectHandle as #krate::EncodeTypeDef>::encode_type_def(&mut buf);
+            }],
+            {
+                let ret_ty = method.ret.as_ref().unwrap();
+                quote_spanned! {span=>
+                    <#ret_ty as #krate::EncodeTypeDef>::encode_type_def(&mut buf);
+                }
+            },
+            krate,
+        ),
+        ExportMethodKind::Setter { .. } => export_signature_generator(
+            vec![
+                quote_spanned! {span=>
+                    <#krate::object_store::ObjectHandle as #krate::EncodeTypeDef>::encode_type_def(&mut buf);
+                },
+                {
+                    let arg_ty = method.arguments.first().map(|a| &a.ty).unwrap();
+                    quote_spanned! {span=>
+                        <#arg_ty as #krate::EncodeTypeDef>::encode_type_def(&mut buf);
+                    }
+                },
+            ],
+            quote_spanned! {span=>
+                <() as #krate::EncodeTypeDef>::encode_type_def(&mut buf);
+            },
+            krate,
+        ),
+    };
+
     let js_class_member_spec = quote_spanned! {span=>
         const _: () = {
             #[allow(non_upper_case_globals)]
@@ -1654,7 +1793,8 @@ fn generate_export_method(method: &ExportMethod, krate: &TokenStream) -> syn::Re
                 #member_name,
                 #export_name,
                 #arg_count,
-                #member_kind
+                #member_kind,
+                #export_signature
             );
 
             #krate::inventory::submit! {

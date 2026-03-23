@@ -133,6 +133,10 @@ pub struct JsClassMemberSpec {
     arg_count: usize,
     /// Type of member
     kind: JsClassMemberKind,
+    /// Binary signature bytes for the underlying export call.
+    ///
+    /// Format: [param_count: u8] [param TypeDefs...] [return TypeDef]
+    signature_bytes: fn() -> Vec<u8>,
 }
 
 impl JsClassMemberSpec {
@@ -142,6 +146,7 @@ impl JsClassMemberSpec {
         export_name: &'static str,
         arg_count: usize,
         kind: JsClassMemberKind,
+        signature_bytes: fn() -> Vec<u8>,
     ) -> Self {
         Self {
             class_name,
@@ -149,6 +154,7 @@ impl JsClassMemberSpec {
             export_name,
             arg_count,
             kind,
+            signature_bytes,
         }
     }
 
@@ -175,6 +181,11 @@ impl JsClassMemberSpec {
     /// Get the type of member
     pub const fn kind(&self) -> JsClassMemberKind {
         self.kind
+    }
+
+    /// Get the encoded binary signature for this export.
+    pub fn signature_bytes(&self) -> Vec<u8> {
+        (self.signature_bytes)()
     }
 }
 
@@ -222,6 +233,15 @@ fn generate_args(count: usize) -> String {
         .map(|i| format!("a{i}"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn format_export_signature(signature_bytes: &[u8]) -> String {
+    let signature = signature_bytes
+        .iter()
+        .map(|byte| byte.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("window.__wryParseExportSignature([{signature}])")
 }
 
 impl FunctionRegistry {
@@ -324,12 +344,14 @@ impl FunctionRegistry {
                         } else {
                             "this.__handle".to_string()
                         };
+                        let signature = format_export_signature(&member.signature_bytes());
                         writeln!(
                             &mut script,
-                            r#"    {}({}) {{ return window.__wryCallExport("{}", {}); }}"#,
+                            r#"    {}({}) {{ return window.__wryCallTypedExport("{}", {}, {}); }}"#,
                             member.member_name(),
                             args,
                             member.export_name(),
+                            signature,
                             args_with_handle
                         )
                         .unwrap();
@@ -355,27 +377,40 @@ impl FunctionRegistry {
                 let setter = setters.get(prop_name);
                 match (getter, setter) {
                     (Some(g), Some(s)) => {
+                        let getter_signature = format_export_signature(&g.signature_bytes());
+                        let setter_signature = format_export_signature(&s.signature_bytes());
                         writeln!(
                             &mut script,
-                            r#"    get {}() {{ return window.__wryCallExport("{}", this.__handle); }}
-    set {}(v) {{ window.__wryCallExport("{}", this.__handle, v); }}"#,
-                            prop_name, g.export_name(), prop_name, s.export_name()
+                            r#"    get {}() {{ return window.__wryCallTypedExport("{}", {}, this.__handle); }}
+    set {}(v) {{ window.__wryCallTypedExport("{}", {}, this.__handle, v); }}"#,
+                            prop_name,
+                            g.export_name(),
+                            getter_signature,
+                            prop_name,
+                            s.export_name(),
+                            setter_signature
                         )
                         .unwrap();
                     }
                     (Some(g), None) => {
+                        let getter_signature = format_export_signature(&g.signature_bytes());
                         writeln!(
                             &mut script,
-                            r#"    get {}() {{ return window.__wryCallExport("{}", this.__handle); }}"#,
-                            prop_name, g.export_name()
+                            r#"    get {}() {{ return window.__wryCallTypedExport("{}", {}, this.__handle); }}"#,
+                            prop_name,
+                            g.export_name(),
+                            getter_signature
                         )
                         .unwrap();
                     }
                     (None, Some(s)) => {
+                        let setter_signature = format_export_signature(&s.signature_bytes());
                         writeln!(
                             &mut script,
-                            r#"    set {}(v) {{ window.__wryCallExport("{}", this.__handle, v); }}"#,
-                            prop_name, s.export_name()
+                            r#"    set {}(v) {{ window.__wryCallTypedExport("{}", {}, this.__handle, v); }}"#,
+                            prop_name,
+                            s.export_name(),
+                            setter_signature
                         )
                         .unwrap();
                     }
@@ -392,13 +427,15 @@ impl FunctionRegistry {
                     JsClassMemberKind::Constructor => {
                         let args = generate_args(member.arg_count());
                         let args_call = if member.arg_count() > 0 { &args } else { "" };
+                        let signature = format_export_signature(&member.signature_bytes());
                         writeln!(
                             &mut script,
-                            r#"  {class_name}.{method_name} = function({args}) {{ const handle = window.__wryCallExport("{export_name}", {args_call}); return {class_name}.__wrap(handle); }};"#,
+                            r#"  {class_name}.{method_name} = function({args}) {{ const handle = window.__wryCallTypedExport("{export_name}", {signature}, {args_call}); return {class_name}.__wrap(handle); }};"#,
                             class_name = class_name,
                             method_name = member.member_name(),
                             args = args,
                             export_name = member.export_name(),
+                            signature = signature,
                             args_call = args_call
                         )
                         .unwrap();
@@ -406,13 +443,15 @@ impl FunctionRegistry {
                     JsClassMemberKind::StaticMethod => {
                         let args = generate_args(member.arg_count());
                         let args_call = if member.arg_count() > 0 { &args } else { "" };
+                        let signature = format_export_signature(&member.signature_bytes());
                         writeln!(
                             &mut script,
-                            r#"  {class_name}.{method_name} = function({args}) {{ return window.__wryCallExport("{export_name}", {args_call}); }};"#,
+                            r#"  {class_name}.{method_name} = function({args}) {{ return window.__wryCallTypedExport("{export_name}", {signature}, {args_call}); }};"#,
                             class_name = class_name,
                             method_name = member.member_name(),
                             args = args,
                             export_name = member.export_name(),
+                            signature = signature,
                             args_call = args_call
                         )
                         .unwrap();
