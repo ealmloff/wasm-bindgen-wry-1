@@ -8,10 +8,18 @@ use wasm_bindgen::wasm_bindgen;
 ///   panicked at batch.rs:415: Failed to decode return value: U8BufferEmpty
 ///   data.is_empty()=true, fn_id=1297, is_batching=false, needs_flush=false
 ///
-/// Root cause: When Closure callbacks are triggered by browser event dispatch
-/// (setTimeout, scroll, resize, etc.), the timing between evaluate_script
-/// and callback XHRs in the protocol handler causes response data to go
-/// missing. Synchronous JS callbacks (for loops) do NOT trigger this.
+/// Root cause: when Closure callbacks are triggered by browser event dispatch
+/// (setTimeout, scroll, resize, etc.), the timing between evaluate_script and
+/// callback XHRs in the protocol handler causes response data to go missing.
+/// Synchronous JS callbacks (for loops) do NOT trigger this.
+///
+/// The test maximizes the race by:
+///   * queuing a large burst of setTimeout(0) callbacks that each perform
+///     multiple JS->Rust IPC roundtrips (DOM calls),
+///   * simultaneously bursting Rust->JS evaluate_script calls on every yield,
+///   * yielding via setTimeout(0) (not a millisecond sleep) so the event loop
+///     interleaves callback delivery with Rust-side work as tightly as possible,
+///   * bailing out early with a clear diagnostic if progress stalls.
 pub(crate) async fn test_batch_stress_browser_event_callbacks() {
     use wasm_bindgen::Closure;
 
@@ -21,20 +29,31 @@ pub(crate) async fn test_batch_stress_browser_event_callbacks() {
                 setTimeout(() => cb(i), 0);
             }
         }
-        export function wait_ms(ms) {
-            return new Promise(resolve => setTimeout(resolve, ms));
+        export function yield_to_event_loop() {
+            return new Promise(resolve => setTimeout(resolve, 0));
         }
     "#)]
     extern "C" {
         fn schedule_callbacks(cb: &Closure<dyn FnMut(u32)>, count: u32);
 
         #[wasm_bindgen(catch)]
-        async fn wait_ms(ms: u32) -> Result<JsValue, JsValue>;
+        async fn yield_to_event_loop() -> Result<JsValue, JsValue>;
     }
+
+    // Tuned to reproduce the U8BufferEmpty decode failure within a few
+    // hundred milliseconds on the affected builds. If you find the bug no
+    // longer reproduces reliably, bump CALLBACK_COUNT first.
+    const CALLBACK_COUNT: u32 = 500;
+    const RUST_OPS_PER_YIELD: u32 = 20;
+    const STALL_LIMIT: u32 = 200;
+    const MAX_ITERATIONS: u32 = 5_000;
 
     let window = web_sys::window().unwrap();
     let document = window.document().unwrap();
     let body = document.body().unwrap();
+
+    let test_start = std::time::Instant::now();
+    println!("[batch_stress] t=0ms start");
 
     let container = document.create_element("div").unwrap();
     body.append_child(&container).unwrap();
@@ -72,21 +91,59 @@ pub(crate) async fn test_batch_stress_browser_event_callbacks() {
         container_clone.append_child(&item).unwrap();
     });
 
-    schedule_callbacks(&callback, 200);
+    schedule_callbacks(&callback, CALLBACK_COUNT);
+    println!(
+        "[batch_stress] t={}ms scheduled {CALLBACK_COUNT} callbacks",
+        test_start.elapsed().as_millis()
+    );
 
-    for _ in 0..20 {
-        wait_ms(50).await.unwrap();
-        let div = document.create_element("div").unwrap();
-        div.set_text_content(Some("Rust-side element"));
-        body.append_child(&div).unwrap();
-        if counter.get() >= 200 {
-            break;
+    let mut iterations = 0u32;
+    let mut last_count = 0u32;
+    let mut stalled = 0u32;
+
+    while counter.get() < CALLBACK_COUNT {
+        // Burst many evaluate_script calls per yield to amplify the race with
+        // in-flight callback XHRs.
+        for _ in 0..RUST_OPS_PER_YIELD {
+            let div = document.create_element("div").unwrap();
+            div.set_text_content(Some("Rust-side element"));
+            body.append_child(&div).unwrap();
         }
+
+        yield_to_event_loop().await.unwrap();
+        iterations += 1;
+
+        let now = counter.get();
+        if iterations == 1 || iterations % 20 == 0 {
+            println!(
+                "[batch_stress] t={}ms iter={iterations} counter={now}",
+                test_start.elapsed().as_millis()
+            );
+        }
+        if now == last_count {
+            stalled += 1;
+        } else {
+            stalled = 0;
+            last_count = now;
+        }
+
+        assert!(
+            stalled <= STALL_LIMIT,
+            "Callbacks stalled at {now}/{CALLBACK_COUNT} after {iterations} \
+             iterations ({stalled} stalled yields) — likely dropped or \
+             mis-decoded callback response",
+        );
+
+        assert!(
+            iterations < MAX_ITERATIONS,
+            "Hit MAX_ITERATIONS={MAX_ITERATIONS} with only {now}/{CALLBACK_COUNT} callbacks",
+        );
     }
 
-    assert!(
-        counter.get() >= 200,
-        "Expected 200 callbacks, got {}",
+    assert_eq!(
+        counter.get(),
+        CALLBACK_COUNT,
+        "Expected exactly {CALLBACK_COUNT} callbacks, got {}",
         counter.get()
     );
 

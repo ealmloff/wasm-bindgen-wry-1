@@ -73,6 +73,14 @@ async fn async_test_with_js_context<Fut: std::future::Future<Output = ()>, F: Fn
 
 fn main() {
     wry_launch::run_headless(|| async {
+        // Batch stress test first — reproduces the U8BufferEmpty decode
+        // failure (issue #21) within ~100ms of webview boot, so we fail
+        // fast instead of waiting for all prior tests to run.
+        async_test_with_js_context_allow_new_js_values(
+            batch_stress::test_batch_stress_browser_event_callbacks,
+        )
+        .await;
+
         // Adding numbers with and without batching
         test_with_js_context(add_number_js::test_add_number_js).await;
         test_with_js_context(add_number_js::test_add_number_js_batch).await;
@@ -177,12 +185,6 @@ fn main() {
         test_with_js_context(is_type_of::test_is_type_of_with_dyn_into).await;
         test_with_js_context(is_type_of::test_is_type_of_with_dyn_ref).await;
         test_with_js_context(is_type_of::test_has_type_with_is_type_of).await;
-
-        // Batch stress test (IPC buffer exhaustion reproduction — issue #21)
-        async_test_with_js_context_allow_new_js_values(
-            batch_stress::test_batch_stress_browser_event_callbacks,
-        )
-        .await;
 
         // async bindings test
         async_test_with_js_context(async_bindings::test_call_async).await;
