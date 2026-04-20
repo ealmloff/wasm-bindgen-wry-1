@@ -55,6 +55,16 @@ pub struct Runtime {
     webview_id: u64,
     /// Thread locals associated with the runtime
     thread_locals: BTreeMap<ThreadLocalKey<'static>, Box<dyn Any>>,
+    /// Monotonic counter for Rust->JS Evaluate sequence IDs. Each flush_and_then
+    /// tags its Evaluate with an id; JS echoes it in the Respond so the right
+    /// flush_and_then consumes the right Respond regardless of JS processing
+    /// order (Rust's FIFO-on-a-shared-channel model otherwise mismatches when
+    /// JS processes Evaluates out of Rust's send order — see issue #21).
+    next_seq_id: u32,
+    /// Responds pulled from the channel but whose seq_id doesn't match the
+    /// currently-waiting flush. Drained by later flush_and_then calls that
+    /// are looking for those seq_ids.
+    buffered_responds: Vec<(u32, IPCMessage)>,
 }
 
 impl Runtime {
@@ -83,7 +93,26 @@ impl Runtime {
             ipc,
             webview_id,
             thread_locals: BTreeMap::new(),
+            // seq_id 0 is reserved as a sentinel for Rust->JS Responds (which
+            // don't need matching); real Evaluates start at 1.
+            next_seq_id: 1,
+            buffered_responds: Vec::new(),
         }
+    }
+
+    /// Pull a previously-buffered Respond with the matching seq_id.
+    pub(crate) fn take_buffered_respond(&mut self, seq_id: u32) -> Option<IPCMessage> {
+        let pos = self
+            .buffered_responds
+            .iter()
+            .position(|(sid, _)| *sid == seq_id)?;
+        Some(self.buffered_responds.swap_remove(pos).1)
+    }
+
+    /// Stash a Respond whose seq_id doesn't match the current flush. A later
+    /// flush_and_then waiting for this seq_id will pull it.
+    pub(crate) fn buffer_respond(&mut self, seq_id: u32, msg: IPCMessage) {
+        self.buffered_responds.push((seq_id, msg));
     }
 
     fn new_encoder_for_evaluate() -> EncodedData {
@@ -98,6 +127,22 @@ impl Runtime {
         let id = self.max_id;
         self.max_id += 1;
         id
+    }
+
+    /// Current max_id (next id that would be allocated).
+    pub(crate) fn current_max_id(&self) -> u64 {
+        self.max_id
+    }
+
+    /// Advance `max_id` to at least `new_min` so a later allocation can't
+    /// collide with a slot JS has already used. JS sends explicit slot ids
+    /// when it writes a `HeapRef`, and if one of those is ahead of Rust's
+    /// counter (e.g. because an earlier Respond is still buffered), we need
+    /// to catch up before the next placeholder allocation.
+    pub(crate) fn bump_max_id_to(&mut self, new_min: u64) {
+        if self.max_id < new_min {
+            self.max_id = new_min;
+        }
     }
 
     /// Get the next heap ID for a batched return value placeholder.
@@ -163,12 +208,21 @@ impl Runtime {
 
     /// Take the message data and reset the batch for reuse.
     /// Includes any pending drops at the start of the message.
-    /// Prepends the reserved placeholder count so JS can skip those IDs during nested allocations.
-    pub(crate) fn take_message(&mut self) -> IPCMessage {
+    /// Prepends the reserved placeholder count so JS can skip those IDs during
+    /// nested allocations, and a sequence ID so the Respond can be matched to
+    /// its originating flush_and_then. Returns the seq_id for the caller.
+    pub(crate) fn take_message(&mut self) -> (IPCMessage, u32) {
+        let seq_id = self.next_seq_id;
+        // Skip 0 on wrap; 0 is the sentinel for Rust-originated Responds.
+        self.next_seq_id = self.next_seq_id.wrapping_add(1);
+        if self.next_seq_id == 0 {
+            self.next_seq_id = 1;
+        }
         let reserved_count = self.take_reserved_placeholder_count();
         let mut encoder = self.take_encoder();
         encoder.prepend_u32(reserved_count);
-        IPCMessage::new(encoder.to_bytes())
+        encoder.prepend_u32(seq_id);
+        (IPCMessage::new(encoder.to_bytes()), seq_id)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -442,14 +496,14 @@ pub(crate) fn flush_and_return<R: BinaryDecode>() -> R {
 pub(crate) fn flush_and_then<R>(then: impl for<'a> Fn(DecodedData<'a>) -> R) -> R {
     use crate::runtime::WryBindgenEvent;
 
-    let batch_msg = with_runtime(|state| state.take_message());
+    let (batch_msg, expected_seq) = with_runtime(|state| state.take_message());
 
     // Send and wait for result
     with_runtime(|runtime| {
         (runtime.ipc().proxy)(WryBindgenEvent::ipc(runtime.webview_id(), batch_msg))
     });
     loop {
-        if let Some(result) = crate::runtime::progress_js_with(&then) {
+        if let Some(result) = crate::runtime::progress_js_with(expected_seq, &then) {
             return result;
         }
     }

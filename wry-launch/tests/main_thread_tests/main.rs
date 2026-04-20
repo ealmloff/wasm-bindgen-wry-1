@@ -74,12 +74,26 @@ async fn async_test_with_js_context<Fut: std::future::Future<Output = ()>, F: Fn
 fn main() {
     wry_launch::run_headless(|| async {
         // Batch stress test first — reproduces the U8BufferEmpty decode
-        // failure (issue #21) within ~100ms of webview boot, so we fail
-        // fast instead of waiting for all prior tests to run.
-        async_test_with_js_context_allow_new_js_values(
-            batch_stress::test_batch_stress_browser_event_callbacks,
-        )
-        .await;
+        // failure (issue #21). It drives thousands of JS->Rust and Rust->JS
+        // roundtrips so gets a wider timeout than the default 5s.
+        async fn run_batch_stress() {
+            let f = || batch_stress::test_batch_stress_browser_event_callbacks();
+            println!("testing batch_stress outside of batch");
+            select! {
+                result = f() => result,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    panic!("batch_stress outside-of-batch timed out after 30s");
+                }
+            };
+            println!("testing batch_stress inside of batch");
+            select! {
+                result = batch_async(f()) => result,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    panic!("batch_stress inside-of-batch timed out after 30s");
+                }
+            };
+        }
+        run_batch_stress().await;
 
         // Adding numbers with and without batching
         test_with_js_context(add_number_js::test_add_number_js).await;

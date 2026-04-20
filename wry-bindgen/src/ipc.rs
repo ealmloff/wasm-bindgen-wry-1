@@ -126,9 +126,15 @@ impl IPCMessage {
     }
 
     /// Create a new respond message with the given data.
+    ///
+    /// Uses seq_id 0 as a sentinel — Rust-originated Responds answer a
+    /// JS-originated Evaluate (a callback), and JS doesn't match seq_ids on
+    /// that path. The 0 keeps the wire format uniform so both sides can
+    /// always skip the u32 after the message type byte.
     pub fn new_respond(push_data: impl FnOnce(&mut EncodedData)) -> Self {
         let mut encoder = EncodedData::new();
         encoder.push_u8(MessageType::Respond as u8);
+        encoder.push_u32(0);
 
         push_data(&mut encoder);
 
@@ -147,12 +153,24 @@ impl IPCMessage {
     }
 
     /// Decode the message into its variant form.
+    ///
+    /// For `Respond`, also parses the seq_id that immediately follows the
+    /// message type byte. This allows the caller to route the Respond to the
+    /// specific `flush_and_then` that's waiting for it, instead of relying on
+    /// FIFO channel order (which breaks when JS processes Rust Evaluates out
+    /// of send order — see issue #21).
     pub fn decoded(&self) -> Result<DecodedVariant<'_>, DecodeError> {
         let mut decoded = DecodedData::from_bytes(&self.data)?;
         let message_type = decoded.take_u8()?;
         let message_type = match message_type {
             0 => DecodedVariant::Evaluate { data: decoded },
-            1 => DecodedVariant::Respond { data: decoded },
+            1 => {
+                let seq_id = decoded.take_u32()?;
+                DecodedVariant::Respond {
+                    seq_id,
+                    data: decoded,
+                }
+            }
             v => return Err(DecodeError::InvalidMessageType { value: v }),
         };
         Ok(message_type)
@@ -172,8 +190,10 @@ impl IPCMessage {
 /// Decoded message variant.
 #[derive(Debug)]
 pub(crate) enum DecodedVariant<'a> {
-    /// Response from JS/Rust
-    Respond { data: DecodedData<'a> },
+    /// Response from JS/Rust. `seq_id` identifies which Rust-sent Evaluate
+    /// this is answering (0 for Rust-originated Responds, which Rust never
+    /// decodes back on its own side).
+    Respond { seq_id: u32, data: DecodedData<'a> },
     /// Evaluation request
     Evaluate { data: DecodedData<'a> },
 }

@@ -60,8 +60,13 @@ class BoolType implements TypeClass {
  */
 class HeapRefType implements TypeClass {
   encode(encoder: DataEncoder, obj: unknown): void {
-    // Insert into heap but don't encode the id - Rust side is in sync with the slab
-    window.jsHeap.insert(obj);
+    // Insert into heap AND encode the id explicitly. Rust used to infer the
+    // slot by advancing its own counter in lockstep, but that breaks when
+    // Responds are buffered (seq_id mismatch) — JS advances its slab while
+    // Rust's decode is deferred, so the counters drift. Sending the id
+    // keeps both heaps in sync regardless of when Rust decodes.
+    const id = window.jsHeap.insert(obj);
+    encoder.pushU64(id);
   }
 
   decode(decoder: DataDecoder): unknown {

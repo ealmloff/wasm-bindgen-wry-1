@@ -142,10 +142,18 @@ function handleBinaryResponse(
   const msgType: MessageType = rawMsgType;
 
   if (msgType === MessageType.Respond) {
-    // Respond - just return the decoder for further processing
+    // Skip the seq_id — it's only used by Rust to match Responds to the
+    // originating flush_and_then. JS doesn't need it on this path (the
+    // caller already knows which XHR chain this decoder belongs to).
+    decoder.takeU32();
     return decoder;
   } else if (msgType === MessageType.Evaluate) {
     // Evaluate - Rust is calling JS functions (possibly multiple)
+
+    // Rust tags each Evaluate with a seq_id so the Respond can be matched
+    // back to the originating flush_and_then even if JS processes Rust
+    // Evaluates out of Rust's send order. Echo it unchanged.
+    const seqId = decoder.takeU32();
 
     // Read the reserved placeholder count and push a reservation scope
     // This ensures nested callback allocations skip these reserved IDs
@@ -154,6 +162,7 @@ function handleBinaryResponse(
 
     const encoder = new DataEncoder();
     encoder.pushU8(MessageType.Respond);
+    encoder.pushU32(seqId);
 
     // Push a single borrow frame for this entire Evaluate message
     // This frame persists across all operations and nested calls
