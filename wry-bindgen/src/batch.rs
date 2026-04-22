@@ -208,9 +208,18 @@ impl Runtime {
 
     /// Take the message data and reset the batch for reuse.
     /// Includes any pending drops at the start of the message.
-    /// Prepends the reserved placeholder count so JS can skip those IDs during
-    /// nested allocations, and a sequence ID so the Respond can be matched to
-    /// its originating flush_and_then. Returns the seq_id for the caller.
+    ///
+    /// Wire format after the leading `MessageType::Evaluate` byte:
+    ///   `[seq_id: u32][reserved_placeholder_count: u32][payload...]`
+    ///
+    /// `seq_id` lets `progress_js_with` route the matching Respond back to the
+    /// originating `flush_and_then`. JS echoes it unchanged on its Respond
+    /// (see `ipc.ts` `handleBinaryResponse`); both Rust (`IPCMessage::decoded`)
+    /// and JS must skip this u32 after the message-type byte.
+    /// `reserved_placeholder_count` is consumed by JS to size its reservation
+    /// scope so nested callback allocations skip pre-reserved heap ids.
+    ///
+    /// Returns the seq_id so the caller can match it against incoming Responds.
     pub(crate) fn take_message(&mut self) -> (IPCMessage, u32) {
         let seq_id = self.next_seq_id;
         // Skip 0 on wrap; 0 is the sentinel for Rust-originated Responds.

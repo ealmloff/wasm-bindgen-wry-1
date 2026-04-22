@@ -113,6 +113,10 @@ struct WebviewState {
     /// processes Rust work vs. the order Rust expects Responds back. Queueing
     /// until the next XHR arrives lets that XHR's responder carry the work
     /// inline, preserving order.
+    ///
+    /// On webview shutdown, anything still in this queue is dropped. The
+    /// corresponding `flush_and_then` would block forever on `recv_blocking`,
+    /// but the runtime is going away with it so this is intentional.
     queued_rust_msgs: VecDeque<IPCMessage>,
 }
 
@@ -130,18 +134,22 @@ impl WebviewState {
         }
     }
 
-    /// Respond to a specific XHR responder with a raw IPC message payload.
-    fn respond_to_responder(responder: WryBindgenResponder, msg: IPCMessage) {
+    /// Build the HTTP response body for an IPC message. Base64 because sync
+    /// XMLHttpRequest can't use `responseType="arraybuffer"`.
+    fn ipc_response(msg: IPCMessage) -> Response<Vec<u8>> {
         let body = msg.into_data();
         let engine = base64::engine::general_purpose::STANDARD;
         let body_base64 = engine.encode(&body);
-        responder.respond(
-            http::Response::builder()
-                .status(200)
-                .header("Content-Type", "text/plain")
-                .body(body_base64.into_bytes())
-                .expect("Failed to build response"),
-        );
+        http::Response::builder()
+            .status(200)
+            .header("Content-Type", "text/plain")
+            .body(body_base64.into_bytes())
+            .expect("Failed to build response")
+    }
+
+    /// Respond to a specific XHR responder with a raw IPC message payload.
+    fn respond_to_responder(responder: WryBindgenResponder, msg: IPCMessage) {
+        responder.respond(Self::ipc_response(msg));
     }
 
     fn set_ongoing_request(&mut self, responder: WryBindgenResponder) {
@@ -163,17 +171,7 @@ impl WebviewState {
 
     fn respond_to_request(&mut self, response: IPCMessage) {
         if let Some(responder) = self.take_ongoing_request() {
-            let body = response.into_data();
-            // Encode as base64 - sync XMLHttpRequest cannot use responseType="arraybuffer"
-            let engine = base64::engine::general_purpose::STANDARD;
-            let body_base64 = engine.encode(&body);
-            responder.respond(
-                http::Response::builder()
-                    .status(200)
-                    .header("Content-Type", "text/plain")
-                    .body(body_base64.into_bytes())
-                    .expect("Failed to build response"),
-            );
+            Self::respond_to_responder(responder, response);
         } else {
             panic!("WARNING: respond_to_request called but no pending request! Response dropped.");
         }
