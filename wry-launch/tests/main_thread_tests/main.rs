@@ -1,4 +1,14 @@
-use tokio::select;
+use std::any::Any;
+use std::future::Future;
+use std::io::{self, Write};
+use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
+use std::process::ExitCode;
+use std::sync::mpsc as std_mpsc;
+use std::time::{Duration, Instant};
+
+use futures_util::FutureExt;
+use libtest_mimic::{Arguments, Failed};
 use wasm_bindgen::{batch::batch_async, wasm_bindgen};
 
 mod add_number_js;
@@ -27,165 +37,340 @@ extern "C" {
     pub fn heap_objects_alive() -> u32;
 }
 
-async fn test_with_js_context_allow_new_js_values<F: Fn()>(f: F) {
-    async_test_with_js_context_allow_new_js_values(async || f()).await;
+const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy)]
+enum BatchMode {
+    NonBatched,
+    Batched,
 }
 
-async fn async_test_with_js_context_allow_new_js_values<
-    Fut: std::future::Future<Output = ()>,
-    F: Fn() -> Fut,
->(
-    f: F,
-) {
-    println!("testing {} outside of batch", std::any::type_name::<F>());
-    select! {
-        result = f() => result,
-        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-            panic!("Test timed out after 5 seconds");
+impl BatchMode {
+    fn suffix(self) -> &'static str {
+        match self {
+            BatchMode::NonBatched => "nonbatched",
+            BatchMode::Batched => "batched",
+        }
+    }
+}
+
+// The futures returned by test bodies (e.g. anything awaiting `JsFuture`) are
+// `!Send` because they hold `Rc<RefCell<…>>`. That's fine — they're polled on
+// the single-threaded runtime where they were constructed.
+type TestFuture = Pin<Box<dyn Future<Output = ()>>>;
+type TestBody = Box<dyn FnOnce() -> TestFuture>;
+
+struct TestCase {
+    name: String,
+    body: TestBody,
+}
+
+async fn run_with_timeout(fut: impl Future<Output = ()>, mode: BatchMode) {
+    let body = async move {
+        match mode {
+            BatchMode::NonBatched => fut.await,
+            BatchMode::Batched => batch_async(fut).await,
         }
     };
-    println!("testing {} inside of batch", std::any::type_name::<F>());
-    select! {
-        result = batch_async(f()) => result,
-        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-            panic!("Test timed out after 5 seconds");
+    tokio::select! {
+        _ = body => {}
+        _ = tokio::time::sleep(TEST_TIMEOUT) => {
+            panic!("Test timed out after {} seconds", TEST_TIMEOUT.as_secs())
         }
+    }
+}
+
+fn sync_test<F>(name: String, mode: BatchMode, f: F) -> TestCase
+where
+    F: Fn() + Copy + 'static,
+{
+    TestCase {
+        name,
+        body: Box::new(move || Box::pin(run_with_timeout(async move { f() }, mode))),
+    }
+}
+
+fn async_test<Fut, F>(name: String, mode: BatchMode, f: F) -> TestCase
+where
+    F: Fn() -> Fut + Copy + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    TestCase {
+        name,
+        body: Box::new(move || Box::pin(run_with_timeout(f(), mode))),
+    }
+}
+
+fn trial_name(module: &str, name: &str, mode: BatchMode) -> String {
+    format!("{module}::{name}::{}", mode.suffix())
+}
+
+/// Generate one case per (test, batch_mode) pair for sync `fn()` tests.
+macro_rules! sync_trials {
+    ($tests:expr; $($module:ident :: $name:ident),* $(,)?) => {{
+        $(
+            for mode in [BatchMode::NonBatched, BatchMode::Batched] {
+                $tests.push(sync_test(
+                    trial_name(stringify!($module), stringify!($name), mode),
+                    mode,
+                    $module::$name,
+                ));
+            }
+        )*
+    }};
+}
+
+/// Generate one case per (test, batch_mode) pair for `async fn()` tests.
+macro_rules! async_trials {
+    ($tests:expr; $($module:ident :: $name:ident),* $(,)?) => {{
+        $(
+            for mode in [BatchMode::NonBatched, BatchMode::Batched] {
+                $tests.push(async_test(
+                    trial_name(stringify!($module), stringify!($name), mode),
+                    mode,
+                    $module::$name,
+                ));
+            }
+        )*
+    }};
+}
+
+fn build_tests() -> Vec<TestCase> {
+    let mut tests: Vec<TestCase> = Vec::new();
+
+    sync_trials!(tests;
+        add_number_js::test_add_number_js,
+        add_number_js::test_add_number_js_batch,
+        roundtrip::test_roundtrip,
+        callbacks::test_call_callback,
+        callbacks::test_mut_dyn_fn,
+        callbacks::test_mut_dyn_fnmut,
+        callbacks::test_mut_dyn_fn_many_arity,
+        callbacks::test_mut_dyn_fnmut_many_arity,
+        reentrant_callbacks::test_reentrant_fn_closure,
+        reentrant_callbacks::test_interleaved_fn_closures,
+        jsvalue::test_jsvalue_constants,
+        jsvalue::test_jsvalue_bool,
+        jsvalue::test_jsvalue_default,
+        jsvalue::test_jsvalue_clone_reserved,
+        jsvalue::test_jsvalue_equality,
+        jsvalue::test_jsvalue_from_js,
+        jsvalue::test_jsvalue_pass_to_js,
+        jsvalue::test_jsvalue_as_string,
+        jsvalue::test_jsvalue_as_f64,
+        jsvalue::test_jsvalue_arithmetic,
+        jsvalue::test_jsvalue_bitwise,
+        jsvalue::test_jsvalue_comparisons,
+        jsvalue::test_jsvalue_loose_eq_coercion,
+        jsvalue::test_jsvalue_js_in,
+        jsvalue::test_instanceof_basic,
+        jsvalue::test_instanceof_is_instance_of,
+        jsvalue::test_instanceof_dyn_into,
+        jsvalue::test_instanceof_dyn_ref,
+        jsvalue::test_partial_eq_bool,
+        jsvalue::test_partial_eq_numbers,
+        jsvalue::test_partial_eq_strings,
+        jsvalue::test_try_from_f64,
+        jsvalue::test_try_from_string,
+        jsvalue::test_owned_arithmetic_operators,
+        jsvalue::test_owned_bitwise_operators,
+        jsvalue::test_jscast_as_ref,
+        jsvalue::test_as_ref_jsvalue,
+        string_enum::test_string_enum_from_str,
+        string_enum::test_string_enum_to_str,
+        string_enum::test_string_enum_to_jsvalue,
+        string_enum::test_string_enum_from_jsvalue,
+        string_enum::test_string_enum_pass_to_js,
+        string_enum::test_string_enum_receive_from_js,
+        catch_attribute::test_catch_throws_error,
+        catch_attribute::test_catch_successful_call,
+        catch_attribute::test_catch_with_arguments,
+        catch_attribute::test_catch_method,
+        structs::test_struct_bindings,
+        clamped::test_clamped_is_uint8clampedarray,
+        clamped::test_clamped_vec_is_uint8clampedarray,
+        clamped::test_clamped_js_clamping_behavior,
+        clamped::test_clamped_preserves_data,
+        clamped::test_clamped_empty,
+        clamped::test_clamped_mut_slice,
+        borrow_stack::test_borrowed_ref_in_callback,
+        borrow_stack::test_borrowed_ref_in_callback_with_return,
+        borrow_stack::test_borrowed_ref_nested_frames,
+        borrow_stack::test_borrowed_ref_deep_nesting,
+        thread_local::test_thread_local,
+        thread_local::test_thread_local_window,
+        module_import::test_module_import,
+        indexing::test_indexing_getter_array,
+        indexing::test_indexing_setter_array,
+        indexing::test_indexing_deleter_array,
+        is_type_of::test_is_type_of_string,
+        is_type_of::test_is_type_of_number,
+        is_type_of::test_is_type_of_with_dyn_into,
+        is_type_of::test_is_type_of_with_dyn_ref,
+        is_type_of::test_has_type_with_is_type_of,
+    );
+
+    async_trials!(tests;
+        callbacks::test_call_callback_async,
+        callbacks::test_join_many_callbacks_async,
+        async_bindings::test_call_async,
+        async_bindings::test_call_async_returning_js_value,
+        async_bindings::test_catch_async_call_ok,
+        async_bindings::test_catch_async_call_err,
+        async_bindings::test_async_method,
+        async_bindings::test_async_method_with_catch,
+        async_bindings::test_async_static_method,
+        async_bindings::test_join_many_async,
+    );
+
+    tests
+}
+
+fn extract_panic_message(payload: Box<dyn Any + Send>) -> Failed {
+    let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "test panicked".to_string()
     };
+    Failed::from(msg)
 }
 
-async fn test_with_js_context<F: Fn()>(f: F) {
-    async_test_with_js_context_allow_new_js_values(async || f()).await;
+async fn run_test(body: TestBody) -> Result<(), Failed> {
+    let fut = std::panic::catch_unwind(AssertUnwindSafe(body)).map_err(extract_panic_message)?;
+    AssertUnwindSafe(fut)
+        .catch_unwind()
+        .await
+        .map_err(extract_panic_message)
 }
 
-async fn async_test_with_js_context<Fut: std::future::Future<Output = ()>, F: Fn() -> Fut>(f: F) {
-    async_test_with_js_context_allow_new_js_values(move || {
-        let f = f();
-        async move {
-            // let before = heap_objects_alive();
-            f.await;
-            // let after = heap_objects_alive();
-            // assert_eq!(before, after, "JS heap object leak detected");
+fn is_filtered_out(args: &Arguments, test: &TestCase) -> bool {
+    if let Some(filter) = &args.filter {
+        match args.exact {
+            true if &test.name != filter => return true,
+            false if !test.name.contains(filter) => return true,
+            _ => {}
         }
-    })
-    .await;
+    }
+
+    for skip_filter in &args.skip {
+        match args.exact {
+            true if &test.name == skip_filter => return true,
+            false if test.name.contains(skip_filter) => return true,
+            _ => {}
+        }
+    }
+
+    // This harness does not define ignored tests, so `--ignored` filters every
+    // test out just like libtest would.
+    args.ignored
 }
 
-fn main() {
-    wry_launch::run_headless(|| async {
-        // Adding numbers with and without batching
-        test_with_js_context(add_number_js::test_add_number_js).await;
-        test_with_js_context(add_number_js::test_add_number_js_batch).await;
+fn print_failures(failures: &[(String, Option<String>)]) {
+    if failures.is_empty() {
+        return;
+    }
 
-        // Roundtrip tests
-        test_with_js_context(roundtrip::test_roundtrip).await;
+    println!();
+    println!("failures:");
+    println!();
 
-        // Callbacks
-        test_with_js_context(callbacks::test_call_callback).await;
-        async_test_with_js_context(callbacks::test_call_callback_async).await;
-        async_test_with_js_context(callbacks::test_join_many_callbacks_async).await;
+    for (name, message) in failures {
+        println!("---- {name} ----");
+        if let Some(message) = message {
+            println!("{message}");
+        }
+        println!();
+    }
 
-        // &mut dyn Fn and &mut dyn FnMut tests
-        test_with_js_context(callbacks::test_mut_dyn_fn).await;
-        test_with_js_context(callbacks::test_mut_dyn_fnmut).await;
-        test_with_js_context(callbacks::test_mut_dyn_fn_many_arity).await;
-        test_with_js_context(callbacks::test_mut_dyn_fnmut_many_arity).await;
+    println!();
+    println!("failures:");
+    for (name, _) in failures {
+        println!("    {name}");
+    }
+}
 
-        // Reentrant callbacks (dyn Fn)
-        test_with_js_context(reentrant_callbacks::test_reentrant_fn_closure).await;
-        test_with_js_context(reentrant_callbacks::test_interleaved_fn_closures).await;
+async fn run_tests(args: Arguments, mut tests: Vec<TestCase>) -> bool {
+    let started = Instant::now();
+    let initial_count = tests.len();
+    tests.retain(|test| !is_filtered_out(&args, test));
+    let filtered = initial_count - tests.len();
 
-        // JsValue behavior tests
-        test_with_js_context(jsvalue::test_jsvalue_constants).await;
-        test_with_js_context(jsvalue::test_jsvalue_bool).await;
-        test_with_js_context(jsvalue::test_jsvalue_default).await;
-        test_with_js_context(jsvalue::test_jsvalue_clone_reserved).await;
-        test_with_js_context(jsvalue::test_jsvalue_equality).await;
-        test_with_js_context(jsvalue::test_jsvalue_from_js).await;
-        test_with_js_context(jsvalue::test_jsvalue_pass_to_js).await;
-        test_with_js_context(jsvalue::test_jsvalue_as_string).await;
-        test_with_js_context(jsvalue::test_jsvalue_as_f64).await;
-        test_with_js_context(jsvalue::test_jsvalue_arithmetic).await;
-        test_with_js_context(jsvalue::test_jsvalue_bitwise).await;
-        test_with_js_context(jsvalue::test_jsvalue_comparisons).await;
-        test_with_js_context(jsvalue::test_jsvalue_loose_eq_coercion).await;
-        test_with_js_context(jsvalue::test_jsvalue_js_in).await;
+    if args.list {
+        for test in tests {
+            println!("{}: test", test.name);
+        }
+        return true;
+    }
 
-        // instanceof tests
-        test_with_js_context(jsvalue::test_instanceof_basic).await;
-        test_with_js_context(jsvalue::test_instanceof_is_instance_of).await;
-        test_with_js_context(jsvalue::test_instanceof_dyn_into).await;
-        test_with_js_context(jsvalue::test_instanceof_dyn_ref).await;
+    let plural = if tests.len() == 1 { "" } else { "s" };
+    println!();
+    println!("running {} test{plural}", tests.len());
 
-        // Stable API additions tests
-        test_with_js_context(jsvalue::test_partial_eq_bool).await;
-        test_with_js_context(jsvalue::test_partial_eq_numbers).await;
-        test_with_js_context(jsvalue::test_partial_eq_strings).await;
-        test_with_js_context(jsvalue::test_try_from_f64).await;
-        test_with_js_context(jsvalue::test_try_from_string).await;
-        test_with_js_context(jsvalue::test_owned_arithmetic_operators).await;
-        test_with_js_context(jsvalue::test_owned_bitwise_operators).await;
-        test_with_js_context(jsvalue::test_jscast_as_ref).await;
-        test_with_js_context(jsvalue::test_as_ref_jsvalue).await;
+    let name_width = tests
+        .iter()
+        .map(|test| test.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut passed = 0;
+    let mut ignored = 0;
+    let mut failures = Vec::new();
 
-        // String enum tests
-        test_with_js_context(string_enum::test_string_enum_from_str).await;
-        test_with_js_context(string_enum::test_string_enum_to_str).await;
-        test_with_js_context(string_enum::test_string_enum_to_jsvalue).await;
-        test_with_js_context(string_enum::test_string_enum_from_jsvalue).await;
-        test_with_js_context(string_enum::test_string_enum_pass_to_js).await;
-        test_with_js_context(string_enum::test_string_enum_receive_from_js).await;
+    for test in tests {
+        print!("test {: <name_width$} ... ", test.name);
+        io::stdout().flush().unwrap();
 
-        // Catch attribute tests
-        test_with_js_context(catch_attribute::test_catch_throws_error).await;
-        test_with_js_context(catch_attribute::test_catch_successful_call).await;
-        test_with_js_context(catch_attribute::test_catch_with_arguments).await;
-        test_with_js_context(catch_attribute::test_catch_method).await;
+        if args.bench {
+            ignored += 1;
+            println!("ignored");
+            continue;
+        }
 
-        // Struct bindings tests
-        test_with_js_context(structs::test_struct_bindings).await;
+        match run_test(test.body).await {
+            Ok(()) => {
+                passed += 1;
+                println!("ok");
+            }
+            Err(failed) => {
+                println!("FAILED");
+                failures.push((test.name.clone(), failed.message().map(ToOwned::to_owned)));
+            }
+        }
+    }
 
-        // Clamped type tests
-        test_with_js_context(clamped::test_clamped_is_uint8clampedarray).await;
-        test_with_js_context(clamped::test_clamped_vec_is_uint8clampedarray).await;
-        test_with_js_context(clamped::test_clamped_js_clamping_behavior).await;
-        test_with_js_context(clamped::test_clamped_preserves_data).await;
-        test_with_js_context(clamped::test_clamped_empty).await;
-        test_with_js_context(clamped::test_clamped_mut_slice).await;
+    print_failures(&failures);
 
-        // Borrow stack tests
-        test_with_js_context(borrow_stack::test_borrowed_ref_in_callback).await;
-        test_with_js_context(borrow_stack::test_borrowed_ref_in_callback_with_return).await;
-        test_with_js_context(borrow_stack::test_borrowed_ref_nested_frames).await;
-        test_with_js_context(borrow_stack::test_borrowed_ref_deep_nesting).await;
+    let result = if failures.is_empty() { "ok" } else { "FAILED" };
+    println!();
+    println!(
+        "test result: {result}. {passed} passed; {} failed; {ignored} ignored; 0 measured; {filtered} filtered out; finished in {:.2}s",
+        failures.len(),
+        started.elapsed().as_secs_f64(),
+    );
+    println!();
 
-        // Thread local tests
-        test_with_js_context(thread_local::test_thread_local).await;
-        test_with_js_context_allow_new_js_values(thread_local::test_thread_local_window).await;
+    failures.is_empty()
+}
 
-        // Module import test
-        test_with_js_context(module_import::test_module_import).await;
+fn main() -> ExitCode {
+    let args = Arguments::from_args();
 
-        // Indexing tests
-        test_with_js_context(indexing::test_indexing_getter_array).await;
-        test_with_js_context(indexing::test_indexing_setter_array).await;
-        test_with_js_context(indexing::test_indexing_deleter_array).await;
+    // The test result travels back from the runtime thread to main() so
+    // `main` can return its exit code after `run_headless` returns.
+    let (passed_tx, passed_rx) = std_mpsc::channel::<bool>();
 
-        // is_type_of tests
-        test_with_js_context(is_type_of::test_is_type_of_string).await;
-        test_with_js_context(is_type_of::test_is_type_of_number).await;
-        test_with_js_context(is_type_of::test_is_type_of_with_dyn_into).await;
-        test_with_js_context(is_type_of::test_is_type_of_with_dyn_ref).await;
-        test_with_js_context(is_type_of::test_has_type_with_is_type_of).await;
-
-        // async bindings test
-        async_test_with_js_context(async_bindings::test_call_async).await;
-        async_test_with_js_context(async_bindings::test_call_async_returning_js_value).await;
-        async_test_with_js_context(async_bindings::test_catch_async_call_ok).await;
-        async_test_with_js_context(async_bindings::test_catch_async_call_err).await;
-        async_test_with_js_context(async_bindings::test_async_method).await;
-        async_test_with_js_context(async_bindings::test_async_method_with_catch).await;
-        async_test_with_js_context(async_bindings::test_async_static_method).await;
-        async_test_with_js_context(async_bindings::test_join_many_async).await;
+    wry_launch::run_headless(move || async move {
+        let passed = run_tests(args, build_tests()).await;
+        passed_tx
+            .send(passed)
+            .expect("test result receiver disappeared");
     })
-    .unwrap();
+    .expect("failed to run headless test harness");
+
+    if passed_rx.recv().expect("test result sender disappeared") {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(101)
+    }
 }
