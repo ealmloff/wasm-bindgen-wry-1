@@ -81,14 +81,14 @@ fn main() {
             println!("testing batch_stress outside of batch");
             select! {
                 result = f() => result,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(600)) => {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
                     panic!("batch_stress outside-of-batch timed out after 30s");
                 }
             };
             println!("testing batch_stress inside of batch");
             select! {
                 result = batch_async(f()) => result,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(600)) => {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
                     panic!("batch_stress inside-of-batch timed out after 30s");
                 }
             };

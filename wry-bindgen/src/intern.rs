@@ -70,7 +70,7 @@ fn unintern_str(key: &str) {
 /// If you are sending the same string multiple times, you can call this `intern`
 /// function, which simply returns its argument unchanged:
 ///
-/// ```rust,no_run
+/// ```rust
 /// # use wry_bindgen::intern;
 /// intern("foo") // returns "foo"
 /// # ;
