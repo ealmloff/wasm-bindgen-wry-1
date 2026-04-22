@@ -1,13 +1,14 @@
 use std::any::Any;
 use std::future::Future;
+use std::io::{self, Write};
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::process::ExitCode;
+use std::sync::mpsc as std_mpsc;
+use std::time::{Duration, Instant};
 
 use futures_util::FutureExt;
-use libtest_mimic::{Arguments, Conclusion, Failed, Trial};
-use tokio::sync::{mpsc, oneshot};
+use libtest_mimic::{Arguments, Failed};
 use wasm_bindgen::{batch::batch_async, wasm_bindgen};
 
 mod add_number_js;
@@ -55,32 +56,13 @@ impl BatchMode {
 
 // The futures returned by test bodies (e.g. anything awaiting `JsFuture`) are
 // `!Send` because they hold `Rc<RefCell<…>>`. That's fine — they're polled on
-// the single-threaded runtime where they were constructed. Only the boxed
-// closure that constructs them has to be `Send` to cross the channel.
+// the single-threaded runtime where they were constructed.
 type TestFuture = Pin<Box<dyn Future<Output = ()>>>;
-type TestBody = Box<dyn FnOnce() -> TestFuture + Send>;
+type TestBody = Box<dyn FnOnce() -> TestFuture>;
 
-struct TestRequest {
+struct TestCase {
+    name: String,
     body: TestBody,
-    done: oneshot::Sender<Result<(), Failed>>,
-}
-
-static TASK_TX: OnceLock<mpsc::UnboundedSender<TestRequest>> = OnceLock::new();
-
-/// Send a test future from a libtest_mimic worker thread back to the runtime
-/// thread's driver loop, then block until the driver replies.
-fn submit_test(body: TestBody) -> Result<(), Failed> {
-    let (done_tx, done_rx) = oneshot::channel();
-    TASK_TX
-        .get()
-        .ok_or_else(|| Failed::from("test driver not initialized"))?
-        .send(TestRequest {
-            body,
-            done: done_tx,
-        })
-        .map_err(|_| Failed::from("test driver disappeared"))?;
-    futures_executor::block_on(done_rx)
-        .map_err(|_| Failed::from("test driver dropped reply channel"))?
 }
 
 async fn run_with_timeout(fut: impl Future<Output = ()>, mode: BatchMode) {
@@ -98,37 +80,37 @@ async fn run_with_timeout(fut: impl Future<Output = ()>, mode: BatchMode) {
     }
 }
 
-fn sync_trial<F>(name: String, mode: BatchMode, f: F) -> Trial
+fn sync_test<F>(name: String, mode: BatchMode, f: F) -> TestCase
 where
-    F: Fn() + Send + Sync + Copy + 'static,
+    F: Fn() + Copy + 'static,
 {
-    Trial::test(name, move || {
-        submit_test(Box::new(move || {
-            Box::pin(run_with_timeout(async move { f() }, mode))
-        }))
-    })
+    TestCase {
+        name,
+        body: Box::new(move || Box::pin(run_with_timeout(async move { f() }, mode))),
+    }
 }
 
-fn async_trial<Fut, F>(name: String, mode: BatchMode, f: F) -> Trial
+fn async_test<Fut, F>(name: String, mode: BatchMode, f: F) -> TestCase
 where
-    F: Fn() -> Fut + Send + Sync + Copy + 'static,
+    F: Fn() -> Fut + Copy + 'static,
     Fut: Future<Output = ()> + 'static,
 {
-    Trial::test(name, move || {
-        submit_test(Box::new(move || Box::pin(run_with_timeout(f(), mode))))
-    })
+    TestCase {
+        name,
+        body: Box::new(move || Box::pin(run_with_timeout(f(), mode))),
+    }
 }
 
 fn trial_name(module: &str, name: &str, mode: BatchMode) -> String {
     format!("{module}::{name}::{}", mode.suffix())
 }
 
-/// Generate one trial per (test, batch_mode) pair for sync `fn()` tests.
+/// Generate one case per (test, batch_mode) pair for sync `fn()` tests.
 macro_rules! sync_trials {
-    ($trials:expr; $($module:ident :: $name:ident),* $(,)?) => {{
+    ($tests:expr; $($module:ident :: $name:ident),* $(,)?) => {{
         $(
             for mode in [BatchMode::NonBatched, BatchMode::Batched] {
-                $trials.push(sync_trial(
+                $tests.push(sync_test(
                     trial_name(stringify!($module), stringify!($name), mode),
                     mode,
                     $module::$name,
@@ -138,12 +120,12 @@ macro_rules! sync_trials {
     }};
 }
 
-/// Generate one trial per (test, batch_mode) pair for `async fn()` tests.
+/// Generate one case per (test, batch_mode) pair for `async fn()` tests.
 macro_rules! async_trials {
-    ($trials:expr; $($module:ident :: $name:ident),* $(,)?) => {{
+    ($tests:expr; $($module:ident :: $name:ident),* $(,)?) => {{
         $(
             for mode in [BatchMode::NonBatched, BatchMode::Batched] {
-                $trials.push(async_trial(
+                $tests.push(async_test(
                     trial_name(stringify!($module), stringify!($name), mode),
                     mode,
                     $module::$name,
@@ -153,10 +135,10 @@ macro_rules! async_trials {
     }};
 }
 
-fn build_trials() -> Vec<Trial> {
-    let mut trials: Vec<Trial> = Vec::new();
+fn build_tests() -> Vec<TestCase> {
+    let mut tests: Vec<TestCase> = Vec::new();
 
-    sync_trials!(trials;
+    sync_trials!(tests;
         add_number_js::test_add_number_js,
         add_number_js::test_add_number_js_batch,
         roundtrip::test_roundtrip,
@@ -228,7 +210,7 @@ fn build_trials() -> Vec<Trial> {
         is_type_of::test_has_type_with_is_type_of,
     );
 
-    async_trials!(trials;
+    async_trials!(tests;
         callbacks::test_call_callback_async,
         callbacks::test_join_many_callbacks_async,
         async_bindings::test_call_async,
@@ -241,7 +223,7 @@ fn build_trials() -> Vec<Trial> {
         async_bindings::test_join_many_async,
     );
 
-    trials
+    tests
 }
 
 fn extract_panic_message(payload: Box<dyn Any + Send>) -> Failed {
@@ -255,57 +237,140 @@ fn extract_panic_message(payload: Box<dyn Any + Send>) -> Failed {
     Failed::from(msg)
 }
 
-fn main() {
-    let mut args = Arguments::from_args();
-    // The webview/JS context is shared across every test, so trials must run
-    // serially. Setting test_threads=1 makes libtest_mimic run them on its
-    // calling thread (the spawn_blocking task below).
-    args.test_threads = Some(1);
+async fn run_test(body: TestBody) -> Result<(), Failed> {
+    let fut = std::panic::catch_unwind(AssertUnwindSafe(body)).map_err(extract_panic_message)?;
+    AssertUnwindSafe(fut)
+        .catch_unwind()
+        .await
+        .map_err(extract_panic_message)
+}
 
-    let trials = build_trials();
+fn is_filtered_out(args: &Arguments, test: &TestCase) -> bool {
+    if let Some(filter) = &args.filter {
+        match args.exact {
+            true if &test.name != filter => return true,
+            false if !test.name.contains(filter) => return true,
+            _ => {}
+        }
+    }
 
-    // The libtest_mimic Conclusion travels back from the runtime thread to
-    // main() so we can invoke `.exit()` after `run_headless` returns.
-    let conclusion: std::sync::Arc<Mutex<Option<Conclusion>>> = Default::default();
-    let conclusion_for_app = conclusion.clone();
+    for skip_filter in &args.skip {
+        match args.exact {
+            true if &test.name == skip_filter => return true,
+            false if test.name.contains(skip_filter) => return true,
+            _ => {}
+        }
+    }
+
+    // This harness does not define ignored tests, so `--ignored` filters every
+    // test out just like libtest would.
+    args.ignored
+}
+
+fn print_failures(failures: &[(String, Option<String>)]) {
+    if failures.is_empty() {
+        return;
+    }
+
+    println!();
+    println!("failures:");
+    println!();
+
+    for (name, message) in failures {
+        println!("---- {name} ----");
+        if let Some(message) = message {
+            println!("{message}");
+        }
+        println!();
+    }
+
+    println!();
+    println!("failures:");
+    for (name, _) in failures {
+        println!("    {name}");
+    }
+}
+
+async fn run_tests(args: Arguments, mut tests: Vec<TestCase>) -> bool {
+    let started = Instant::now();
+    let initial_count = tests.len();
+    tests.retain(|test| !is_filtered_out(&args, test));
+    let filtered = initial_count - tests.len();
+
+    if args.list {
+        for test in tests {
+            println!("{}: test", test.name);
+        }
+        return true;
+    }
+
+    let plural = if tests.len() == 1 { "" } else { "s" };
+    println!();
+    println!("running {} test{plural}", tests.len());
+
+    let name_width = tests
+        .iter()
+        .map(|test| test.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut passed = 0;
+    let mut ignored = 0;
+    let mut failures = Vec::new();
+
+    for test in tests {
+        print!("test {: <name_width$} ... ", test.name);
+        io::stdout().flush().unwrap();
+
+        if args.bench {
+            ignored += 1;
+            println!("ignored");
+            continue;
+        }
+
+        match run_test(test.body).await {
+            Ok(()) => {
+                passed += 1;
+                println!("ok");
+            }
+            Err(failed) => {
+                println!("FAILED");
+                failures.push((test.name.clone(), failed.message().map(ToOwned::to_owned)));
+            }
+        }
+    }
+
+    print_failures(&failures);
+
+    let result = if failures.is_empty() { "ok" } else { "FAILED" };
+    println!();
+    println!(
+        "test result: {result}. {passed} passed; {} failed; {ignored} ignored; 0 measured; {filtered} filtered out; finished in {:.2}s",
+        failures.len(),
+        started.elapsed().as_secs_f64(),
+    );
+    println!();
+
+    failures.is_empty()
+}
+
+fn main() -> ExitCode {
+    let args = Arguments::from_args();
+
+    // The test result travels back from the runtime thread to main() so
+    // `main` can return its exit code after `run_headless` returns.
+    let (passed_tx, passed_rx) = std_mpsc::channel::<bool>();
 
     wry_launch::run_headless(move || async move {
-        let (tx, mut rx) = mpsc::unbounded_channel::<TestRequest>();
-        TASK_TX
-            .set(tx)
-            .map_err(|_| ())
-            .expect("test driver already initialized");
-
-        // libtest_mimic blocks its calling thread; run it on a dedicated
-        // blocking task so the runtime stays free to drive test futures and
-        // service IPC from the webview event loop.
-        let runner =
-            tokio::task::spawn_blocking(move || libtest_mimic::run(&args, trials));
-        tokio::pin!(runner);
-
-        let conc = loop {
-            tokio::select! {
-                Some(req) = rx.recv() => {
-                    let result = AssertUnwindSafe((req.body)())
-                        .catch_unwind()
-                        .await;
-                    let reply = match result {
-                        Ok(()) => Ok(()),
-                        Err(payload) => Err(extract_panic_message(payload)),
-                    };
-                    let _ = req.done.send(reply);
-                }
-                res = &mut runner => {
-                    break res.expect("libtest_mimic runner panicked");
-                }
-            }
-        };
-
-        *conclusion_for_app.lock().unwrap() = Some(conc);
+        let passed = run_tests(args, build_tests()).await;
+        passed_tx
+            .send(passed)
+            .expect("test result receiver disappeared");
     })
-    .unwrap();
+    .expect("failed to run headless test harness");
 
-    if let Some(conc) = conclusion.lock().unwrap().take() {
-        conc.exit();
+    if passed_rx.recv().expect("test result sender disappeared") {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(101)
     }
 }
