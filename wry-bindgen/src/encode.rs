@@ -533,37 +533,18 @@ impl BinaryEncode for JsValue {
 }
 
 impl BinaryDecode for JsValue {
-    fn decode(decoder: &mut DecodedData) -> Result<Self, DecodeError> {
-        // JS encodes the explicit heap slot id so the two heaps stay in sync
-        // even if Rust's decode is deferred (e.g. a buffered Respond that
-        // doesn't match the active flush's seq_id). Previously we relied on
-        // lock-step counters here, which broke under out-of-order Responds.
-        let id = decoder.take_u64()?;
-        with_runtime(|runtime| {
-            // Keep max_id >= id + 1 so a later placeholder allocation can't
-            // collide with an id JS already used.
-            if id >= runtime.current_max_id() {
-                runtime.bump_max_id_to(id + 1);
-            }
-        });
-        Ok(JsValue::from_id(id))
+    fn decode(_: &mut DecodedData) -> Result<Self, DecodeError> {
+        // JS value is always in sync with the dom. We should never need to decode it.
+        // Use get_next_heap_id() (NOT get_next_placeholder_id()) because decode() is
+        // called for callback parameters from JS, not for return value placeholders.
+        with_runtime(|runtime| Ok(JsValue::from_id(runtime.get_next_heap_id())))
     }
 }
 
 impl BatchableResult for JsValue {
     fn try_placeholder(batch: &mut Runtime) -> Option<Self> {
-        // Only use a placeholder in batch mode — JS's `pushReservationScope`
-        // pre-allocates slots for batched HeapRef returns, so Rust's
-        // placeholder id matches the slot JS will `fillNextReserved` into.
-        //
-        // In non-batch mode JS writes the slot id explicitly into the Respond
-        // (see `HeapRefType.encode`), so Rust must decode that id instead of
-        // inventing one — returning None here routes to `JsValue::decode`.
-        if batch.is_batching() {
-            Some(JsValue::from_id(batch.get_next_placeholder_id()))
-        } else {
-            None
-        }
+        // Use get_next_placeholder_id() to track reserved slots for JS
+        Some(JsValue::from_id(batch.get_next_placeholder_id()))
     }
 }
 

@@ -147,44 +147,18 @@ impl WryIPC {
 }
 
 pub(crate) fn progress_js_with<O>(
-    expected_seq: u32,
     with_respond: impl for<'a> Fn(DecodedData<'a>) -> O,
 ) -> Option<O> {
-    // Check the buffer first — a prior flush may have pulled the Respond we
-    // want while it was waiting for a different one.
-    let from_buffer = with_runtime(|r| r.take_buffered_respond(expected_seq));
-    let response = match from_buffer {
-        Some(msg) => msg,
-        None => with_runtime(|runtime| runtime.ipc().receivers.write().recv_blocking())?,
-    };
+    let response = with_runtime(|runtime| runtime.ipc().receivers.write().recv_blocking())?;
 
-    let mut non_matching_seq: Option<u32> = None;
-    let result = {
-        let decoder = response.decoded().expect("Failed to decode response");
-        match decoder {
-            DecodedVariant::Respond { seq_id, data } => {
-                if seq_id == expected_seq {
-                    Some(with_respond(data))
-                } else {
-                    non_matching_seq = Some(seq_id);
-                    None
-                }
-            }
-            DecodedVariant::Evaluate { mut data } => {
-                handle_rust_callback(&mut data);
-                None
-            }
+    let decoder = response.decoded().expect("Failed to decode response");
+    match decoder {
+        DecodedVariant::Respond { data } => Some(with_respond(data)),
+        DecodedVariant::Evaluate { mut data } => {
+            handle_rust_callback(&mut data);
+            None
         }
-    };
-
-    if let Some(seq_id) = non_matching_seq {
-        // Respond arrived for a different waiting flush (JS processed Rust
-        // Evaluates out of send order). Park it so the right flush can claim
-        // it when it gets around to recv_blocking.
-        with_runtime(|r| r.buffer_respond(seq_id, response));
     }
-
-    result
 }
 
 pub async fn handle_callbacks() {

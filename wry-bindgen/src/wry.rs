@@ -5,7 +5,6 @@
 //! to enable wry-bindgen functionality.
 
 use alloc::boxed::Box;
-use alloc::collections::VecDeque;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -104,20 +103,6 @@ struct WebviewState {
     loading_state: WebviewLoadingState,
     // A function that evaluates scripts in the webview
     evaluate_script: Box<dyn FnMut(&str)>,
-    /// Rust->JS Evaluates queued while a JS sync-XHR chain is active but the
-    /// responder slot is momentarily empty (Rust just replied with an
-    /// Evaluate — `respond_to_request` cleared `ongoing_request` — and JS
-    /// hasn't yet opened the next XHR in the chain). If we fell through to
-    /// `evaluate_script` here, the Evaluate would land in JS's macrotask
-    /// queue and run AFTER the in-flight XHR unblocks, skewing the order JS
-    /// processes Rust work vs. the order Rust expects Responds back. Queueing
-    /// until the next XHR arrives lets that XHR's responder carry the work
-    /// inline, preserving order.
-    ///
-    /// On webview shutdown, anything still in this queue is dropped. The
-    /// corresponding `flush_and_then` would block forever on `recv_blocking`,
-    /// but the runtime is going away with it so this is intentional.
-    queued_rust_msgs: VecDeque<IPCMessage>,
 }
 
 impl WebviewState {
@@ -130,26 +115,7 @@ impl WebviewState {
             sender,
             loading_state: WebviewLoadingState::default(),
             evaluate_script: Box::new(evaluate_script),
-            queued_rust_msgs: VecDeque::new(),
         }
-    }
-
-    /// Build the HTTP response body for an IPC message. Base64 because sync
-    /// XMLHttpRequest can't use `responseType="arraybuffer"`.
-    fn ipc_response(msg: IPCMessage) -> Response<Vec<u8>> {
-        let body = msg.into_data();
-        let engine = base64::engine::general_purpose::STANDARD;
-        let body_base64 = engine.encode(&body);
-        http::Response::builder()
-            .status(200)
-            .header("Content-Type", "text/plain")
-            .body(body_base64.into_bytes())
-            .expect("Failed to build response")
-    }
-
-    /// Respond to a specific XHR responder with a raw IPC message payload.
-    fn respond_to_responder(responder: WryBindgenResponder, msg: IPCMessage) {
-        responder.respond(Self::ipc_response(msg));
     }
 
     fn set_ongoing_request(&mut self, responder: WryBindgenResponder) {
@@ -171,7 +137,17 @@ impl WebviewState {
 
     fn respond_to_request(&mut self, response: IPCMessage) {
         if let Some(responder) = self.take_ongoing_request() {
-            Self::respond_to_responder(responder, response);
+            let body = response.into_data();
+            // Encode as base64 - sync XMLHttpRequest cannot use responseType="arraybuffer"
+            let engine = base64::engine::general_purpose::STANDARD;
+            let body_base64 = engine.encode(&body);
+            responder.respond(
+                http::Response::builder()
+                    .status(200)
+                    .header("Content-Type", "text/plain")
+                    .body(body_base64.into_bytes())
+                    .expect("Failed to build response"),
+            );
         } else {
             panic!("WARNING: respond_to_request called but no pending request! Response dropped.");
         }
@@ -303,32 +279,23 @@ impl ProtocolHandler {
                 MessageType::Evaluate => {
                     webview_state.pending_rust_evaluates += 1;
                     webview_state.set_ongoing_request(responder);
-                    webview_state.sender.start_send(msg);
                 }
-                // Response from JS to a previous Rust Evaluate. If Rust has
-                // queued Evaluates waiting for a carrier XHR, route one back
-                // via this responder (instead of holding it or blank-responding)
-                // so JS processes it inline.
+                // Response from JS to a previous Evaluate - decrement pending count and respond accordingly
                 MessageType::Respond => {
                     webview_state.pending_js_evaluates =
                         webview_state.pending_js_evaluates.saturating_sub(1);
-
-                    if let Some(queued) = webview_state.queued_rust_msgs.pop_front() {
-                        WebviewState::respond_to_responder(responder, queued);
-                    } else if webview_state.pending_rust_evaluates > 0
+                    if webview_state.pending_rust_evaluates > 0
                         || webview_state.pending_js_evaluates > 0
                     {
+                        // Still more round-trips expected
                         webview_state.set_ongoing_request(responder);
                     } else {
+                        // Conversation is over
                         responder.respond(blank_response());
                     }
-                    // Push the Respond payload regardless — seq_id matching on
-                    // the Rust side (see `progress_js_with`) routes it to the
-                    // correct flush_and_then, even if FIFO order doesn't match
-                    // Rust's send order.
-                    webview_state.sender.start_send(msg);
                 }
             }
+            webview_state.sender.start_send(msg);
             return None;
         }
 
@@ -471,20 +438,9 @@ impl WryBindgen {
             }
         }
 
-        // If there's an ongoing XHR, reply to it immediately (inline with JS's
-        // sync-XHR chain).
+        // If there is an ongoing request, respond to immediately
         if webview_state.has_pending_request() {
             webview_state.respond_to_request(ipc_msg);
-            return;
-        }
-
-        // No ongoing XHR. If JS has a sync-XHR chain in flight
-        // (pending_rust_evaluates > 0) the responder is only empty transiently:
-        // the next Respond XHR will arrive and can carry this Evaluate. Queue
-        // instead of `evaluate_script` so JS processes it inline in the XHR
-        // chain rather than as a later macrotask.
-        if ty == MessageType::Evaluate && webview_state.pending_rust_evaluates > 0 {
-            webview_state.queued_rust_msgs.push_back(ipc_msg);
             return;
         }
 
