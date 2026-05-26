@@ -10,45 +10,29 @@ use core::cell::{Ref, RefCell, RefMut};
 use std::boxed::Box;
 
 use crate::encode::{BatchableResult, BinaryDecode};
+use crate::id_allocator::IdAllocator;
 use crate::ipc::DecodedData;
 use crate::ipc::{EncodedData, IPCMessage, MessageType};
 use crate::lazy::ThreadLocalKey;
 use crate::runtime::WryIPC;
-use crate::value::{JSIDX_OFFSET, JSIDX_RESERVED};
+use crate::type_cache::TypeCache;
+use crate::value::JSIDX_RESERVED;
 
 /// State for batching operations and object storage.
 /// Every evaluation is a batch - it may just have one operation.
 ///
-/// Uses a free-list strategy for heap ID allocation to stay in sync with JS heap.
 /// Also stores exported Rust structs and callback functions.
 pub struct Runtime {
     /// The encoder accumulating batched operations
     encoder: EncodedData,
-    /// Stack of freed IDs available for reuse
-    free_ids: Vec<u64>,
-    /// Next ID to allocate if free_ids is empty
-    max_id: u64,
-    /// A stack of ongoing function encodings with the ids
-    /// that need to be freed after each one is done
-    ids_to_free: Vec<Vec<u64>>,
+    /// Allocator for heap and borrow-stack IDs that mirror the JS runtime.
+    id_allocator: IdAllocator,
     /// Whether we're inside a batch() call
     is_batching: bool,
-    /// Borrow stack pointer - uses indices 1-127, growing downward from JSIDX_OFFSET (128) to 1
-    /// Reset after each operation completes
-    borrow_stack_pointer: u64,
-    /// Frame stack for nested operations - saves borrow stack pointers
-    borrow_frame_stack: Vec<u64>,
-    /// Count of IDs reserved as placeholders during the current batch.
-    /// This is sent to JS so it can skip these IDs during nested callback allocations.
-    reserved_placeholder_count: u32,
-    /// Type cache for avoiding resending type definitions to JS
-    type_cache: BTreeMap<Vec<u8>, u32>,
-    /// Next type ID to assign
-    next_type_id: u32,
+    /// Type cache for avoiding resending type definitions to JS.
+    type_cache: TypeCache,
     /// Exported Rust structs stored by handle
     objects: BTreeMap<u32, Box<dyn Any>>,
-    /// Next handle to assign for exported objects
-    next_object_handle: u32,
     /// The ipc layer used to communicate with the JS runtime
     ipc: WryIPC,
     /// The id of the webview this is associated with
@@ -61,25 +45,11 @@ impl Runtime {
     pub(crate) fn new(ipc: WryIPC, webview_id: u64) -> Self {
         Self {
             encoder: Self::new_encoder_for_evaluate(),
-            free_ids: Vec::new(),
-            // Start allocating heap IDs from JSIDX_RESERVED to match JS heap
-            max_id: JSIDX_RESERVED,
-            ids_to_free: Vec::new(),
+            id_allocator: IdAllocator::new(),
             is_batching: false,
-            // Borrow stack starts at JSIDX_OFFSET (128) and grows downward to 1
-            borrow_stack_pointer: JSIDX_OFFSET,
-            // Frame stack starts empty
-            borrow_frame_stack: Vec::new(),
-            // No reserved placeholders initially
-            reserved_placeholder_count: 0,
-            // Type cache starts empty
-            type_cache: BTreeMap::new(),
-            // Type IDs start at 0
-            next_type_id: 0,
+            type_cache: TypeCache::new(),
             // Object store starts empty
             objects: BTreeMap::new(),
-            // Object handles start at 0
-            next_object_handle: 0,
             ipc,
             webview_id,
             thread_locals: BTreeMap::new(),
@@ -93,72 +63,39 @@ impl Runtime {
     }
 
     /// Get the next heap ID for placeholder allocation.
-    /// Uses free-list strategy: reuses freed IDs first, then allocates new ones.
     pub fn get_next_heap_id(&mut self) -> u64 {
-        let id = self.max_id;
-        self.max_id += 1;
-        id
+        self.id_allocator.next_heap_id()
     }
 
     /// Get the next heap ID for a batched return value placeholder.
     /// This also tracks the reserved placeholder count so JS can skip these IDs
     /// during nested callback allocations.
     pub fn get_next_placeholder_id(&mut self) -> u64 {
-        let id = self.get_next_heap_id();
-        if self.is_batching {
-            self.reserved_placeholder_count += 1;
-        }
-        id
+        self.id_allocator.next_placeholder_id(self.is_batching)
     }
 
     /// Get the next borrow ID from the borrow stack (indices 1-127).
     /// The borrow stack grows downward from JSIDX_OFFSET (128) toward 1.
     /// Panics if the borrow stack overflows (more than 127 borrowed refs in one operation).
     pub fn get_next_borrow_id(&mut self) -> u64 {
-        if self.borrow_stack_pointer <= 1 {
-            panic!("Borrow stack overflow: too many borrowed references in a single operation");
-        }
-        self.borrow_stack_pointer -= 1;
-        self.borrow_stack_pointer
+        self.id_allocator.next_borrow_id()
     }
 
     /// Push a borrow frame before a nested operation that may use borrowed refs.
     /// This saves the current borrow stack pointer so we can restore it later.
     pub fn push_borrow_frame(&mut self) {
-        self.borrow_frame_stack.push(self.borrow_stack_pointer);
+        self.id_allocator.push_borrow_frame();
     }
 
     /// Pop a borrow frame after a nested operation completes.
     /// This restores the borrow stack pointer to where it was before the nested operation.
     pub fn pop_borrow_frame(&mut self) {
-        if let Some(saved_pointer) = self.borrow_frame_stack.pop() {
-            self.borrow_stack_pointer = saved_pointer;
-        } else {
-            panic!("pop_borrow_frame called with empty frame stack");
-        }
+        self.id_allocator.pop_borrow_frame();
     }
 
-    /// Release a heap ID back to the free-list and queue it for JS drop.
+    /// Track a heap ID as released and queue it for JS drop when appropriate.
     pub fn release_heap_id(&mut self, id: u64) -> Option<u64> {
-        // Never release reserved IDs
-        if id < JSIDX_RESERVED {
-            unreachable!("Attempted to release reserved JS heap ID {}", id);
-        }
-
-        debug_assert!(
-            !self.free_ids.contains(&id) && !self.ids_to_free.iter().any(|ids| ids.contains(&id)),
-            "Double-free detected for heap ID {id}"
-        );
-        match self.ids_to_free.last_mut() {
-            Some(ids) => {
-                ids.push(id);
-                None
-            }
-            None => {
-                self.free_ids.push(id);
-                Some(id)
-            }
-        }
+        self.id_allocator.release_heap_id(id)
     }
 
     /// Take the message data and reset the batch for reuse.
@@ -177,19 +114,11 @@ impl Runtime {
     }
 
     pub(crate) fn push_ids_to_free(&mut self) {
-        self.ids_to_free.push(Vec::new());
+        self.id_allocator.push_ids_to_free();
     }
 
     pub(crate) fn pop_and_release_ids(&mut self) -> Vec<u64> {
-        let mut to_free = Vec::new();
-        if let Some(ids) = self.ids_to_free.pop() {
-            for id in ids {
-                if let Some(freed_id) = self.release_heap_id(id) {
-                    to_free.push(freed_id);
-                }
-            }
-        }
-        to_free
+        self.id_allocator.pop_and_release_ids()
     }
 
     pub(crate) fn set_batching(&mut self, batching: bool) {
@@ -203,7 +132,7 @@ impl Runtime {
     /// Take and reset the reserved placeholder count.
     /// Called when building a message to send to JS.
     pub(crate) fn take_reserved_placeholder_count(&mut self) -> u32 {
-        core::mem::take(&mut self.reserved_placeholder_count)
+        self.id_allocator.take_reserved_placeholder_count()
     }
 
     pub(crate) fn take_encoder(&mut self) -> EncodedData {
@@ -221,20 +150,12 @@ impl Runtime {
     /// Get or create a type ID for the given type definition bytes.
     /// Returns (type_id, is_cached) where is_cached is true if the type was already in the cache.
     pub(crate) fn get_or_create_type_id(&mut self, type_bytes: Vec<u8>) -> (u32, bool) {
-        if let Some(&id) = self.type_cache.get(&type_bytes) {
-            (id, true)
-        } else {
-            let id = self.next_type_id;
-            self.next_type_id += 1;
-            self.type_cache.insert(type_bytes, id);
-            (id, false)
-        }
+        self.type_cache.get_or_create_type_id(type_bytes)
     }
 
     /// Insert an exported object and return its handle.
     pub(crate) fn insert_object<T: 'static>(&mut self, obj: T) -> u32 {
-        let handle = self.next_object_handle;
-        self.next_object_handle = self.next_object_handle.wrapping_add(1);
+        let handle = self.id_allocator.next_object_handle();
         self.objects.insert(handle, Box::new(RefCell::new(obj)));
         handle
     }

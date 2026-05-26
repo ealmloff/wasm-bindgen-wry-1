@@ -24,6 +24,7 @@ pub mod convert;
 pub mod encode;
 pub mod function;
 mod function_registry;
+mod id_allocator;
 mod intern;
 pub(crate) mod ipc;
 mod js_helpers;
@@ -31,6 +32,7 @@ mod lazy;
 #[doc(hidden)]
 pub mod object_store;
 pub mod runtime;
+mod type_cache;
 mod value;
 pub mod wry;
 
