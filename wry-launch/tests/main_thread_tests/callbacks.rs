@@ -125,6 +125,45 @@ pub(crate) fn test_mut_dyn_fnmut() {
     assert_eq!(call_count, 1, "FnMut was not called exactly once");
 }
 
+pub(crate) fn test_batch_flushed_heap_ref_return_with_stack_callback() {
+    #[wasm_bindgen(inline_js = r#"
+        export function make_heap_ref(label) {
+            return { label };
+        }
+
+        export function call_stack_callback_and_return_heap_ref(cb, value) {
+            return { called: cb(value), value };
+        }
+
+        export function read_u32_field(obj, field) {
+            return obj[field];
+        }
+    "#)]
+    extern "C" {
+        fn make_heap_ref(label: u32) -> JsValue;
+        fn call_stack_callback_and_return_heap_ref(
+            cb: &mut dyn FnMut(u32) -> u32,
+            value: u32,
+        ) -> JsValue;
+        fn read_u32_field(obj: &JsValue, field: &str) -> u32;
+    }
+
+    let pending = make_heap_ref(7);
+    let mut call_count = 0;
+    let returned = call_stack_callback_and_return_heap_ref(
+        &mut |value| {
+            call_count += 1;
+            value + 1
+        },
+        41,
+    );
+
+    assert_eq!(call_count, 1, "stack callback was not called exactly once");
+    assert_eq!(read_u32_field(&pending, "label"), 7);
+    assert_eq!(read_u32_field(&returned, "called"), 42);
+    assert_eq!(read_u32_field(&returned, "value"), 41);
+}
+
 // Tests for &mut dyn Fn with multiple arities
 pub(crate) fn test_mut_dyn_fn_many_arity() {
     #[wasm_bindgen(inline_js = r#"

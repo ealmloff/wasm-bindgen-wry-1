@@ -13,6 +13,7 @@ mod indexing;
 mod is_type_of;
 mod jsvalue;
 mod module_import;
+mod opaque_id_stress;
 mod reentrant_callbacks;
 mod roundtrip;
 mod string_enum;
@@ -73,18 +74,25 @@ async fn async_test_with_js_context<Fut: std::future::Future<Output = ()>, F: Fn
 
 fn main() {
     wry_launch::run_headless(|| async {
-        // Batch stress test first — reproduces the U8BufferEmpty decode
-        // failure (issue #21). It drives thousands of JS->Rust and Rust->JS
-        // roundtrips so gets a wider timeout than the default 5s.
-        async fn run_batch_stress() {
-            let f = || batch_stress::test_batch_stress_browser_event_callbacks();
-            println!("testing batch_stress outside of batch");
+        // Opaque-id stress first — reproduces duplicate Rust ownership of the
+        // same JS heap id before later tests can perturb heap allocation shape.
+        async fn run_opaque_id_stress() {
+            let f = || opaque_id_stress::test_opaque_id_double_free_stress();
+            println!("testing opaque_id_stress inside of batch");
             select! {
-                result = f() => result,
+                result = batch_async(f()) => result,
                 _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                    panic!("batch_stress outside-of-batch timed out after 30s");
+                    panic!("opaque_id_stress inside-of-batch timed out after 30s");
                 }
             };
+        }
+
+        // Batch stress test next — reproduces the U8BufferEmpty decode
+        // failure (issue #21). The batched case runs with a cold type cache,
+        // which catches cached type IDs being observed by JS before the
+        // corresponding full type definition.
+        async fn run_batch_stress() {
+            let f = || batch_stress::test_batch_stress_browser_event_callbacks();
             println!("testing batch_stress inside of batch");
             select! {
                 result = batch_async(f()) => result,
@@ -93,6 +101,7 @@ fn main() {
                 }
             };
         }
+        run_opaque_id_stress().await;
         run_batch_stress().await;
 
         // Adding numbers with and without batching
@@ -110,6 +119,8 @@ fn main() {
         // &mut dyn Fn and &mut dyn FnMut tests
         test_with_js_context(callbacks::test_mut_dyn_fn).await;
         test_with_js_context(callbacks::test_mut_dyn_fnmut).await;
+        test_with_js_context(callbacks::test_batch_flushed_heap_ref_return_with_stack_callback)
+            .await;
         test_with_js_context(callbacks::test_mut_dyn_fn_many_arity).await;
         test_with_js_context(callbacks::test_mut_dyn_fnmut_many_arity).await;
 
