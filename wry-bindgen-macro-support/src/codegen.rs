@@ -27,6 +27,40 @@ fn clippy_allows() -> TokenStream {
     }
 }
 
+fn generate_member_type_helpers(
+    arg_types: &[TokenStream],
+    return_type: Option<TokenStream>,
+    krate: &TokenStream,
+    span: proc_macro2::Span,
+) -> TokenStream {
+    let return_body = match return_type {
+        Some(ty) => quote_spanned! {span=>
+            let mut ty = #krate::alloc::vec::Vec::new();
+            <#ty as #krate::EncodeTypeDef>::encode_type_def(&mut ty);
+            ::core::option::Option::Some(ty)
+        },
+        None => quote_spanned! {span=> ::core::option::Option::None },
+    };
+
+    quote_spanned! {span=>
+        fn __wry_arg_types() -> #krate::alloc::vec::Vec<#krate::alloc::vec::Vec<u8>> {
+            #krate::alloc::vec![
+                #(
+                {
+                    let mut ty = #krate::alloc::vec::Vec::new();
+                    <#arg_types as #krate::EncodeTypeDef>::encode_type_def(&mut ty);
+                    ty
+                }
+                ),*
+            ]
+        }
+
+        fn __wry_return_type() -> ::core::option::Option<#krate::alloc::vec::Vec<u8>> {
+            #return_body
+        }
+    }
+}
+
 /// Generate code for the entire program
 pub fn generate(program: &Program) -> syn::Result<TokenStream> {
     let mut tokens = TokenStream::new();
@@ -1957,14 +1991,20 @@ fn generate_field_accessor(
 
     // Generate JsClassMemberSpec for the property getter
     let js_class_name = struct_name.to_string();
+    let getter_type_helpers =
+        generate_member_type_helpers(&[], Some(quote_spanned! {span=> #field_ty }), krate, span);
     let getter_member_spec = quote_spanned! {span=>
         const _: () = {
+            #getter_type_helpers
+
             #[allow(non_upper_case_globals)]
             static __GETTER_MEMBER_SPEC: #krate::JsClassMemberSpec = #krate::JsClassMemberSpec::new(
                 #js_class_name,
                 #js_field_name,
                 #getter_name,
                 0,
+                __wry_arg_types,
+                __wry_return_type,
                 #krate::JsClassMemberKind::Getter
             );
 
@@ -1976,14 +2016,21 @@ fn generate_field_accessor(
 
     // Generate JsClassMemberSpec for the property setter (unless readonly)
     let setter_member_spec = if !field.readonly {
+        let setter_arg_types = vec![quote_spanned! {span=> #field_ty }];
+        let setter_type_helpers =
+            generate_member_type_helpers(&setter_arg_types, None, krate, span);
         quote_spanned! {span=>
             const _: () = {
+                #setter_type_helpers
+
                 #[allow(non_upper_case_globals)]
                 static __SETTER_MEMBER_SPEC: #krate::JsClassMemberSpec = #krate::JsClassMemberSpec::new(
                     #js_class_name,
                     #js_field_name,
                     #setter_name,
                     1,
+                    __wry_arg_types,
+                    __wry_return_type,
                     #krate::JsClassMemberKind::Setter
                 );
 
@@ -2030,6 +2077,10 @@ fn generate_inspectable(
     let struct_name_str = struct_name.to_string();
 
     let js_name_str = js_name.to_string();
+    let string_return_type = Some(quote_spanned! {span=> ::alloc::string::String });
+    let to_json_type_helpers =
+        generate_member_type_helpers(&[], string_return_type.clone(), krate, span);
+    let to_string_type_helpers = generate_member_type_helpers(&[], string_return_type, krate, span);
 
     Ok(quote_spanned! {span=>
         const _: () = {
@@ -2062,12 +2113,16 @@ fn generate_inspectable(
 
         // JsClassMemberSpec for toJSON method
         const _: () = {
+            #to_json_type_helpers
+
             #[allow(non_upper_case_globals)]
             static __TO_JSON_MEMBER_SPEC: #krate::JsClassMemberSpec = #krate::JsClassMemberSpec::new(
                 #js_name_str,
                 "toJSON",
                 #to_json_name,
                 0,
+                __wry_arg_types,
+                __wry_return_type,
                 #krate::JsClassMemberKind::Method
             );
 
@@ -2098,12 +2153,16 @@ fn generate_inspectable(
 
         // JsClassMemberSpec for toString method
         const _: () = {
+            #to_string_type_helpers
+
             #[allow(non_upper_case_globals)]
             static __TO_STRING_MEMBER_SPEC: #krate::JsClassMemberSpec = #krate::JsClassMemberSpec::new(
                 #js_name_str,
                 "toString",
                 #to_string_name,
                 0,
+                __wry_arg_types,
+                __wry_return_type,
                 #krate::JsClassMemberKind::Method
             );
 
@@ -2319,6 +2378,23 @@ fn generate_export_method(method: &ExportMethod, krate: &TokenStream) -> syn::Re
 
     // Generate JsClassMemberSpec for the method
     let arg_count = method.arguments.len();
+    let member_arg_types: Vec<TokenStream> = method
+        .arguments
+        .iter()
+        .map(|arg| {
+            let ty = &arg.ty;
+            quote_spanned! {span=> #ty }
+        })
+        .collect();
+    let member_return_type = match &method.kind {
+        ExportMethodKind::Constructor => {
+            Some(quote_spanned! {span=> #krate::object_store::ObjectHandle })
+        }
+        ExportMethodKind::Setter { .. } => None,
+        _ => method.ret.as_ref().map(|ty| quote_spanned! {span=> #ty }),
+    };
+    let member_type_helpers =
+        generate_member_type_helpers(&member_arg_types, member_return_type, krate, span);
     let (member_name, member_kind) = match &method.kind {
         ExportMethodKind::Constructor => (
             js_name.clone(),
@@ -2344,12 +2420,16 @@ fn generate_export_method(method: &ExportMethod, krate: &TokenStream) -> syn::Re
 
     let js_class_member_spec = quote_spanned! {span=>
         const _: () = {
+            #member_type_helpers
+
             #[allow(non_upper_case_globals)]
             static __CLASS_MEMBER_SPEC: #krate::JsClassMemberSpec = #krate::JsClassMemberSpec::new(
                 #class_str,
                 #member_name,
                 #export_name,
                 #arg_count,
+                __wry_arg_types,
+                __wry_return_type,
                 #member_kind
             );
 

@@ -19,6 +19,7 @@ mod borrow_stack;
 mod callbacks;
 mod catch_attribute;
 mod clamped;
+mod export_call;
 mod indexing;
 mod is_type_of;
 mod jsvalue;
@@ -241,6 +242,8 @@ fn build_tests() -> Vec<TestCase> {
         catch_attribute::test_catch_with_arguments,
         catch_attribute::test_catch_method,
         structs::test_struct_bindings,
+        export_call::test_js_calls_exported_usize_js_thunk,
+        export_call::test_js_calls_exported_usize_js_thunk_batched,
         clamped::test_clamped_is_uint8clampedarray,
         clamped::test_clamped_vec_is_uint8clampedarray,
         clamped::test_clamped_js_clamping_behavior,
