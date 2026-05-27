@@ -1,5 +1,5 @@
 import { DataEncoder, DataDecoder } from "./encoding";
-import { RustFunction } from "./rust_function";
+import { RustFunction, RustFunctionPolicy } from "./rust_function";
 
 /**
  * Type tags for the binary type definition protocol.
@@ -60,12 +60,16 @@ class BoolType implements TypeClass {
  */
 class HeapRefType implements TypeClass {
   encode(encoder: DataEncoder, obj: unknown): void {
-    // Insert into heap but don't encode the id - Rust side is in sync with the slab
-    window.jsHeap.insert(obj);
+    // Rust assigns the ID. JS either stores immediately for responses or defers
+    // request arguments until Rust sends the exact ID to install.
+    encoder.pushHeapRef(obj);
   }
 
   decode(decoder: DataDecoder): unknown {
     const id = decoder.takeU64();
+    if (!window.jsHeap.has(id)) {
+      throw new Error(`Unknown JS heap reference ID: ${id}`);
+    }
     return window.jsHeap.get(id);
   }
 }
@@ -83,6 +87,9 @@ class BorrowedRefType implements TypeClass {
 
   decode(decoder: DataDecoder): unknown {
     const id = decoder.takeU64();
+    if (!window.jsHeap.has(id)) {
+      throw new Error(`Unknown borrowed JS reference ID: ${id}`);
+    }
     // Works for both heap refs (128+) and borrow stack refs (1-127)
     return window.jsHeap.get(id);
   }
@@ -142,8 +149,13 @@ class CallbackType implements TypeClass {
 
   decode(decoder: DataDecoder): (...args: any[]) => any {
     const fnId = decoder.takeU32();
-    const f = new RustFunction(fnId, this.paramTypes, this.returnType);
-    return (...args: any[]) => f.call(...args);
+    const policy = decoder.takeU32() as RustFunctionPolicy;
+    const rustFunction = new RustFunction(fnId, this.paramTypes, this.returnType, policy);
+    const callable = (...args: any[]) => rustFunction.call(...args);
+    Object.defineProperty(callable, "__wryRustFunction", {
+      value: rustFunction,
+    });
+    return callable;
   }
 }
 

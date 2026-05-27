@@ -1,6 +1,6 @@
 use futures_util::{StreamExt, stream::futures_unordered};
 use std::cell::Cell;
-use wasm_bindgen::{Closure, wasm_bindgen};
+use wasm_bindgen::{Closure, batch::batch, wasm_bindgen};
 use wry_launch::JsValue;
 
 pub(crate) fn test_call_callback() {
@@ -34,6 +34,55 @@ pub(crate) async fn test_call_callback_async() {
     calls_callback_async(callback, random);
     let result = result_rx.next().await.unwrap();
     assert_eq!(result, random + 1);
+}
+
+pub(crate) fn test_dropped_closure_disposes_js_callable() {
+    #[wasm_bindgen(inline_js = r#"
+        let storedDroppedCallback = null;
+
+        export function store_callback_for_drop_test(cb) {
+            storedDroppedCallback = cb;
+        }
+
+        export function dropped_callback_throws_after_rust_drop() {
+            try {
+                storedDroppedCallback(1);
+                return false;
+            } catch (error) {
+                return String(error && error.message ? error.message : error)
+                    .includes("already been dropped");
+            }
+        }
+
+        export function clear_callback_for_drop_test() {
+            storedDroppedCallback = null;
+        }
+    "#)]
+    extern "C" {
+        fn store_callback_for_drop_test(cb: &Closure<dyn FnMut(u32)>);
+        fn dropped_callback_throws_after_rust_drop() -> bool;
+        fn clear_callback_for_drop_test();
+    }
+
+    let called = std::rc::Rc::new(Cell::new(false));
+    let called_clone = called.clone();
+    let callback = Closure::new(move |_| {
+        called_clone.set(true);
+    });
+
+    store_callback_for_drop_test(&callback);
+    drop(callback);
+
+    assert!(
+        dropped_callback_throws_after_rust_drop(),
+        "dropped closure should dispose the JS callable"
+    );
+    assert!(
+        !called.get(),
+        "dropped closure should not call back into Rust"
+    );
+
+    clear_callback_for_drop_test();
 }
 
 pub(crate) async fn test_join_many_callbacks_async() {
@@ -162,6 +211,42 @@ pub(crate) fn test_batch_flushed_heap_ref_return_with_stack_callback() {
     assert_eq!(read_u32_field(&pending, "label"), 7);
     assert_eq!(read_u32_field(&returned, "called"), 42);
     assert_eq!(read_u32_field(&returned, "value"), 41);
+}
+
+pub(crate) fn test_js_callback_heap_ref_arg_with_pending_placeholders() {
+    #[wasm_bindgen(inline_js = r#"
+        export function make_heap_ref_for_install_test(label) {
+            return { label };
+        }
+
+        export function call_callback_with_heap_ref_arg(cb, label) {
+            cb({ label });
+        }
+
+        export function read_heap_ref_label(obj) {
+            return obj.label;
+        }
+    "#)]
+    extern "C" {
+        fn make_heap_ref_for_install_test(label: u32) -> JsValue;
+        fn call_callback_with_heap_ref_arg(cb: &Closure<dyn FnMut(JsValue)>, label: u32);
+        fn read_heap_ref_label(obj: &JsValue) -> u32;
+    }
+
+    let called = std::rc::Rc::new(Cell::new(false));
+    let called_clone = called.clone();
+    let callback = Closure::new(move |obj: JsValue| {
+        assert_eq!(read_heap_ref_label(&obj), 99);
+        called_clone.set(true);
+    });
+
+    batch(|| {
+        let pending = make_heap_ref_for_install_test(7);
+        call_callback_with_heap_ref_arg(&callback, 99);
+        assert_eq!(read_heap_ref_label(&pending), 7);
+    });
+
+    assert!(called.get(), "callback was not called");
 }
 
 // Tests for &mut dyn Fn with multiple arities

@@ -26,15 +26,15 @@ pub const CALL_EXPORT_FN_ID: u32 = 0xFFFFFFFE;
 
 /// Encode type definitions for a function call.
 /// On first call for a type signature, sends TYPE_FULL + id + param_count + type defs.
-/// On subsequent calls, sends TYPE_CACHED + id.
+/// Once JS acknowledges parsing that full definition, sends TYPE_CACHED + id.
 fn encode_function_types(encoder: &mut EncodedData, encode_types: impl FnOnce(&mut Vec<u8>)) {
     // Always encode type definitions to get the bytes
     let mut type_buf = Vec::new();
     encode_types(&mut type_buf);
 
     with_runtime(|state| {
-        let (id, is_cached) = state.get_or_create_type_id(type_buf.clone());
-        if is_cached {
+        let (id, can_use_cached) = state.get_or_create_type_id(type_buf.clone());
+        if can_use_cached {
             // Cached - just send marker + ID
             encoder.push_u8(TYPE_CACHED);
             encoder.push_u32(id);

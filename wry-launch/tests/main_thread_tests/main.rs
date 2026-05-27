@@ -1,6 +1,8 @@
 use tokio::select;
 use wasm_bindgen::{batch::batch_async, wasm_bindgen};
 
+use std::time::{Duration, Instant};
+
 mod add_number_js;
 #[allow(clippy::redundant_closure)]
 mod async_bindings;
@@ -72,154 +74,191 @@ async fn async_test_with_js_context<Fut: std::future::Future<Output = ()>, F: Fn
     .await;
 }
 
+async fn run_main_thread_tests() {
+    // Opaque-id stress first — reproduces duplicate Rust ownership of the
+    // same JS heap id before later tests can perturb heap allocation shape.
+    async fn run_opaque_id_stress() {
+        let f = || opaque_id_stress::test_opaque_id_double_free_stress();
+        println!("testing opaque_id_stress inside of batch");
+        select! {
+            result = batch_async(f()) => result,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                panic!("opaque_id_stress inside-of-batch timed out after 30s");
+            }
+        };
+    }
+
+    // Batch stress test next — reproduces the U8BufferEmpty decode
+    // failure (issue #21). The batched case runs with a cold type cache,
+    // which catches cached type IDs being observed by JS before the
+    // corresponding full type definition.
+    async fn run_batch_stress() {
+        let f = || batch_stress::test_batch_stress_browser_event_callbacks();
+        println!("testing batch_stress inside of batch");
+        select! {
+            result = batch_async(f()) => result,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                panic!("batch_stress inside-of-batch timed out after 30s");
+            }
+        };
+    }
+    run_opaque_id_stress().await;
+    run_batch_stress().await;
+
+    // Adding numbers with and without batching
+    test_with_js_context(add_number_js::test_add_number_js).await;
+    test_with_js_context(add_number_js::test_add_number_js_batch).await;
+
+    // Roundtrip tests
+    test_with_js_context(roundtrip::test_roundtrip).await;
+
+    // Callbacks
+    test_with_js_context(callbacks::test_call_callback).await;
+    async_test_with_js_context(callbacks::test_call_callback_async).await;
+    test_with_js_context(callbacks::test_dropped_closure_disposes_js_callable).await;
+    async_test_with_js_context(callbacks::test_join_many_callbacks_async).await;
+
+    // &mut dyn Fn and &mut dyn FnMut tests
+    test_with_js_context(callbacks::test_mut_dyn_fn).await;
+    test_with_js_context(callbacks::test_mut_dyn_fnmut).await;
+    test_with_js_context(callbacks::test_batch_flushed_heap_ref_return_with_stack_callback).await;
+    test_with_js_context(callbacks::test_js_callback_heap_ref_arg_with_pending_placeholders).await;
+    test_with_js_context(callbacks::test_mut_dyn_fn_many_arity).await;
+    test_with_js_context(callbacks::test_mut_dyn_fnmut_many_arity).await;
+
+    // Reentrant callbacks (dyn Fn)
+    test_with_js_context(reentrant_callbacks::test_reentrant_fn_closure).await;
+    test_with_js_context(reentrant_callbacks::test_interleaved_fn_closures).await;
+
+    // JsValue behavior tests
+    test_with_js_context(jsvalue::test_jsvalue_constants).await;
+    test_with_js_context(jsvalue::test_jsvalue_bool).await;
+    test_with_js_context(jsvalue::test_jsvalue_default).await;
+    test_with_js_context(jsvalue::test_jsvalue_clone_reserved).await;
+    test_with_js_context(jsvalue::test_jsvalue_equality).await;
+    test_with_js_context(jsvalue::test_jsvalue_from_js).await;
+    test_with_js_context(jsvalue::test_jsvalue_pass_to_js).await;
+    test_with_js_context(jsvalue::test_jsvalue_as_string).await;
+    test_with_js_context(jsvalue::test_jsvalue_as_f64).await;
+    test_with_js_context(jsvalue::test_jsvalue_arithmetic).await;
+    test_with_js_context(jsvalue::test_jsvalue_bitwise).await;
+    test_with_js_context(jsvalue::test_jsvalue_comparisons).await;
+    test_with_js_context(jsvalue::test_jsvalue_loose_eq_coercion).await;
+    test_with_js_context(jsvalue::test_jsvalue_js_in).await;
+
+    // instanceof tests
+    test_with_js_context(jsvalue::test_instanceof_basic).await;
+    test_with_js_context(jsvalue::test_instanceof_is_instance_of).await;
+    test_with_js_context(jsvalue::test_instanceof_dyn_into).await;
+    test_with_js_context(jsvalue::test_instanceof_dyn_ref).await;
+
+    // Stable API additions tests
+    test_with_js_context(jsvalue::test_partial_eq_bool).await;
+    test_with_js_context(jsvalue::test_partial_eq_numbers).await;
+    test_with_js_context(jsvalue::test_partial_eq_strings).await;
+    test_with_js_context(jsvalue::test_try_from_f64).await;
+    test_with_js_context(jsvalue::test_try_from_string).await;
+    test_with_js_context(jsvalue::test_owned_arithmetic_operators).await;
+    test_with_js_context(jsvalue::test_owned_bitwise_operators).await;
+    test_with_js_context(jsvalue::test_jscast_as_ref).await;
+    test_with_js_context(jsvalue::test_as_ref_jsvalue).await;
+
+    // String enum tests
+    test_with_js_context(string_enum::test_string_enum_from_str).await;
+    test_with_js_context(string_enum::test_string_enum_to_str).await;
+    test_with_js_context(string_enum::test_string_enum_to_jsvalue).await;
+    test_with_js_context(string_enum::test_string_enum_from_jsvalue).await;
+    test_with_js_context(string_enum::test_string_enum_pass_to_js).await;
+    test_with_js_context(string_enum::test_string_enum_receive_from_js).await;
+
+    // Catch attribute tests
+    test_with_js_context(catch_attribute::test_catch_throws_error).await;
+    test_with_js_context(catch_attribute::test_catch_successful_call).await;
+    test_with_js_context(catch_attribute::test_catch_with_arguments).await;
+    test_with_js_context(catch_attribute::test_catch_method).await;
+
+    // Struct bindings tests
+    test_with_js_context(structs::test_struct_bindings).await;
+
+    // Clamped type tests
+    test_with_js_context(clamped::test_clamped_is_uint8clampedarray).await;
+    test_with_js_context(clamped::test_clamped_vec_is_uint8clampedarray).await;
+    test_with_js_context(clamped::test_clamped_js_clamping_behavior).await;
+    test_with_js_context(clamped::test_clamped_preserves_data).await;
+    test_with_js_context(clamped::test_clamped_empty).await;
+    test_with_js_context(clamped::test_clamped_mut_slice).await;
+
+    // Borrow stack tests
+    test_with_js_context(borrow_stack::test_borrowed_ref_in_callback).await;
+    test_with_js_context(borrow_stack::test_borrowed_ref_in_callback_with_return).await;
+    test_with_js_context(borrow_stack::test_borrowed_ref_nested_frames).await;
+    test_with_js_context(borrow_stack::test_borrowed_ref_deep_nesting).await;
+
+    // Thread local tests
+    test_with_js_context(thread_local::test_thread_local).await;
+    test_with_js_context_allow_new_js_values(thread_local::test_thread_local_window).await;
+
+    // Module import test
+    test_with_js_context(module_import::test_module_import).await;
+
+    // Indexing tests
+    test_with_js_context(indexing::test_indexing_getter_array).await;
+    test_with_js_context(indexing::test_indexing_setter_array).await;
+    test_with_js_context(indexing::test_indexing_deleter_array).await;
+
+    // is_type_of tests
+    test_with_js_context(is_type_of::test_is_type_of_string).await;
+    test_with_js_context(is_type_of::test_is_type_of_number).await;
+    test_with_js_context(is_type_of::test_is_type_of_with_dyn_into).await;
+    test_with_js_context(is_type_of::test_is_type_of_with_dyn_ref).await;
+    test_with_js_context(is_type_of::test_has_type_with_is_type_of).await;
+
+    // async bindings test
+    async_test_with_js_context(async_bindings::test_call_async).await;
+    async_test_with_js_context(async_bindings::test_call_async_returning_js_value).await;
+    async_test_with_js_context(async_bindings::test_catch_async_call_ok).await;
+    async_test_with_js_context(async_bindings::test_catch_async_call_err).await;
+    async_test_with_js_context(async_bindings::test_async_method).await;
+    async_test_with_js_context(async_bindings::test_async_method_with_catch).await;
+    async_test_with_js_context(async_bindings::test_async_static_method).await;
+    async_test_with_js_context(async_bindings::test_join_many_async).await;
+}
+
+fn repeat_for() -> Option<Duration> {
+    let from_arg = std::env::args().find_map(|arg| {
+        arg.strip_prefix("--wry-repeat-for-secs=")
+            .and_then(|value| value.parse::<u64>().ok())
+    });
+    let from_env = std::env::var("WRY_BINDGEN_REPEAT_FOR_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+
+    from_arg.or(from_env).map(Duration::from_secs)
+}
+
 fn main() {
     wry_launch::run_headless(|| async {
-        // Opaque-id stress first — reproduces duplicate Rust ownership of the
-        // same JS heap id before later tests can perturb heap allocation shape.
-        async fn run_opaque_id_stress() {
-            let f = || opaque_id_stress::test_opaque_id_double_free_stress();
-            println!("testing opaque_id_stress inside of batch");
-            select! {
-                result = batch_async(f()) => result,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                    panic!("opaque_id_stress inside-of-batch timed out after 30s");
+        if let Some(duration) = repeat_for() {
+            let start = Instant::now();
+            let mut iteration = 0u64;
+            loop {
+                iteration += 1;
+                println!(
+                    "=== main_thread_tests iteration {iteration} elapsed {:?} ===",
+                    start.elapsed()
+                );
+                run_main_thread_tests().await;
+                if start.elapsed() >= duration {
+                    println!(
+                        "=== completed {iteration} clean main_thread_tests iterations in {:?} ===",
+                        start.elapsed()
+                    );
+                    break;
                 }
-            };
+            }
+        } else {
+            run_main_thread_tests().await;
         }
-
-        // Batch stress test next — reproduces the U8BufferEmpty decode
-        // failure (issue #21). The batched case runs with a cold type cache,
-        // which catches cached type IDs being observed by JS before the
-        // corresponding full type definition.
-        async fn run_batch_stress() {
-            let f = || batch_stress::test_batch_stress_browser_event_callbacks();
-            println!("testing batch_stress inside of batch");
-            select! {
-                result = batch_async(f()) => result,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                    panic!("batch_stress inside-of-batch timed out after 30s");
-                }
-            };
-        }
-        run_opaque_id_stress().await;
-        run_batch_stress().await;
-
-        // Adding numbers with and without batching
-        test_with_js_context(add_number_js::test_add_number_js).await;
-        test_with_js_context(add_number_js::test_add_number_js_batch).await;
-
-        // Roundtrip tests
-        test_with_js_context(roundtrip::test_roundtrip).await;
-
-        // Callbacks
-        test_with_js_context(callbacks::test_call_callback).await;
-        async_test_with_js_context(callbacks::test_call_callback_async).await;
-        async_test_with_js_context(callbacks::test_join_many_callbacks_async).await;
-
-        // &mut dyn Fn and &mut dyn FnMut tests
-        test_with_js_context(callbacks::test_mut_dyn_fn).await;
-        test_with_js_context(callbacks::test_mut_dyn_fnmut).await;
-        test_with_js_context(callbacks::test_batch_flushed_heap_ref_return_with_stack_callback)
-            .await;
-        test_with_js_context(callbacks::test_mut_dyn_fn_many_arity).await;
-        test_with_js_context(callbacks::test_mut_dyn_fnmut_many_arity).await;
-
-        // Reentrant callbacks (dyn Fn)
-        test_with_js_context(reentrant_callbacks::test_reentrant_fn_closure).await;
-        test_with_js_context(reentrant_callbacks::test_interleaved_fn_closures).await;
-
-        // JsValue behavior tests
-        test_with_js_context(jsvalue::test_jsvalue_constants).await;
-        test_with_js_context(jsvalue::test_jsvalue_bool).await;
-        test_with_js_context(jsvalue::test_jsvalue_default).await;
-        test_with_js_context(jsvalue::test_jsvalue_clone_reserved).await;
-        test_with_js_context(jsvalue::test_jsvalue_equality).await;
-        test_with_js_context(jsvalue::test_jsvalue_from_js).await;
-        test_with_js_context(jsvalue::test_jsvalue_pass_to_js).await;
-        test_with_js_context(jsvalue::test_jsvalue_as_string).await;
-        test_with_js_context(jsvalue::test_jsvalue_as_f64).await;
-        test_with_js_context(jsvalue::test_jsvalue_arithmetic).await;
-        test_with_js_context(jsvalue::test_jsvalue_bitwise).await;
-        test_with_js_context(jsvalue::test_jsvalue_comparisons).await;
-        test_with_js_context(jsvalue::test_jsvalue_loose_eq_coercion).await;
-        test_with_js_context(jsvalue::test_jsvalue_js_in).await;
-
-        // instanceof tests
-        test_with_js_context(jsvalue::test_instanceof_basic).await;
-        test_with_js_context(jsvalue::test_instanceof_is_instance_of).await;
-        test_with_js_context(jsvalue::test_instanceof_dyn_into).await;
-        test_with_js_context(jsvalue::test_instanceof_dyn_ref).await;
-
-        // Stable API additions tests
-        test_with_js_context(jsvalue::test_partial_eq_bool).await;
-        test_with_js_context(jsvalue::test_partial_eq_numbers).await;
-        test_with_js_context(jsvalue::test_partial_eq_strings).await;
-        test_with_js_context(jsvalue::test_try_from_f64).await;
-        test_with_js_context(jsvalue::test_try_from_string).await;
-        test_with_js_context(jsvalue::test_owned_arithmetic_operators).await;
-        test_with_js_context(jsvalue::test_owned_bitwise_operators).await;
-        test_with_js_context(jsvalue::test_jscast_as_ref).await;
-        test_with_js_context(jsvalue::test_as_ref_jsvalue).await;
-
-        // String enum tests
-        test_with_js_context(string_enum::test_string_enum_from_str).await;
-        test_with_js_context(string_enum::test_string_enum_to_str).await;
-        test_with_js_context(string_enum::test_string_enum_to_jsvalue).await;
-        test_with_js_context(string_enum::test_string_enum_from_jsvalue).await;
-        test_with_js_context(string_enum::test_string_enum_pass_to_js).await;
-        test_with_js_context(string_enum::test_string_enum_receive_from_js).await;
-
-        // Catch attribute tests
-        test_with_js_context(catch_attribute::test_catch_throws_error).await;
-        test_with_js_context(catch_attribute::test_catch_successful_call).await;
-        test_with_js_context(catch_attribute::test_catch_with_arguments).await;
-        test_with_js_context(catch_attribute::test_catch_method).await;
-
-        // Struct bindings tests
-        test_with_js_context(structs::test_struct_bindings).await;
-
-        // Clamped type tests
-        test_with_js_context(clamped::test_clamped_is_uint8clampedarray).await;
-        test_with_js_context(clamped::test_clamped_vec_is_uint8clampedarray).await;
-        test_with_js_context(clamped::test_clamped_js_clamping_behavior).await;
-        test_with_js_context(clamped::test_clamped_preserves_data).await;
-        test_with_js_context(clamped::test_clamped_empty).await;
-        test_with_js_context(clamped::test_clamped_mut_slice).await;
-
-        // Borrow stack tests
-        test_with_js_context(borrow_stack::test_borrowed_ref_in_callback).await;
-        test_with_js_context(borrow_stack::test_borrowed_ref_in_callback_with_return).await;
-        test_with_js_context(borrow_stack::test_borrowed_ref_nested_frames).await;
-        test_with_js_context(borrow_stack::test_borrowed_ref_deep_nesting).await;
-
-        // Thread local tests
-        test_with_js_context(thread_local::test_thread_local).await;
-        test_with_js_context_allow_new_js_values(thread_local::test_thread_local_window).await;
-
-        // Module import test
-        test_with_js_context(module_import::test_module_import).await;
-
-        // Indexing tests
-        test_with_js_context(indexing::test_indexing_getter_array).await;
-        test_with_js_context(indexing::test_indexing_setter_array).await;
-        test_with_js_context(indexing::test_indexing_deleter_array).await;
-
-        // is_type_of tests
-        test_with_js_context(is_type_of::test_is_type_of_string).await;
-        test_with_js_context(is_type_of::test_is_type_of_number).await;
-        test_with_js_context(is_type_of::test_is_type_of_with_dyn_into).await;
-        test_with_js_context(is_type_of::test_is_type_of_with_dyn_ref).await;
-        test_with_js_context(is_type_of::test_has_type_with_is_type_of).await;
-
-        // async bindings test
-        async_test_with_js_context(async_bindings::test_call_async).await;
-        async_test_with_js_context(async_bindings::test_call_async_returning_js_value).await;
-        async_test_with_js_context(async_bindings::test_catch_async_call_ok).await;
-        async_test_with_js_context(async_bindings::test_catch_async_call_err).await;
-        async_test_with_js_context(async_bindings::test_async_method).await;
-        async_test_with_js_context(async_bindings::test_async_method_with_catch).await;
-        async_test_with_js_context(async_bindings::test_async_static_method).await;
-        async_test_with_js_context(async_bindings::test_join_many_async).await;
     })
     .unwrap();
 }

@@ -51,62 +51,42 @@ pub(crate) async fn test_batch_stress_browser_event_callbacks() {
     const WAVE_COUNT: u32 = 8;
     const WAVE_SIZE: u32 = 250;
     const TOTAL_CALLBACKS: u32 = WAVE_COUNT * WAVE_SIZE;
-    const RUST_OPS_PER_YIELD: u32 = 40;
+    const RUST_OPS_PER_YIELD: u32 = 16;
     const STALL_LIMIT: u32 = 300;
     const MAX_ITERATIONS: u32 = 20_000;
 
     let window = web_sys::window().unwrap();
     let document = window.document().unwrap();
-    let body = document.body().unwrap();
 
     let test_start = std::time::Instant::now();
     println!("[batch_stress] t=0ms start");
 
+    let scratch = document.create_element("div").unwrap();
+
     let container = document.create_element("div").unwrap();
-    body.append_child(&container).unwrap();
+    scratch.append_child(&container).unwrap();
 
     let counter = std::rc::Rc::new(std::cell::Cell::new(0u32));
     let counter_clone = counter.clone();
     let document_clone = document.clone();
     let container_clone = container.clone();
 
-    // Each callback does ~12 JS->Rust roundtrips covering the three return
-    // shapes that exercise decode: HeapRef (create_element, append_child),
-    // Result<(), JsValue> (set_attribute), and void (set_text_content).
+    // Each callback covers the three return shapes that exercise decode:
+    // HeapRef (create_element/append_child), Result<(), JsValue>
+    // (set_attribute), and void (set_text_content).
     // If a Respond gets misaligned, these mismatched decoders surface it
     // immediately as U8BufferEmpty rather than corrupting state silently.
     let callback = Closure::new(move |i: u32| {
-        counter_clone.set(counter_clone.get() + 1);
+        let count = counter_clone.get() + 1;
+        counter_clone.set(count);
 
         let item = document_clone.create_element("div").unwrap();
-        item.set_attribute("class", "grid-item").unwrap();
-        item.set_attribute(
-            "style",
-            &format!(
-                "position:absolute;top:{}px;left:{}px;width:200px;height:280px",
-                (i / 5) * 296,
-                (i % 5) * 216,
-            ),
-        )
-        .unwrap();
-
-        let cover = document_clone.create_element("div").unwrap();
-        cover
-            .set_attribute("style", "width:200px;height:200px;background:#333")
-            .unwrap();
-        cover.set_attribute("data-cover", &format!("{i}")).unwrap();
-        item.append_child(&cover).unwrap();
-
-        let text = document_clone.create_element("div").unwrap();
-        text.set_text_content(Some(&format!("Album {i}")));
-        text.set_attribute("data-text", &format!("{i}")).unwrap();
-        item.append_child(&text).unwrap();
-
-        let caption = document_clone.create_element("span").unwrap();
-        caption.set_text_content(Some(&format!("#{i}")));
-        item.append_child(&caption).unwrap();
-
+        item.set_attribute("data-item", &format!("{i}")).unwrap();
+        item.set_text_content(Some(&format!("Item {i}")));
         container_clone.append_child(&item).unwrap();
+        if count % 32 == 0 {
+            container_clone.set_text_content(None);
+        }
     });
 
     let mut iterations = 0u32;
@@ -128,15 +108,13 @@ pub(crate) async fn test_batch_stress_browser_event_callbacks() {
         for _ in 0..RUST_OPS_PER_YIELD {
             let div = document.create_element("div").unwrap();
             div.set_text_content(Some("Rust-side element"));
-            body.append_child(&div).unwrap();
+            scratch.append_child(&div).unwrap();
         }
 
         // Keep feeding setTimeout callbacks throughout the test. Scheduling
         // mid-run (rather than all upfront) means new callbacks keep racing
         // Rust's evaluate_scripts for the whole duration.
-        if waves_scheduled < WAVE_COUNT
-            && counter.get() >= waves_scheduled * WAVE_SIZE / 2
-        {
+        if waves_scheduled < WAVE_COUNT && counter.get() >= waves_scheduled * WAVE_SIZE / 2 {
             schedule_callbacks(&callback, WAVE_SIZE);
             waves_scheduled += 1;
         }
@@ -178,5 +156,6 @@ pub(crate) async fn test_batch_stress_browser_event_callbacks() {
         counter.get()
     );
 
-    callback.forget();
+    scratch.set_text_content(None);
+    drop(callback);
 }

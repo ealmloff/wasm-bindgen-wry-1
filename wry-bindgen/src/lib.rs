@@ -256,6 +256,8 @@ pub struct Closure<T: ?Sized> {
     // careful: must be Box<T> not just T because unsized PhantomData
     // seems to have weird interaction with Pin<>
     _phantom: core::marker::PhantomData<Box<T>>,
+    rust_callback: Option<object_store::ObjectHandle>,
+    drop_rust_callback_on_drop: bool,
     pub(crate) value: JsValue,
 }
 
@@ -273,7 +275,9 @@ impl<T: ?Sized> Closure<T> {
     where
         F: WasmClosureFnOnce<T, M>,
     {
-        fn_once.into_closure()
+        let mut closure = fn_once.into_closure();
+        closure.drop_rust_callback_on_drop = false;
+        closure
     }
 
     /// Forgets the closure, leaking it.
@@ -289,9 +293,14 @@ impl<T: ?Sized> Closure<T> {
         CallbackKey<FnPtr>: BinaryEncode + EncodeTypeDef,
     {
         let key = insert_object(RustCallback::new_fn(encode_decode));
-        // Use wbg_cast with CallbackKey so param encodes as Callback type (JS creates RustFunction)
-        // Return type is Closure which encodes as HeapRef (JS inserts into heap)
-        crate::__rt::wbg_cast::<CallbackKey<FnPtr>, crate::Closure<T>>(CallbackKey::new(key))
+        let value =
+            crate::__rt::wbg_cast::<CallbackKey<FnPtr>, crate::JsValue>(CallbackKey::new(key));
+        Self {
+            _phantom: core::marker::PhantomData,
+            rust_callback: Some(key),
+            drop_rust_callback_on_drop: true,
+            value,
+        }
     }
 
     /// Wrap a raw closure. Only for use by generated code.
@@ -302,9 +311,53 @@ impl<T: ?Sized> Closure<T> {
         CallbackKey<FnPtr>: BinaryEncode + EncodeTypeDef,
     {
         let key = insert_object(RustCallback::new_fn_mut(encode_decode));
-        // Use wbg_cast with CallbackKey so param encodes as Callback type (JS creates RustFunction)
-        // Return type is Closure which encodes as HeapRef (JS inserts into heap)
-        crate::__rt::wbg_cast::<CallbackKey<FnPtr>, crate::Closure<T>>(CallbackKey::new(key))
+        let value =
+            crate::__rt::wbg_cast::<CallbackKey<FnPtr>, crate::JsValue>(CallbackKey::new(key));
+        Self {
+            _phantom: core::marker::PhantomData,
+            rust_callback: Some(key),
+            drop_rust_callback_on_drop: true,
+            value,
+        }
+    }
+
+    /// Wrap a raw one-shot closure. Only for use by generated code.
+    pub(crate) fn wrap_once_encode_decode_mut<FnPtr>(
+        mut encode_decode: impl FnMut(&mut DecodedData, &mut EncodedData) + 'static,
+    ) -> Self
+    where
+        CallbackKey<FnPtr>: BinaryEncode + EncodeTypeDef,
+    {
+        let handle_cell = alloc::rc::Rc::new(core::cell::Cell::new(None));
+        let handle_for_callback = handle_cell.clone();
+        let key = insert_object(RustCallback::new_fn_mut(move |decoder, encoder| {
+            encode_decode(decoder, encoder);
+            if let Some(handle) = handle_for_callback.take() {
+                crate::batch::queue_rust_object_drop_with_reason(
+                    handle,
+                    "once callback after call",
+                );
+            }
+        }));
+        handle_cell.set(Some(key));
+        let value = crate::__rt::wbg_cast::<CallbackKey<FnPtr>, crate::JsValue>(
+            CallbackKey::new_with_policy(key, crate::encode::CallbackPolicy::JsOwnedOnce),
+        );
+        Self {
+            _phantom: core::marker::PhantomData,
+            rust_callback: Some(key),
+            drop_rust_callback_on_drop: false,
+            value,
+        }
+    }
+}
+
+impl<T: ?Sized> Drop for Closure<T> {
+    fn drop(&mut self) {
+        if self.drop_rust_callback_on_drop && self.rust_callback.take().is_some() {
+            crate::batch::queue_js_dispose_and_drop_rust_function(self.value.id());
+            self.value.idx = crate::value::JSIDX_UNDEFINED;
+        }
     }
 }
 

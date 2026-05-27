@@ -10,10 +10,11 @@ use core::cell::{Ref, RefCell, RefMut};
 use std::boxed::Box;
 
 use crate::encode::{BatchableResult, BinaryDecode};
-use crate::id_allocator::IdAllocator;
+use crate::id_allocator::{IdAllocator, PendingInstallIds};
 use crate::ipc::DecodedData;
 use crate::ipc::{EncodedData, IPCMessage, MessageType};
 use crate::lazy::ThreadLocalKey;
+use crate::object_store::ObjectHandle;
 use crate::runtime::WryIPC;
 use crate::type_cache::TypeCache;
 use crate::value::JSIDX_RESERVED;
@@ -31,8 +32,15 @@ pub struct Runtime {
     is_batching: bool,
     /// Type cache for avoiding resending type definitions to JS.
     type_cache: TypeCache,
+    /// Stack of JS-originated IPC requests currently executing Rust code.
+    inbound_js_request_stack: Vec<u32>,
     /// Exported Rust structs stored by handle
     objects: BTreeMap<u32, Box<dyn Any>>,
+    /// Recently removed object handles for diagnostics.
+    removed_objects: BTreeMap<u32, &'static str>,
+    /// Rust-owned object handles to drop after the current encoded JS call
+    /// has finished executing.
+    objects_to_free: Vec<Vec<u32>>,
     /// The ipc layer used to communicate with the JS runtime
     ipc: WryIPC,
     /// The id of the webview this is associated with
@@ -43,35 +51,67 @@ pub struct Runtime {
 
 impl Runtime {
     pub(crate) fn new(ipc: WryIPC, webview_id: u64) -> Self {
+        let mut id_allocator = IdAllocator::new();
+        let encoder = Self::new_encoder_for_evaluate(&mut id_allocator, 0);
         Self {
-            encoder: Self::new_encoder_for_evaluate(),
-            id_allocator: IdAllocator::new(),
+            encoder,
+            id_allocator,
             is_batching: false,
             type_cache: TypeCache::new(),
+            inbound_js_request_stack: Vec::new(),
             // Object store starts empty
             objects: BTreeMap::new(),
+            removed_objects: BTreeMap::new(),
+            objects_to_free: Vec::new(),
             ipc,
             webview_id,
             thread_locals: BTreeMap::new(),
         }
     }
 
-    fn new_encoder_for_evaluate() -> EncodedData {
+    fn new_encoder_for_evaluate(
+        id_allocator: &mut IdAllocator,
+        response_channel_id: u32,
+    ) -> EncodedData {
         let mut encoder = EncodedData::new();
         encoder.push_u8(MessageType::Evaluate as u8);
+        encoder.push_u32(id_allocator.next_rust_request_id());
+        encoder.push_u32(response_channel_id);
         encoder
     }
 
-    /// Get the next heap ID for placeholder allocation.
-    pub fn get_next_heap_id(&mut self) -> u64 {
-        self.id_allocator.next_heap_id()
+    /// Record a JS-allocated heap ID from a response.
+    pub fn observe_js_heap_id(&mut self, id: u64) {
+        self.id_allocator.observe_js_heap_id(id);
     }
 
-    /// Get the next heap ID for a batched return value placeholder.
-    /// This also tracks the reserved placeholder count so JS can skip these IDs
-    /// during nested callback allocations.
+    /// Get the next heap ID for a return value placeholder.
     pub fn get_next_placeholder_id(&mut self) -> u64 {
-        self.id_allocator.next_placeholder_id(self.is_batching)
+        self.id_allocator.next_placeholder_id()
+    }
+
+    /// Allocate an ID for a JS object sent to Rust without an encoded ID.
+    pub fn get_next_inbound_js_heap_id(&mut self, request_id: u32) -> u64 {
+        self.id_allocator.next_inbound_js_heap_id(request_id)
+    }
+
+    pub(crate) fn push_inbound_js_request(&mut self, request_id: u32) {
+        self.inbound_js_request_stack.push(request_id);
+    }
+
+    pub(crate) fn pop_inbound_js_request(&mut self, request_id: u32) {
+        let popped = self
+            .inbound_js_request_stack
+            .pop()
+            .expect("pop_inbound_js_request called with empty stack");
+        assert_eq!(
+            popped, request_id,
+            "inbound JS request stack was popped out of order"
+        );
+    }
+
+    pub(crate) fn current_response_channel_id(&self) -> u32 {
+        self.inbound_js_request_stack.last().copied().unwrap_or(0)
     }
 
     /// Get the next borrow ID from the borrow stack (indices 1-127).
@@ -98,27 +138,70 @@ impl Runtime {
         self.id_allocator.release_heap_id(id)
     }
 
+    pub fn recycle_heap_id(&mut self, id: u64) {
+        self.id_allocator.recycle_heap_id(id);
+    }
+
     /// Take the message data and reset the batch for reuse.
-    /// Includes any pending drops at the start of the message.
-    /// Prepends the reserved placeholder count so JS can skip those IDs during nested allocations.
+    /// Includes ID installation and placeholder reservation metadata at the start of the message.
     pub(crate) fn take_message(&mut self) -> IPCMessage {
-        let reserved_count = self.take_reserved_placeholder_count();
+        let install_ids = self.pending_install_id_batches();
+        let reserved_ids = self.take_reserved_placeholder_ids();
         let mut encoder = self.take_encoder();
-        encoder.prepend_u32(reserved_count);
+        set_response_channel_id(&mut encoder, self.current_response_channel_id());
+        prepend_rust_to_js_evaluate_prelude(&mut encoder, &install_ids, &reserved_ids);
+        IPCMessage::new(encoder.to_bytes())
+    }
+
+    /// Add Rust-to-JS response metadata and turn the encoder into a response message.
+    pub(crate) fn finish_respond_message(&mut self, mut encoder: EncodedData) -> IPCMessage {
+        let install_ids = self.pending_install_id_batches();
+        set_response_channel_id(&mut encoder, self.current_response_channel_id());
+        prepend_rust_to_js_respond_prelude(&mut encoder, &install_ids);
         IPCMessage::new(encoder.to_bytes())
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        // 12 bytes for offsets + 1 byte for message type
-        self.encoder.byte_len() <= 13
+        // 12 bytes for offsets, 1 byte for message type, and two u32 header
+        // words.
+        self.encoder.byte_len() <= 21
     }
 
     pub(crate) fn push_ids_to_free(&mut self) {
         self.id_allocator.push_ids_to_free();
+        self.objects_to_free.push(Vec::new());
     }
 
     pub(crate) fn pop_and_release_ids(&mut self) -> Vec<u64> {
         self.id_allocator.pop_and_release_ids()
+    }
+
+    pub(crate) fn release_object_handle(
+        &mut self,
+        handle: ObjectHandle,
+        reason: &'static str,
+    ) -> Option<Box<dyn Any>> {
+        match self.objects_to_free.last_mut() {
+            Some(handles) => {
+                handles.push(handle.raw());
+                None
+            }
+            None => self.remove_object_untyped_with_reason(handle.raw(), reason),
+        }
+    }
+
+    pub(crate) fn pop_and_release_objects(&mut self) -> Vec<u32> {
+        let handles = self
+            .objects_to_free
+            .pop()
+            .expect("pop_and_release_objects called with empty frame stack");
+
+        if let Some(parent) = self.objects_to_free.last_mut() {
+            parent.extend(handles);
+            Vec::new()
+        } else {
+            handles
+        }
     }
 
     pub(crate) fn set_batching(&mut self, batching: bool) {
@@ -129,21 +212,38 @@ impl Runtime {
         self.is_batching
     }
 
-    /// Take and reset the reserved placeholder count.
-    /// Called when building a message to send to JS.
-    pub(crate) fn take_reserved_placeholder_count(&mut self) -> u32 {
-        self.id_allocator.take_reserved_placeholder_count()
+    /// Get unresolved ID batches JS should install for objects it sent to Rust.
+    pub(crate) fn pending_install_id_batches(&self) -> Vec<PendingInstallIds> {
+        self.id_allocator.pending_install_id_batches()
+    }
+
+    /// Mark deferred JS heap-ref requests as installed by JS.
+    pub(crate) fn ack_pending_install_ids(&mut self, ids: impl IntoIterator<Item = u32>) {
+        self.id_allocator.ack_pending_install_ids(ids);
+    }
+
+    /// Take IDs JS should reserve for pending Rust-to-JS return values.
+    pub(crate) fn take_reserved_placeholder_ids(&mut self) -> Vec<u64> {
+        self.id_allocator.take_reserved_placeholder_ids()
     }
 
     pub(crate) fn take_encoder(&mut self) -> EncodedData {
-        core::mem::replace(&mut self.encoder, Self::new_encoder_for_evaluate())
+        if self.is_empty() {
+            let response_channel_id = self.current_response_channel_id();
+            self.encoder =
+                Self::new_encoder_for_evaluate(&mut self.id_allocator, response_channel_id);
+        }
+        let response_channel_id = self.current_response_channel_id();
+        let next = Self::new_encoder_for_evaluate(&mut self.id_allocator, response_channel_id);
+        core::mem::replace(&mut self.encoder, next)
     }
 
     pub(crate) fn extend_encoder(&mut self, other: &EncodedData) {
-        // Manually extend to avoid adding an extra message type byte
+        // Manually extend to avoid adding an extra message type byte or message
+        // header.
         self.encoder.u8_buf.extend_from_slice(&other.u8_buf[1..]);
+        self.encoder.u32_buf.extend_from_slice(&other.u32_buf[2..]);
         self.encoder.u16_buf.extend_from_slice(&other.u16_buf);
-        self.encoder.u32_buf.extend_from_slice(&other.u32_buf);
         self.encoder.str_buf.extend_from_slice(&other.str_buf);
     }
 
@@ -151,6 +251,13 @@ impl Runtime {
     /// Returns (type_id, is_cached) where is_cached is true if the type was already in the cache.
     pub(crate) fn get_or_create_type_id(&mut self, type_bytes: Vec<u8>) -> (u32, bool) {
         self.type_cache.get_or_create_type_id(type_bytes)
+    }
+
+    /// Mark type IDs as available in JS after JS acknowledges parsing them.
+    pub(crate) fn ack_type_ids(&mut self, ids: impl IntoIterator<Item = u32>) {
+        for id in ids {
+            self.type_cache.ack_type_id(id);
+        }
     }
 
     /// Insert an exported object and return its handle.
@@ -186,7 +293,13 @@ impl Runtime {
 
     /// Get a reference to an exported object.
     pub(crate) fn get_object<T: 'static>(&self, handle: u32) -> Ref<'_, T> {
-        let boxed = self.objects.get(&handle).expect("invalid handle");
+        let boxed =
+            self.objects
+                .get(&handle)
+                .unwrap_or_else(|| match self.removed_objects.get(&handle) {
+                    Some(reason) => panic!("invalid handle {handle} (removed by {reason})"),
+                    None => panic!("invalid handle {handle}"),
+                });
         let cell = boxed.downcast_ref::<RefCell<T>>().expect("type mismatch");
         cell.borrow()
     }
@@ -201,13 +314,21 @@ impl Runtime {
     /// Remove an exported object and return it.
     pub(crate) fn remove_object<T: 'static>(&mut self, handle: u32) -> T {
         let boxed = self.objects.remove(&handle).expect("invalid handle");
+        self.removed_objects.insert(handle, "typed remove_object");
         let cell = boxed.downcast::<RefCell<T>>().expect("type mismatch");
         cell.into_inner()
     }
 
-    /// Remove an exported object without returning it.
-    pub(crate) fn remove_object_untyped(&mut self, handle: u32) -> Option<Box<dyn Any>> {
-        self.objects.remove(&handle)
+    pub(crate) fn remove_object_untyped_with_reason(
+        &mut self,
+        handle: u32,
+        reason: &'static str,
+    ) -> Option<Box<dyn Any>> {
+        let object = self.objects.remove(&handle);
+        if object.is_some() {
+            self.removed_objects.insert(handle, reason);
+        }
+        object
     }
 
     /// Get a reference to the IPC layer.
@@ -219,6 +340,47 @@ impl Runtime {
     pub(crate) fn webview_id(&self) -> u64 {
         self.webview_id
     }
+}
+
+fn push_id_list(buf: &mut Vec<u32>, ids: &[u64]) {
+    buf.push(ids.len() as u32);
+    for &id in ids {
+        buf.push((id & 0xFFFF_FFFF) as u32);
+        buf.push((id >> 32) as u32);
+    }
+}
+
+fn set_response_channel_id(encoder: &mut EncodedData, id: u32) {
+    encoder.u32_buf[1] = id;
+}
+
+fn push_install_batches(buf: &mut Vec<u32>, batches: &[PendingInstallIds]) {
+    buf.push(batches.len() as u32);
+    for batch in batches {
+        buf.push(batch.request_id);
+        push_id_list(buf, &batch.ids);
+        push_id_list(buf, &batch.drop_after_install);
+    }
+}
+
+fn prepend_rust_to_js_respond_prelude(
+    encoder: &mut EncodedData,
+    install_ids: &[PendingInstallIds],
+) {
+    let mut prelude = Vec::new();
+    push_install_batches(&mut prelude, install_ids);
+    encoder.insert_u32s(2, &prelude);
+}
+
+fn prepend_rust_to_js_evaluate_prelude(
+    encoder: &mut EncodedData,
+    install_ids: &[PendingInstallIds],
+    reserved_ids: &[u64],
+) {
+    let mut prelude = Vec::new();
+    push_install_batches(&mut prelude, install_ids);
+    push_id_list(&mut prelude, reserved_ids);
+    encoder.insert_u32s(2, &prelude);
 }
 
 thread_local! {
@@ -268,16 +430,100 @@ pub(crate) fn queue_js_drop(id: u64) {
         "Attempted to drop reserved JS heap ID {id}"
     );
 
-    let runtime_already_dropped = RUNTIME.with(|state| state.borrow().is_empty());
+    let runtime_already_dropped = match RUNTIME.try_with(|state| {
+        state
+            .try_borrow()
+            .map(|runtime_stack| runtime_stack.is_empty())
+    }) {
+        Ok(Ok(value)) => value,
+        Ok(Err(_)) => return,
+        Err(_) => return,
+    };
     // If the runtime has already been dropped, we don't need to drop the JS reference
     if runtime_already_dropped {
         return;
     }
 
-    let id = with_runtime(|state| state.release_heap_id(id));
+    let id = match RUNTIME.try_with(|state| {
+        state.try_borrow_mut().ok().and_then(|mut runtime_stack| {
+            runtime_stack
+                .last_mut()
+                .map(|runtime| runtime.release_heap_id(id))
+        })
+    }) {
+        Ok(Some(id)) => id,
+        Ok(None) | Err(_) => return,
+    };
     if let Some(id) = id {
         crate::js_helpers::js_drop_heap_ref(id);
+        let _ = RUNTIME.try_with(|state| {
+            let Ok(mut runtime_stack) = state.try_borrow_mut() else {
+                return;
+            };
+            if let Some(runtime) = runtime_stack.last_mut() {
+                runtime.recycle_heap_id(id);
+            }
+        });
     }
+}
+
+/// Queue a JS drop for a RustFunction heap ID, disposing the exact JS callable
+/// removed from the heap before the ID can be reused.
+pub(crate) fn queue_js_dispose_and_drop_rust_function(id: u64) {
+    debug_assert!(
+        id >= JSIDX_RESERVED,
+        "Attempted to drop reserved JS heap ID {id}"
+    );
+
+    let runtime_already_dropped = match RUNTIME.try_with(|state| {
+        state
+            .try_borrow()
+            .map(|runtime_stack| runtime_stack.is_empty())
+    }) {
+        Ok(Ok(value)) => value,
+        Ok(Err(_)) => return,
+        Err(_) => return,
+    };
+    if runtime_already_dropped {
+        return;
+    }
+
+    let id = match RUNTIME.try_with(|state| {
+        state.try_borrow_mut().ok().and_then(|mut runtime_stack| {
+            runtime_stack
+                .last_mut()
+                .map(|runtime| runtime.release_heap_id(id))
+        })
+    }) {
+        Ok(Some(id)) => id,
+        Ok(None) | Err(_) => return,
+    };
+    if let Some(id) = id {
+        crate::js_helpers::js_dispose_and_drop_rust_function(id);
+        let _ = RUNTIME.try_with(|state| {
+            let Ok(mut runtime_stack) = state.try_borrow_mut() else {
+                return;
+            };
+            if let Some(runtime) = runtime_stack.last_mut() {
+                runtime.recycle_heap_id(id);
+            }
+        });
+    }
+}
+
+/// Drop a Rust-owned object now, or after the current encoded JS operation
+/// finishes if that object is being passed to JS.
+pub(crate) fn queue_rust_object_drop_with_reason(handle: ObjectHandle, reason: &'static str) {
+    let object = RUNTIME
+        .try_with(|state| {
+            state.try_borrow_mut().ok().and_then(|mut runtime_stack| {
+                runtime_stack
+                    .last_mut()
+                    .and_then(|runtime| runtime.release_object_handle(handle, reason))
+            })
+        })
+        .unwrap_or_default();
+    drop(object);
 }
 
 /// Add an operation to the current batch.
@@ -319,15 +565,15 @@ pub(crate) fn run_js_sync<R: BatchableResult>(
         state.extend_encoder(&encoded_during_op);
     });
 
-    // Try to get a placeholder for opaque types that don't need flush
-    // This also increments opaque_count to keep heap IDs in sync
-    let get_placeholder = || with_runtime(|state| R::try_placeholder(state));
+    // Reserve placeholders before any flush so JS receives exact IDs to fill.
+    let mut placeholder = with_runtime(|state| R::try_placeholder(state));
 
     // Must flush if: not batching, or if the operation requires immediate execution
     // (e.g., stack-allocated callbacks that must be invoked before returning)
     let result = if !is_batching() || needs_flush {
-        flush_and_then(|mut data| {
-            let response = get_placeholder()
+        flush_and_then(move |mut data| {
+            let response = placeholder
+                .take()
                 .unwrap_or_else(|| R::decode(&mut data).expect("Failed to decode return value"));
             assert!(
                 data.is_empty(),
@@ -336,13 +582,22 @@ pub(crate) fn run_js_sync<R: BatchableResult>(
             response
         })
     } else {
-        get_placeholder().unwrap_or_else(|| flush_and_return::<R>())
+        placeholder.unwrap_or_else(|| flush_and_return::<R>())
     };
 
     // After running, free any queued IDs for this operation
     let ids = with_runtime(|state| state.pop_and_release_ids());
     for id in ids {
         crate::js_helpers::js_drop_heap_ref(id);
+        with_runtime(|state| state.recycle_heap_id(id));
+    }
+
+    let objects = with_runtime(|state| state.pop_and_release_objects());
+    for handle in objects {
+        let object = with_runtime(|state| {
+            state.remove_object_untyped_with_reason(handle, "queued rust object drop")
+        });
+        drop(object);
     }
 
     result
@@ -360,17 +615,21 @@ pub(crate) fn flush_and_return<R: BinaryDecode>() -> R {
     })
 }
 
-pub(crate) fn flush_and_then<R>(then: impl for<'a> Fn(DecodedData<'a>) -> R) -> R {
+pub(crate) fn flush_and_then<R>(mut then: impl for<'a> FnMut(DecodedData<'a>) -> R) -> R {
     use crate::runtime::WryBindgenEvent;
 
     let batch_msg = with_runtime(|state| state.take_message());
+    let request_id = batch_msg
+        .header()
+        .expect("Failed to decode batch message header")
+        .request_id;
 
     // Send and wait for result
     with_runtime(|runtime| {
         (runtime.ipc().proxy)(WryBindgenEvent::ipc(runtime.webview_id(), batch_msg))
     });
     loop {
-        if let Some(result) = crate::runtime::progress_js_with(&then) {
+        if let Some(result) = crate::runtime::progress_js_with(request_id, &mut then) {
             return result;
         }
     }

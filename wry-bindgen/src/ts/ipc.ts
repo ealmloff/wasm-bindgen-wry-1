@@ -32,6 +32,77 @@ const DROP_NATIVE_REF_FN_ID = 0xffffffff;
 // Reserved function ID for calling exported Rust struct methods - must match Rust's CALL_EXPORT_FN_ID
 const CALL_EXPORT_FN_ID = 0xfffffffe;
 
+interface MessageHeader {
+  requestId: number;
+  responseChannelId: number;
+}
+
+let nextJsRequestId = 1;
+const rustCallResponseChannels: number[] = [];
+
+const pendingTypeCacheAcks: Set<number> = new Set();
+const pendingHeapRefInstallAcks: Set<number> = new Set();
+
+function allocateJsRequestId(): number {
+  const id = nextJsRequestId;
+  nextJsRequestId = (nextJsRequestId + 1) >>> 0;
+  if (nextJsRequestId === 0) {
+    nextJsRequestId = 1;
+  }
+  return id;
+}
+
+function currentResponseChannelId(): number {
+  return rustCallResponseChannels[rustCallResponseChannels.length - 1] ?? 0;
+}
+
+function pushMessageHeader(
+  encoder: DataEncoder,
+  msgType: MessageType,
+  requestId: number,
+  responseChannelId: number
+): void {
+  encoder.pushU8(msgType);
+  encoder.pushU32(requestId);
+  encoder.pushU32(responseChannelId);
+}
+
+function takeMessageHeader(decoder: DataDecoder): {
+  msgType: MessageType;
+  header: MessageHeader;
+} {
+  const rawMsgType = decoder.takeU8();
+  return {
+    msgType: rawMsgType,
+    header: {
+      requestId: decoder.takeU32(),
+      responseChannelId: decoder.takeU32(),
+    },
+  };
+}
+
+function prependJsToRustPrelude(encoder: DataEncoder): void {
+  const heapRefInstallAckIds = Array.from(pendingHeapRefInstallAcks);
+  pendingHeapRefInstallAcks.clear();
+
+  const typeCacheAckIds = Array.from(pendingTypeCacheAcks);
+  pendingTypeCacheAcks.clear();
+
+  const prelude: number[] = [
+    encoder.deferredHeapRefRequestId(),
+    encoder.deferredHeapRefCount(),
+    heapRefInstallAckIds.length,
+  ];
+  for (const id of heapRefInstallAckIds) {
+    prelude.push(id);
+  }
+  prelude.push(typeCacheAckIds.length);
+  for (const id of typeCacheAckIds) {
+    prelude.push(id);
+  }
+  encoder.insertU32s(2, prelude);
+}
+
 /**
  * Sends binary data to Rust and receives binary response.
  */
@@ -120,9 +191,33 @@ function parseTypeInfo(decoder: DataDecoder): CachedTypeInfo {
 
     const cached: CachedTypeInfo = { paramTypes, returnType };
     typeCache.set(typeId, cached);
+    pendingTypeCacheAcks.add(typeId);
     return cached;
   } else {
     throw new Error(`Unknown type marker: ${typeMarker}`);
+  }
+}
+
+function takeIdList(decoder: DataDecoder): number[] {
+  const count = decoder.takeU32();
+  const ids: number[] = [];
+  for (let i = 0; i < count; i++) {
+    ids.push(decoder.takeU64());
+  }
+  return ids;
+}
+
+function installDeferredHeapRefFrames(decoder: DataDecoder): void {
+  const frameCount = decoder.takeU32();
+  for (let i = 0; i < frameCount; i++) {
+    const requestId = decoder.takeU32();
+    const ids = takeIdList(decoder);
+    const dropAfterInstall = takeIdList(decoder);
+    window.jsHeap.resolveDeferredHeapRefs(requestId, ids);
+    for (const id of dropAfterInstall) {
+      window.jsHeap.remove(id);
+    }
+    pendingHeapRefInstallAcks.add(requestId);
   }
 }
 
@@ -131,29 +226,47 @@ function parseTypeInfo(decoder: DataDecoder): CachedTypeInfo {
  * May contain nested Evaluate calls (for callbacks).
  */
 function handleBinaryResponse(
-  response: ArrayBuffer | null
+  response: ArrayBuffer | null,
+  expectedRespondRequestId: number = 0
 ): DataDecoder | null {
   if (!response || response.byteLength === 0) {
+    if (expectedRespondRequestId !== 0) {
+      throw new Error(`Missing response for request ID ${expectedRespondRequestId}`);
+    }
     return null;
   }
 
   const decoder = new DataDecoder(response);
-  const rawMsgType = decoder.takeU8();
-  const msgType: MessageType = rawMsgType;
+  const { msgType, header } = takeMessageHeader(decoder);
 
   if (msgType === MessageType.Respond) {
+    if (
+      expectedRespondRequestId !== 0 &&
+      header.requestId !== expectedRespondRequestId
+    ) {
+      throw new Error(
+        `Response ID mismatch: expected ${expectedRespondRequestId}, got ${header.requestId}`
+      );
+    }
+    installDeferredHeapRefFrames(decoder);
     // Respond - just return the decoder for further processing
     return decoder;
   } else if (msgType === MessageType.Evaluate) {
     // Evaluate - Rust is calling JS functions (possibly multiple)
 
-    // Read the reserved placeholder count and push a reservation scope
-    // This ensures nested callback allocations skip these reserved IDs
-    const reservedCount = decoder.takeU32();
-    window.jsHeap.pushReservationScope(reservedCount);
+    installDeferredHeapRefFrames(decoder);
+
+    // Read the explicit placeholder IDs Rust reserved for this batch.
+    const reservedIds = takeIdList(decoder);
+    window.jsHeap.pushReservationScope(reservedIds);
 
     const encoder = new DataEncoder();
-    encoder.pushU8(MessageType.Respond);
+    pushMessageHeader(
+      encoder,
+      MessageType.Respond,
+      header.requestId,
+      currentResponseChannelId()
+    );
 
     // Push a single borrow frame for this entire Evaluate message
     // This frame persists across all operations and nested calls
@@ -173,15 +286,23 @@ function handleBinaryResponse(
       }
 
       // Decode parameters using their respective types
-      const params = typeInfo.paramTypes.map((paramType) => paramType.decode(decoder));
+      let params: unknown[];
+      try {
+        params = typeInfo.paramTypes.map((paramType) => paramType.decode(decoder));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const source = String(jsFunction).replace(/\s+/g, " ").slice(0, 160);
+        throw new Error(
+          `Failed to decode parameters for function ID ${fnId} (${source}): ${message}`
+        );
+      }
 
       // Call the original JS function with decoded parameters
       const result = jsFunction(...params);
 
-      // If return type is HeapRef and we have reserved slots, fill the next reserved slot
-      // instead of calling encode(). This ensures the ID matches what Rust pre-allocated.
-      // When reservedCount is 0 (non-batch mode), fall back to normal encode() behavior.
-      if (typeInfo.returnType instanceof HeapRefType && reservedCount > 0) {
+      // If return type is HeapRef and Rust reserved slots, fill the next reserved slot.
+      // Otherwise fall back to normal encode() behavior.
+      if (typeInfo.returnType instanceof HeapRefType && reservedIds.length > 0) {
         window.jsHeap.fillNextReserved(result);
       } else {
         // Encode the result using the return type
@@ -195,11 +316,13 @@ function handleBinaryResponse(
     // Pop the reservation scope
     window.jsHeap.popReservationScope();
 
+    prependJsToRustPrelude(encoder);
+
     const nextResponse = sync_request_binary(
       `/__wbg__/handler`,
       encoder.finalize()
     );
-    return handleBinaryResponse(nextResponse);
+    return handleBinaryResponse(nextResponse, expectedRespondRequestId);
   }
 
   if (!decoder.isEmpty()) {
@@ -216,4 +339,8 @@ export {
   MessageType,
   DROP_NATIVE_REF_FN_ID,
   CALL_EXPORT_FN_ID,
+  prependJsToRustPrelude,
+  allocateJsRequestId,
+  pushMessageHeader,
+  rustCallResponseChannels,
 };

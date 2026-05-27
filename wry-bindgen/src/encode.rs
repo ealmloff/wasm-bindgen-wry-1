@@ -26,6 +26,15 @@ pub trait BinaryEncode<P = ()> {
 /// Each type specifies how to deserialize itself.
 pub trait BinaryDecode: Sized {
     fn decode(decoder: &mut DecodedData) -> Result<Self, DecodeError>;
+
+    /// Decode a value from a JS-originated request.
+    ///
+    /// Most types have the same representation in requests and responses. Heap
+    /// references differ because JS defers assigning an ID until Rust sends one
+    /// back, so containers must propagate this method to their elements.
+    fn decode_inbound(decoder: &mut DecodedData) -> Result<Self, DecodeError> {
+        Self::decode(decoder)
+    }
 }
 
 /// Trait for converting a closure into a Closure wrapper.
@@ -479,6 +488,15 @@ impl<T: BinaryDecode> BinaryDecode for Option<T> {
             Ok(None)
         }
     }
+
+    fn decode_inbound(decoder: &mut DecodedData) -> Result<Self, DecodeError> {
+        let has_value = decoder.take_u8()? != 0;
+        if has_value {
+            Ok(Some(T::decode_inbound(decoder)?))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 // Encoding for Option<T> where T is encodable
@@ -516,6 +534,15 @@ impl<T: BinaryDecode, E: BinaryDecode> BinaryDecode for Result<T, E> {
             Ok(Err(E::decode(decoder)?))
         }
     }
+
+    fn decode_inbound(decoder: &mut DecodedData) -> Result<Self, DecodeError> {
+        let is_ok = decoder.take_u8()? != 0;
+        if is_ok {
+            Ok(Ok(T::decode_inbound(decoder)?))
+        } else {
+            Ok(Err(E::decode_inbound(decoder)?))
+        }
+    }
 }
 
 impl<T: BinaryDecode, E: BinaryDecode> BatchableResult for Result<T, E> {}
@@ -533,11 +560,21 @@ impl BinaryEncode for JsValue {
 }
 
 impl BinaryDecode for JsValue {
-    fn decode(_: &mut DecodedData) -> Result<Self, DecodeError> {
-        // JS value is always in sync with the dom. We should never need to decode it.
-        // Use get_next_heap_id() (NOT get_next_placeholder_id()) because decode() is
-        // called for callback parameters from JS, not for return value placeholders.
-        with_runtime(|runtime| Ok(JsValue::from_id(runtime.get_next_heap_id())))
+    fn decode(decoder: &mut DecodedData) -> Result<Self, DecodeError> {
+        let id = decoder.take_u64()?;
+        with_runtime(|runtime| runtime.observe_js_heap_id(id));
+        Ok(JsValue::from_id(id))
+    }
+
+    fn decode_inbound(decoder: &mut DecodedData) -> Result<Self, DecodeError> {
+        // JS-originated heap refs are implicit on the wire. Rust assigns the ID
+        // and sends it back for JS to install before it continues.
+        let request_id = decoder.take_deferred_heap_ref_request_id()?;
+        with_runtime(|runtime| {
+            Ok(JsValue::from_id(
+                runtime.get_next_inbound_js_heap_id(request_id),
+            ))
+        })
     }
 }
 
@@ -552,6 +589,8 @@ impl<F: ?Sized> BatchableResult for Closure<F> {
     fn try_placeholder(batch: &mut Runtime) -> Option<Self> {
         Some(Closure {
             _phantom: PhantomData,
+            rust_callback: None,
+            drop_rust_callback_on_drop: false,
             value: JsValue::try_placeholder(batch)?,
         })
     }
@@ -604,18 +643,30 @@ impl BinaryEncode for &JsValue {
 /// Wrapper type that encodes a callback registration key with Callback type info.
 /// This tells JS to create a RustFunction wrapper when decoding the value.
 /// The type parameter F should be `dyn FnMut(...) -> R` to capture the callback signature.
-pub struct CallbackKey<F: ?Sized>(ObjectHandle, PhantomData<F>);
+#[derive(Clone, Copy)]
+pub(crate) enum CallbackPolicy {
+    RustOwned = 0,
+    JsOwned = 1,
+    JsOwnedOnce = 2,
+}
+
+pub struct CallbackKey<F: ?Sized>(ObjectHandle, CallbackPolicy, PhantomData<F>);
 
 impl<F: ?Sized> CallbackKey<F> {
     /// Create a new CallbackKey from an ObjectHandle.
     pub(crate) fn new(handle: ObjectHandle) -> Self {
-        CallbackKey(handle, PhantomData)
+        Self::new_with_policy(handle, CallbackPolicy::JsOwned)
+    }
+
+    pub(crate) fn new_with_policy(handle: ObjectHandle, policy: CallbackPolicy) -> Self {
+        CallbackKey(handle, policy, PhantomData)
     }
 }
 
 impl<F: ?Sized> BinaryEncode for CallbackKey<F> {
     fn encode(self, encoder: &mut EncodedData) {
         self.0.encode(encoder);
+        (self.1 as u32).encode(encoder);
     }
 }
 
@@ -634,7 +685,7 @@ macro_rules! decode_args {
     // Main entry: decode each arg and call body
     ($decoder:expr; [$first:ident, $($ty:ident,)*] => $body:expr) => {{
         #[allow(non_snake_case)]
-        let $first = <$first as BinaryDecode>::decode($decoder).unwrap();
+        let $first = <$first as BinaryDecode>::decode_inbound($decoder).unwrap();
         decode_args!($decoder; [$($ty,)*] => $body);
     }};
     // Nothing to decode, just execute body
@@ -814,13 +865,16 @@ macro_rules! impl_closure_ref_encode {
                         };
                         let f: &mut dyn FnMut($($arg),*) -> R = unsafe { &mut *ptr };
                         // Decode arguments and call the closure
-                        $(let $arg = <$arg as BinaryDecode>::decode(decoder).unwrap();)*
+                        $(let $arg = <$arg as BinaryDecode>::decode_inbound(decoder).unwrap();)*
                         let result = f($($arg),*);
                         result.encode(encoder);
                     },
                 );
-                let key: CallbackKey<fn($($arg),*) -> R> = CallbackKey::new(crate::object_store::insert_object(callback));
+                let handle = crate::object_store::insert_object(callback);
+                let key: CallbackKey<fn($($arg),*) -> R> =
+                    CallbackKey::new_with_policy(handle, CallbackPolicy::RustOwned);
                 key.encode(encoder);
+                crate::batch::queue_rust_object_drop_with_reason(handle, "stack FnMut callback drop");
             }
         }
 
@@ -877,13 +931,16 @@ macro_rules! impl_closure_ref_encode {
                         };
                         let f: &dyn Fn($($arg),*) -> R = unsafe { &*ptr };
                         // Decode arguments and call the closure
-                        $(let $arg = <$arg as BinaryDecode>::decode(decoder).unwrap();)*
+                        $(let $arg = <$arg as BinaryDecode>::decode_inbound(decoder).unwrap();)*
                         let result = f($($arg),*);
                         result.encode(encoder);
                     },
                 );
-                let key: CallbackKey<fn($($arg),*) -> R> = CallbackKey::new(crate::object_store::insert_object(callback));
+                let handle = crate::object_store::insert_object(callback);
+                let key: CallbackKey<fn($($arg),*) -> R> =
+                    CallbackKey::new_with_policy(handle, CallbackPolicy::RustOwned);
                 key.encode(encoder);
+                crate::batch::queue_rust_object_drop_with_reason(handle, "stack Fn callback drop");
             }
         }
 
@@ -941,13 +998,16 @@ macro_rules! impl_closure_ref_encode {
                         };
                         let f: &dyn Fn($($arg),*) -> R = unsafe { &*ptr };
                         // Decode arguments and call the closure
-                        $(let $arg = <$arg as BinaryDecode>::decode(decoder).unwrap();)*
+                        $(let $arg = <$arg as BinaryDecode>::decode_inbound(decoder).unwrap();)*
                         let result = f($($arg),*);
                         result.encode(encoder);
                     },
                 );
-                let key: CallbackKey<fn($($arg),*) -> R> = CallbackKey::new(crate::object_store::insert_object(callback));
+                let handle = crate::object_store::insert_object(callback);
+                let key: CallbackKey<fn($($arg),*) -> R> =
+                    CallbackKey::new_with_policy(handle, CallbackPolicy::RustOwned);
                 key.encode(encoder);
+                crate::batch::queue_rust_object_drop_with_reason(handle, "stack mutable Fn callback drop");
             }
         }
     };
@@ -1017,7 +1077,7 @@ macro_rules! impl_fnmut_stub_ref {
                 crate::Closure::wrap_encode_decode_mut::<fn(&$first, $($rest),*) -> R>(
                     move |decoder: &mut DecodedData, encoder: &mut EncodedData| {
                         let anchor = <$first as RefFromBinaryDecode>::ref_decode(decoder).unwrap();
-                        $(let $rest = <$rest as BinaryDecode>::decode(decoder).unwrap();)*
+                        $(let $rest = <$rest as BinaryDecode>::decode_inbound(decoder).unwrap();)*
                         let result = boxed(&*anchor, $($rest),*);
                         result.encode(encoder);
                     },
@@ -1038,7 +1098,7 @@ macro_rules! impl_fnmut_stub_ref {
                 crate::Closure::wrap_encode_decode::<fn(&$first, $($rest),*) -> R>(
                     move |decoder: &mut DecodedData, encoder: &mut EncodedData| {
                         let anchor = <$first as RefFromBinaryDecode>::ref_decode(decoder).unwrap();
-                        $(let $rest = <$rest as BinaryDecode>::decode(decoder).unwrap();)*
+                        $(let $rest = <$rest as BinaryDecode>::decode_inbound(decoder).unwrap();)*
                         let result = boxed(&*anchor, $($rest),*);
                         result.encode(encoder);
                     },
@@ -1059,7 +1119,7 @@ macro_rules! impl_fnmut_stub_ref {
                 crate::Closure::wrap_encode_decode_mut::<fn(&$first, $($rest),*) -> R>(
                     move |decoder: &mut DecodedData, encoder: &mut EncodedData| {
                         let anchor = <$first as RefFromBinaryDecode>::ref_decode(decoder).unwrap();
-                        $(let $rest = <$rest as BinaryDecode>::decode(decoder).unwrap();)*
+                        $(let $rest = <$rest as BinaryDecode>::decode_inbound(decoder).unwrap();)*
                         let result = self(&*anchor, $($rest),*);
                         result.encode(encoder);
                     },
@@ -1080,7 +1140,7 @@ macro_rules! impl_fnmut_stub_ref {
                 crate::Closure::wrap_encode_decode::<fn($first, $($rest),*) -> R>(
                     move |decoder: &mut DecodedData, encoder: &mut EncodedData| {
                         let anchor = <$first as RefFromBinaryDecode>::ref_decode(decoder).unwrap();
-                        $(let $rest = <$rest as BinaryDecode>::decode(decoder).unwrap();)*
+                        $(let $rest = <$rest as BinaryDecode>::decode_inbound(decoder).unwrap();)*
                         let result = self(&*anchor, $($rest),*);
                         result.encode(encoder);
                     },
@@ -1114,7 +1174,7 @@ macro_rules! impl_fn_once {
                 // Use Option to allow taking the FnOnce
                 let mut me = Some(self);
                 // Register the callback using the same pattern as impl_fnmut_stub
-                crate::Closure::wrap_encode_decode_mut::<fn($($arg),*) -> R>(
+                crate::Closure::wrap_once_encode_decode_mut::<fn($($arg),*) -> R>(
                     move |decoder: &mut DecodedData, encoder: &mut EncodedData| {
                         let f = me.take().expect("FnOnce closure called more than once");
                         decode_args!(decoder; [$($arg,)*] => {
@@ -1152,11 +1212,11 @@ macro_rules! impl_fn_once_ref {
             #[allow(unused_variables)]
             fn into_closure(self) -> Closure<dyn FnMut(&$first, $($rest),*) -> R> {
                 let mut me = Some(self);
-                crate::Closure::wrap_encode_decode_mut::<fn(&$first, $($rest),*) -> R>(
+                crate::Closure::wrap_once_encode_decode_mut::<fn(&$first, $($rest),*) -> R>(
                     move |decoder: &mut DecodedData, encoder: &mut EncodedData| {
                         let f = me.take().expect("FnOnce closure called more than once");
                         let anchor = <$first as RefFromBinaryDecode>::ref_decode(decoder).unwrap();
-                        $(let $rest = <$rest as BinaryDecode>::decode(decoder).unwrap();)*
+                        $(let $rest = <$rest as BinaryDecode>::decode_inbound(decoder).unwrap();)*
                         let result = f(&*anchor, $($rest),*);
                         result.encode(encoder);
                     },
@@ -1180,6 +1240,18 @@ impl<F: ?Sized> BinaryDecode for crate::Closure<F> {
         let value = <crate::JsValue as BinaryDecode>::decode(decoder)?;
         Ok(Self {
             _phantom: PhantomData,
+            rust_callback: None,
+            drop_rust_callback_on_drop: false,
+            value,
+        })
+    }
+
+    fn decode_inbound(decoder: &mut DecodedData) -> Result<Self, DecodeError> {
+        let value = <crate::JsValue as BinaryDecode>::decode_inbound(decoder)?;
+        Ok(Self {
+            _phantom: PhantomData,
+            rust_callback: None,
+            drop_rust_callback_on_drop: false,
             value,
         })
     }
@@ -1187,8 +1259,9 @@ impl<F: ?Sized> BinaryDecode for crate::Closure<F> {
 
 impl<F: ?Sized> BinaryEncode for crate::Closure<F> {
     fn encode(self, encoder: &mut EncodedData) {
-        // Encode the JsValue
-        self.value.encode(encoder);
+        let this = core::mem::ManuallyDrop::new(self);
+        (&this.value).encode(encoder);
+        crate::batch::queue_js_drop(this.value.id());
     }
 }
 
@@ -1255,6 +1328,15 @@ impl<T: BinaryDecode> BinaryDecode for Vec<T> {
         let mut vec = Vec::with_capacity(len);
         for _ in 0..len {
             vec.push(T::decode(decoder)?);
+        }
+        Ok(vec)
+    }
+
+    fn decode_inbound(decoder: &mut DecodedData) -> Result<Self, DecodeError> {
+        let len = decoder.take_u32()? as usize;
+        let mut vec = Vec::with_capacity(len);
+        for _ in 0..len {
+            vec.push(T::decode_inbound(decoder)?);
         }
         Ok(vec)
     }

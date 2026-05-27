@@ -98,20 +98,48 @@ pub(crate) enum MessageType {
     Respond = 1,
 }
 
+/// Common IPC message header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MessageHeader {
+    /// Evaluate request ID. Respond messages use the same ID as the Evaluate
+    /// they answer.
+    pub(crate) request_id: u32,
+    /// JS-originated request whose sync response channel should receive this
+    /// message. Zero means the message is not routed through a suspended JS
+    /// request.
+    pub(crate) response_channel_id: u32,
+}
+
 /// A binary IPC message.
 ///
 /// Message format in the u8 buffer:
 /// - First u8: message type (0 = Evaluate, 1 = Respond)
+/// - First two u32 values: request ID and response channel ID
 /// - Remaining data depends on message type
+///
+/// Rust-to-JS heap ID lists are encoded in the u32 buffer as `count: u32`
+/// followed by `count` u64 IDs, each split into low/high u32 words.
+///
+/// JS-to-Rust messages start their u32 buffer with:
+/// - deferred heap-ref request ID for implicit JS-originated heap refs
+/// - deferred heap-ref count
+/// - heap-ref install ack list
+/// - type-cache ack list
+///
+/// Rust only emits `TYPE_CACHED` after receiving an ack for the corresponding
+/// `TYPE_FULL`.
 ///
 /// Evaluate format (supports batching - multiple operations in one message):
 /// - u8: message type (0)
+/// - install batches: heap IDs JS should install for deferred JS-originated arguments
+/// - id list: heap IDs JS should reserve for Rust-to-JS return placeholders
 /// - For each operation (read until buffer exhausted):
 ///   - u32: function ID
 ///   - encoded arguments (varies by function)
 ///
 /// Respond format:
 /// - u8: message type (1)
+/// - install batches: heap IDs JS should install for deferred JS-originated arguments
 /// - For each operation result:
 ///   - encoded return value (varies by function)
 #[derive(Debug, Clone)]
@@ -125,16 +153,6 @@ impl IPCMessage {
         Self { data }
     }
 
-    /// Create a new respond message with the given data.
-    pub fn new_respond(push_data: impl FnOnce(&mut EncodedData)) -> Self {
-        let mut encoder = EncodedData::new();
-        encoder.push_u8(MessageType::Respond as u8);
-
-        push_data(&mut encoder);
-
-        IPCMessage::new(encoder.to_bytes())
-    }
-
     /// Get the message type.
     pub fn ty(&self) -> Result<MessageType, DecodeError> {
         let mut decoded = DecodedData::from_bytes(&self.data)?;
@@ -146,13 +164,37 @@ impl IPCMessage {
         }
     }
 
+    /// Get the common message header.
+    pub fn header(&self) -> Result<MessageHeader, DecodeError> {
+        let mut decoded = DecodedData::from_bytes(&self.data)?;
+        let message_type = decoded.take_u8()?;
+        match message_type {
+            0 | 1 => {}
+            v => return Err(DecodeError::InvalidMessageType { value: v }),
+        }
+        Ok(MessageHeader {
+            request_id: decoded.take_u32()?,
+            response_channel_id: decoded.take_u32()?,
+        })
+    }
+
     /// Decode the message into its variant form.
     pub fn decoded(&self) -> Result<DecodedVariant<'_>, DecodeError> {
         let mut decoded = DecodedData::from_bytes(&self.data)?;
         let message_type = decoded.take_u8()?;
+        let header = MessageHeader {
+            request_id: decoded.take_u32()?,
+            response_channel_id: decoded.take_u32()?,
+        };
         let message_type = match message_type {
-            0 => DecodedVariant::Evaluate { data: decoded },
-            1 => DecodedVariant::Respond { data: decoded },
+            0 => DecodedVariant::Evaluate {
+                header,
+                data: decoded,
+            },
+            1 => DecodedVariant::Respond {
+                header,
+                data: decoded,
+            },
             v => return Err(DecodeError::InvalidMessageType { value: v }),
         };
         Ok(message_type)
@@ -173,9 +215,15 @@ impl IPCMessage {
 #[derive(Debug)]
 pub(crate) enum DecodedVariant<'a> {
     /// Response from JS/Rust
-    Respond { data: DecodedData<'a> },
+    Respond {
+        header: MessageHeader,
+        data: DecodedData<'a>,
+    },
     /// Evaluation request
-    Evaluate { data: DecodedData<'a> },
+    Evaluate {
+        header: MessageHeader,
+        data: DecodedData<'a>,
+    },
 }
 
 /// Decoded binary data with aligned buffer access.
@@ -185,6 +233,9 @@ pub struct DecodedData<'a> {
     u16_buf: &'a [u16],
     u32_buf: &'a [u32],
     str_buf: &'a [u8],
+    deferred_heap_ref_request_id: Option<u32>,
+    deferred_heap_ref_count: u32,
+    deferred_heap_refs_decoded: u32,
 }
 
 impl<'a> DecodedData<'a> {
@@ -229,7 +280,31 @@ impl<'a> DecodedData<'a> {
             u16_buf,
             u32_buf,
             str_buf,
+            deferred_heap_ref_request_id: None,
+            deferred_heap_ref_count: 0,
+            deferred_heap_refs_decoded: 0,
         })
+    }
+
+    pub(crate) fn set_deferred_heap_ref_request(&mut self, request_id: Option<u32>, count: u32) {
+        self.deferred_heap_ref_request_id = request_id;
+        self.deferred_heap_ref_count = count;
+        self.deferred_heap_refs_decoded = 0;
+    }
+
+    pub(crate) fn take_deferred_heap_ref_request_id(&mut self) -> Result<u32, DecodeError> {
+        if self.deferred_heap_refs_decoded >= self.deferred_heap_ref_count {
+            return Err(DecodeError::Custom(
+                "decoded more deferred heap refs than JS declared".to_string(),
+            ));
+        }
+        self.deferred_heap_refs_decoded += 1;
+        self.deferred_heap_ref_request_id
+            .ok_or_else(|| DecodeError::Custom("missing deferred heap-ref request ID".to_string()))
+    }
+
+    pub(crate) fn deferred_heap_refs_complete(&self) -> bool {
+        self.deferred_heap_refs_decoded == self.deferred_heap_ref_count
     }
 
     /// Take a u8 from the buffer.
@@ -352,10 +427,14 @@ impl EncodedData {
         self.u32_buf.push(value);
     }
 
-    /// Prepend a u32 to the beginning of the buffer.
-    /// Used to add the reserved placeholder count at the start of batch messages.
-    pub fn prepend_u32(&mut self, value: u32) {
-        self.u32_buf.insert(0, value);
+    /// Insert u32 values at the given u32-buffer index, preserving order.
+    pub(crate) fn insert_u32s(&mut self, index: usize, values: &[u32]) {
+        let index = index.min(self.u32_buf.len());
+        let mut u32_buf = Vec::with_capacity(values.len() + self.u32_buf.len());
+        u32_buf.extend_from_slice(&self.u32_buf[..index]);
+        u32_buf.extend_from_slice(values);
+        u32_buf.extend_from_slice(&self.u32_buf[index..]);
+        self.u32_buf = u32_buf;
     }
 
     /// Push a u64 to the buffer (stored as two u32s).

@@ -92,11 +92,9 @@ impl Default for WebviewLoadingState {
 
 /// Shared state for managing async protocol responses.
 struct WebviewState {
-    ongoing_request: Option<WryBindgenResponder>,
-    /// How many responses we are waiting for from JS
-    pending_js_evaluates: usize,
-    /// How many responses JS is waiting for from us
-    pending_rust_evaluates: usize,
+    /// Sync HTTP responders for JS-originated calls that are suspended while
+    /// Rust runs and may send nested JS work before the final response.
+    response_channels: HashMap<u32, WryBindgenResponder>,
     /// The sender used to send IPC messages to the webview
     sender: IPCSenders,
     // The state of the webview. Either loading (with queued messages) or loaded.
@@ -109,48 +107,46 @@ impl WebviewState {
     /// Create a new webview state.
     fn new(sender: IPCSenders, evaluate_script: impl FnMut(&str) + 'static) -> Self {
         Self {
-            ongoing_request: None,
-            pending_js_evaluates: 0,
-            pending_rust_evaluates: 0,
+            response_channels: HashMap::new(),
             sender,
             loading_state: WebviewLoadingState::default(),
             evaluate_script: Box::new(evaluate_script),
         }
     }
 
-    fn set_ongoing_request(&mut self, responder: WryBindgenResponder) {
-        if self.ongoing_request.is_some() {
-            panic!(
-                "WARNING: Overwriting existing ongoing_request! Previous request will never be responded to."
-            );
+    fn set_response_channel(&mut self, id: u32, responder: WryBindgenResponder) {
+        if id == 0 {
+            panic!("Cannot store responder for response channel 0");
         }
-        self.ongoing_request = Some(responder);
-    }
-
-    fn take_ongoing_request(&mut self) -> Option<WryBindgenResponder> {
-        self.ongoing_request.take()
-    }
-
-    fn has_pending_request(&self) -> bool {
-        self.ongoing_request.is_some()
-    }
-
-    fn respond_to_request(&mut self, response: IPCMessage) {
-        if let Some(responder) = self.take_ongoing_request() {
-            let body = response.into_data();
-            // Encode as base64 - sync XMLHttpRequest cannot use responseType="arraybuffer"
-            let engine = base64::engine::general_purpose::STANDARD;
-            let body_base64 = engine.encode(&body);
-            responder.respond(
-                http::Response::builder()
-                    .status(200)
-                    .header("Content-Type", "text/plain")
-                    .body(body_base64.into_bytes())
-                    .expect("Failed to build response"),
-            );
-        } else {
-            panic!("WARNING: respond_to_request called but no pending request! Response dropped.");
+        if self.response_channels.insert(id, responder).is_some() {
+            panic!("Overwriting existing response channel {id}");
         }
+    }
+
+    fn take_response_channel(&mut self, id: u32) -> Option<WryBindgenResponder> {
+        self.response_channels.remove(&id)
+    }
+
+    fn respond_to_channel(&mut self, id: u32, response: IPCMessage) -> bool {
+        let Some(responder) = self.take_response_channel(id) else {
+            return false;
+        };
+        Self::respond_with(responder, response);
+        true
+    }
+
+    fn respond_with(responder: WryBindgenResponder, response: IPCMessage) {
+        let body = response.into_data();
+        // Encode as base64 - sync XMLHttpRequest cannot use responseType="arraybuffer"
+        let engine = base64::engine::general_purpose::STANDARD;
+        let body_base64 = engine.encode(&body);
+        responder.respond(
+            http::Response::builder()
+                .status(200)
+                .header("Content-Type", "text/plain")
+                .body(body_base64.into_bytes())
+                .expect("Failed to build response"),
+        );
     }
 
     fn evaluate_script(&mut self, script: &str) {
@@ -274,23 +270,24 @@ impl ProtocolHandler {
                 return None;
             };
             let msg_type = msg.ty().unwrap();
+            let header = msg.header().unwrap();
             match msg_type {
-                // New call from JS - save responder and wait for the js application thread to respond
+                // New call from JS - save the sync response channel and
+                // wait for the Rust application thread to respond.
                 MessageType::Evaluate => {
-                    webview_state.pending_rust_evaluates += 1;
-                    webview_state.set_ongoing_request(responder);
+                    if header.response_channel_id == 0 {
+                        responder.respond(error_response());
+                        return None;
+                    }
+                    webview_state.set_response_channel(header.response_channel_id, responder);
                 }
-                // Response from JS to a previous Evaluate - decrement pending count and respond accordingly
+                // Response from JS to a previous Rust Evaluate. If JS is
+                // still waiting on a Rust callback, this same HTTP request
+                // becomes the next response channel for that callback.
                 MessageType::Respond => {
-                    webview_state.pending_js_evaluates =
-                        webview_state.pending_js_evaluates.saturating_sub(1);
-                    if webview_state.pending_rust_evaluates > 0
-                        || webview_state.pending_js_evaluates > 0
-                    {
-                        // Still more round-trips expected
-                        webview_state.set_ongoing_request(responder);
+                    if header.response_channel_id != 0 {
+                        webview_state.set_response_channel(header.response_channel_id, responder);
                     } else {
-                        // Conversation is over
                         responder.respond(blank_response());
                     }
                 }
@@ -425,28 +422,26 @@ impl WryBindgen {
         webview_state: &mut WebviewState,
         ipc_msg: IPCMessage,
     ) {
+        let header = ipc_msg.header().unwrap();
+        if header.response_channel_id != 0 {
+            if webview_state.respond_to_channel(header.response_channel_id, ipc_msg) {
+                return;
+            }
+            panic!(
+                "No JS response channel {} for IPC message {}",
+                header.response_channel_id, header.request_id
+            );
+        }
+
         let ty = ipc_msg.ty().unwrap();
-        match ty {
-            // Rust wants to evaluate something in js
-            MessageType::Evaluate => {
-                webview_state.pending_js_evaluates += 1;
-            }
-            // Rust is responding to a previous js evaluate
-            MessageType::Respond => {
-                webview_state.pending_rust_evaluates =
-                    webview_state.pending_rust_evaluates.saturating_sub(1);
-            }
+        if ty == MessageType::Respond {
+            panic!(
+                "Rust response {} did not specify a JS response channel",
+                header.request_id
+            );
         }
 
-        // If there is an ongoing request, respond to immediately
-        if webview_state.has_pending_request() {
-            webview_state.respond_to_request(ipc_msg);
-            return;
-        }
-
-        // Otherwise call into js through evaluate_script
         let decoded = ipc_msg.decoded().unwrap();
-
         if let DecodedVariant::Evaluate { .. } = decoded {
             // Encode the binary data as base64 and pass to JS
             // JS will iterate over operations in the buffer

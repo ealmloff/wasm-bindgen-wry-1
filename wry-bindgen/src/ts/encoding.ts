@@ -1,8 +1,8 @@
-import { RustFunction } from "./rust_function";
-
 /**
  * Encoder for building binary messages to send to Rust.
  */
+import { DeferredHeapRefs } from "./heap";
+
 class DataEncoder {
   private u8Buf: number[];
   private u16Buf: number[];
@@ -65,6 +65,29 @@ class DataEncoder {
     }
   }
 
+  pushHeapRef(value: unknown) {
+    this.pushU64(window.jsHeap.insert(value));
+  }
+
+  deferredHeapRefRequestId(): number {
+    return 0;
+  }
+
+  deferredHeapRefCount(): number {
+    return 0;
+  }
+
+  prependU32s(values: number[]) {
+    this.u32Buf = values.concat(this.u32Buf);
+  }
+
+  insertU32s(index: number, values: number[]) {
+    const clampedIndex = Math.max(0, Math.min(index, this.u32Buf.length));
+    this.u32Buf = this.u32Buf
+      .slice(0, clampedIndex)
+      .concat(values, this.u32Buf.slice(clampedIndex));
+  }
+
   finalize(): ArrayBuffer {
     const u16Offset = 12 + this.u32Buf.length * 4;
     const u8Offset = u16Offset + this.u16Buf.length * 2;
@@ -101,6 +124,27 @@ class DataEncoder {
     strView.set(this.strBuf);
 
     return buffer;
+  }
+}
+
+class DeferredHeapRefDataEncoder extends DataEncoder {
+  private heapRefs: DeferredHeapRefs;
+
+  constructor(heapRefs: DeferredHeapRefs) {
+    super();
+    this.heapRefs = heapRefs;
+  }
+
+  pushHeapRef(value: unknown) {
+    this.heapRefs.push(value);
+  }
+
+  deferredHeapRefRequestId(): number {
+    return this.heapRefs.id();
+  }
+
+  deferredHeapRefCount(): number {
+    return this.heapRefs.count();
   }
 }
 
@@ -264,4 +308,4 @@ class DataDecoder {
   }
 }
 
-export { DataDecoder, DataEncoder };
+export { DataDecoder, DataEncoder, DeferredHeapRefDataEncoder };

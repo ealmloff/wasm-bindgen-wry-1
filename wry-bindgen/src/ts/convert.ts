@@ -129,7 +129,8 @@ export function is_error(x: any): boolean {
 }
 
 // Heap management - clone a value in the JS heap
-// Returns the value itself (not the ID) - HeapRefType.encode handles inserting it
+// Returns the value itself. HeapRefType.encode handles inserting it and
+// encoding the assigned ID when this is returned to Rust.
 export function clone_heap_ref(heapId: number): unknown {
   return window.jsHeap.get(heapId);
 }
@@ -137,6 +138,26 @@ export function clone_heap_ref(heapId: number): unknown {
 // Heap management - drop a value from the JS heap
 export function drop_heap_ref(heapId: number): void {
   window.jsHeap.remove(heapId);
+}
+
+function disposeRustFunction(value: unknown): void {
+  const rustFunction = (
+    value as
+      | {
+          __wryRustFunction?: {
+            disposeFromRust?: () => void;
+          };
+        }
+      | undefined
+  )?.__wryRustFunction;
+  if (typeof rustFunction?.disposeFromRust === "function") {
+    rustFunction.disposeFromRust();
+  }
+}
+
+export function dispose_and_drop_rust_function(heapId: number): void {
+  const value = window.jsHeap.remove(heapId);
+  disposeRustFunction(value);
 }
 
 // Create a wrapper object for an exported Rust struct
@@ -149,3 +170,4 @@ export function create_rust_object_wrapper(handle: number, className: string): u
 export function extract_rust_handle(obj: any): number | null {
   return (obj && typeof obj.__handle === 'number') ? obj.__handle : null;
 }
+import { RustFunction } from "./rust_function";

@@ -1,5 +1,14 @@
 import { DataEncoder } from "./encoding";
-import { handleBinaryResponse, MessageType, sync_request_binary, CALL_EXPORT_FN_ID } from "./ipc";
+import {
+  handleBinaryResponse,
+  MessageType,
+  sync_request_binary,
+  CALL_EXPORT_FN_ID,
+  prependJsToRustPrelude,
+  allocateJsRequestId,
+  pushMessageHeader,
+  rustCallResponseChannels,
+} from "./ipc";
 
 /**
  * FinalizationRegistry to notify Rust when exported object wrappers are GC'd.
@@ -8,7 +17,8 @@ import { handleBinaryResponse, MessageType, sync_request_binary, CALL_EXPORT_FN_
 const exportRegistry = new FinalizationRegistry<{ handle: number; className: string }>((info) => {
   // Build Evaluate message to drop the object: call ClassName::__drop with handle
   const encoder = new DataEncoder();
-  encoder.pushU8(MessageType.Evaluate);
+  const requestId = allocateJsRequestId();
+  pushMessageHeader(encoder, MessageType.Evaluate, requestId, requestId);
   encoder.pushU32(CALL_EXPORT_FN_ID);
   // Encode the export name as a string
   const dropName = `${info.className}::__drop`;
@@ -16,8 +26,14 @@ const exportRegistry = new FinalizationRegistry<{ handle: number; className: str
   // Encode the handle as u32
   encoder.pushU32(info.handle);
 
-  const response = sync_request_binary(`/__wbg__/handler`, encoder.finalize());
-  handleBinaryResponse(response);
+  rustCallResponseChannels.push(requestId);
+  try {
+    prependJsToRustPrelude(encoder);
+    const response = sync_request_binary(`/__wbg__/handler`, encoder.finalize());
+    handleBinaryResponse(response, requestId);
+  } finally {
+    rustCallResponseChannels.pop();
+  }
 });
 
 /**
@@ -28,7 +44,8 @@ function callExport(exportName: string, ...args: any[]): any {
   window.jsHeap.pushBorrowFrame();
 
   const encoder = new DataEncoder();
-  encoder.pushU8(MessageType.Evaluate);
+  const requestId = allocateJsRequestId();
+  pushMessageHeader(encoder, MessageType.Evaluate, requestId, requestId);
   encoder.pushU32(CALL_EXPORT_FN_ID);
   // Encode the export name as a string
   encoder.pushStr(exportName);
@@ -41,15 +58,20 @@ function callExport(exportName: string, ...args: any[]): any {
     }
   }
 
-  const response = sync_request_binary(`/__wbg__/handler`, encoder.finalize());
-  const decoder = handleBinaryResponse(response);
+  rustCallResponseChannels.push(requestId);
+  try {
+    prependJsToRustPrelude(encoder);
+    const response = sync_request_binary(`/__wbg__/handler`, encoder.finalize());
+    const decoder = handleBinaryResponse(response, requestId);
 
-  window.jsHeap.popBorrowFrame();
-
-  // If we have response data, try to decode it
-  // For now, try to decode as i32 if there's u32 data available
-  if (decoder && decoder.hasMoreU32()) {
-    return decoder.takeI32();
+    // If we have response data, try to decode it
+    // For now, try to decode as i32 if there's u32 data available
+    if (decoder && decoder.hasMoreU32()) {
+      return decoder.takeI32();
+    }
+  } finally {
+    rustCallResponseChannels.pop();
+    window.jsHeap.popBorrowFrame();
   }
 
   return undefined;
