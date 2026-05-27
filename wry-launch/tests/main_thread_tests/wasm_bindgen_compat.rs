@@ -1,7 +1,8 @@
 use wasm_bindgen::{
     JsError, JsValue, Promising,
     convert::{
-        FromWasmAbi, IntoWasmAbi, OptionFromWasmAbi, OptionIntoWasmAbi, RefFromWasmAbi, WasmAbi,
+        FromWasmAbi, IntoWasmAbi, OptionFromWasmAbi, OptionIntoWasmAbi, RefFromWasmAbi,
+        TryFromJsValue, WasmAbi,
     },
     wasm_bindgen,
 };
@@ -102,4 +103,94 @@ pub(crate) fn test_u128_try_from_bigint_preserves_range() {
     );
     assert!(u128::try_from(api_u128_negative_bigint()).is_err());
     assert!(u128::try_from(api_u128_too_large_bigint()).is_err());
+}
+
+pub(crate) fn test_i128_try_from_bigint_preserves_full_width() {
+    #[wasm_bindgen(inline_js = r#"
+        export function api_i128_large_positive_bigint() {
+            return 1n << 80n;
+        }
+
+        export function api_i128_large_negative_bigint() {
+            return -(1n << 80n);
+        }
+
+        export function api_i128_min_bigint() {
+            return -(1n << 127n);
+        }
+
+        export function api_i128_too_large_bigint() {
+            return 1n << 127n;
+        }
+
+        export function api_i128_too_negative_bigint() {
+            return -(1n << 127n) - 1n;
+        }
+    "#)]
+    extern "C" {
+        fn api_i128_large_positive_bigint() -> JsValue;
+        fn api_i128_large_negative_bigint() -> JsValue;
+        fn api_i128_min_bigint() -> JsValue;
+        fn api_i128_too_large_bigint() -> JsValue;
+        fn api_i128_too_negative_bigint() -> JsValue;
+    }
+
+    assert_eq!(
+        i128::try_from(api_i128_large_positive_bigint()).unwrap(),
+        1_i128 << 80
+    );
+    assert_eq!(
+        i128::try_from(api_i128_large_negative_bigint()).unwrap(),
+        -(1_i128 << 80)
+    );
+    assert_eq!(i128::try_from(api_i128_min_bigint()).unwrap(), i128::MIN);
+    assert!(i128::try_from(api_i128_too_large_bigint()).is_err());
+    assert!(i128::try_from(api_i128_too_negative_bigint()).is_err());
+}
+
+pub(crate) fn test_try_from_js_value_signed_numbers_preserve_negative_values() {
+    #[wasm_bindgen(inline_js = r#"
+        export function api_negative_one_number() {
+            return -1;
+        }
+
+        export function api_i8_min_number() {
+            return -128;
+        }
+
+        export function api_i16_min_number() {
+            return -32768;
+        }
+
+        export function api_signed_i32_array() {
+            return [-1, -2, -2147483648, 2147483647];
+        }
+    "#)]
+    extern "C" {
+        fn api_negative_one_number() -> JsValue;
+        fn api_i8_min_number() -> JsValue;
+        fn api_i16_min_number() -> JsValue;
+        fn api_signed_i32_array() -> JsValue;
+    }
+
+    assert_eq!(
+        <i8 as TryFromJsValue>::try_from_js_value(api_negative_one_number()).unwrap(),
+        -1
+    );
+    assert_eq!(
+        <i8 as TryFromJsValue>::try_from_js_value(api_i8_min_number()).unwrap(),
+        i8::MIN
+    );
+    assert_eq!(
+        <i16 as TryFromJsValue>::try_from_js_value(api_i16_min_number()).unwrap(),
+        i16::MIN
+    );
+    assert_eq!(
+        <i32 as TryFromJsValue>::try_from_js_value(api_negative_one_number()).unwrap(),
+        -1
+    );
+    assert_eq!(
+        <Vec<i32> as TryFromJsValue>::try_from_js_value(api_signed_i32_array()).unwrap(),
+        vec![-1, -2, i32::MIN, i32::MAX]
+    );
 }

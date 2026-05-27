@@ -247,6 +247,7 @@ fn build_tests() -> Vec<TestCase> {
         export_call::test_js_calls_exported_usize_js_thunk_batched,
         clamped::test_clamped_is_uint8clampedarray,
         clamped::test_clamped_vec_is_uint8clampedarray,
+        clamped::test_jsvalue_from_clamped_vec_is_uint8clampedarray,
         clamped::test_clamped_js_clamping_behavior,
         clamped::test_clamped_preserves_data,
         clamped::test_clamped_empty,
@@ -270,6 +271,8 @@ fn build_tests() -> Vec<TestCase> {
         wasm_bindgen_compat::test_convert_traits_are_marker_bounds,
         wasm_bindgen_compat::test_jsvalue_abi_ref_preserves_heap_ref,
         wasm_bindgen_compat::test_u128_try_from_bigint_preserves_range,
+        wasm_bindgen_compat::test_i128_try_from_bigint_preserves_full_width,
+        wasm_bindgen_compat::test_try_from_js_value_signed_numbers_preserve_negative_values,
     );
 
     async_trials!(tests;

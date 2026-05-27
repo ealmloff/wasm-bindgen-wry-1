@@ -2,25 +2,8 @@
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
-use core::fmt::{Debug, Display};
 
 use crate::value::{JSIDX_OFFSET, JSIDX_RESERVED};
-
-trait SlabId: Copy + Ord + Debug + Display {
-    fn next(self) -> Self;
-}
-
-impl SlabId for u64 {
-    fn next(self) -> Self {
-        self.checked_add(1).expect("u64 ID space exhausted")
-    }
-}
-
-impl SlabId for u32 {
-    fn next(self) -> Self {
-        self.wrapping_add(1)
-    }
-}
 
 /// A small ID-only slab.
 ///
@@ -31,88 +14,84 @@ impl SlabId for u32 {
 ///
 /// Keeping `release` and `recycle` separate lets callers delay reuse until the
 /// remote side has completed any required cleanup.
-struct IdSlab<I> {
-    live_ids: BTreeSet<I>,
-    free_ids: BTreeSet<I>,
-    next_id: I,
-    reuse_released_ids: bool,
+struct IdSlab {
+    live_ids: BTreeSet<u64>,
+    free_ids: BTreeSet<u64>,
+    next_id: u64,
 }
 
-impl<I: SlabId> IdSlab<I> {
-    fn new(first_id: I, reuse_released_ids: bool) -> Self {
+impl IdSlab {
+    fn new(first_id: u64) -> Self {
         Self {
             live_ids: BTreeSet::new(),
             free_ids: BTreeSet::new(),
             next_id: first_id,
-            reuse_released_ids,
         }
     }
 
-    fn alloc(&mut self) -> I {
-        if self.reuse_released_ids
-            && let Some(id) = self.free_ids.iter().next().copied()
-        {
+    fn alloc(&mut self) -> u64 {
+        if let Some(id) = self.free_ids.iter().next().copied() {
             self.free_ids.remove(&id);
             self.mark_live(id);
             return id;
         }
 
         let id = self.next_id;
-        self.next_id = self.next_id.next();
+        self.next_id = next_heap_id_after(self.next_id);
         self.mark_live(id);
         id
     }
 
-    fn reserve_exact(&mut self, id: I) {
+    fn reserve_exact(&mut self, id: u64) {
         self.free_ids.remove(&id);
         if id >= self.next_id {
-            self.next_id = id.next();
+            self.next_id = next_heap_id_after(id);
         }
         self.mark_live(id);
     }
 
-    fn release(&mut self, id: I) {
+    fn release(&mut self, id: u64) {
         assert!(
             self.live_ids.remove(&id),
             "Attempted to release ID {id}, but it is not live"
         );
     }
 
-    fn recycle(&mut self, id: I) {
+    fn recycle(&mut self, id: u64) {
         assert!(
             !self.live_ids.contains(&id),
             "Attempted to recycle ID {id}, but it is still live"
         );
 
-        if self.reuse_released_ids {
-            self.free_ids.insert(id);
-        }
+        self.free_ids.insert(id);
     }
 
-    fn recycle_if_released(&mut self, id: I) -> bool {
+    fn recycle_if_released(&mut self, id: u64) -> bool {
         if self.live_ids.contains(&id) {
             return false;
         }
 
-        if self.reuse_released_ids {
-            self.free_ids.insert(id);
-        }
+        self.free_ids.insert(id);
         true
     }
 
     #[cfg(test)]
-    fn contains(&self, id: I) -> bool {
+    fn contains(&self, id: u64) -> bool {
         self.live_ids.contains(&id)
     }
 
     #[cfg(test)]
-    fn is_reusable(&self, id: I) -> bool {
+    fn is_reusable(&self, id: u64) -> bool {
         self.free_ids.contains(&id)
     }
 
-    fn mark_live(&mut self, id: I) {
+    fn mark_live(&mut self, id: u64) {
         assert!(self.live_ids.insert(id), "ID {id} is already live");
     }
+}
+
+fn next_heap_id_after(id: u64) -> u64 {
+    id.checked_add(1).expect("u64 ID space exhausted")
 }
 
 #[derive(Clone)]
@@ -123,7 +102,7 @@ pub(crate) struct PendingInstallIds {
 }
 
 struct HeapIds {
-    slab: IdSlab<u64>,
+    slab: IdSlab,
     /// A stack of ongoing function encodings with the ids that need to be freed
     /// after each one is done.
     ids_to_free: Vec<Vec<u64>>,
@@ -139,7 +118,7 @@ struct HeapIds {
 impl HeapIds {
     fn new() -> Self {
         Self {
-            slab: IdSlab::new(JSIDX_RESERVED, true),
+            slab: IdSlab::new(JSIDX_RESERVED),
             ids_to_free: Vec::new(),
             pending_install_ids: BTreeMap::new(),
             pending_install_drops: BTreeMap::new(),
@@ -301,24 +280,53 @@ impl BorrowIds {
 }
 
 struct ObjectHandles {
-    slab: IdSlab<u32>,
+    live_handles: BTreeSet<u32>,
+    free_handles: BTreeSet<u32>,
+    next_handle: u32,
 }
 
 impl ObjectHandles {
     fn new() -> Self {
         Self {
-            slab: IdSlab::new(0, false),
+            live_handles: BTreeSet::new(),
+            free_handles: BTreeSet::new(),
+            next_handle: 1,
         }
     }
 
     fn next_handle(&mut self) -> u32 {
-        self.slab.alloc()
+        if let Some(handle) = self.free_handles.iter().next().copied() {
+            self.free_handles.remove(&handle);
+            self.mark_live(handle);
+            return handle;
+        }
+
+        let handle = self.next_handle;
+        self.next_handle = next_object_handle_after(self.next_handle);
+        self.mark_live(handle);
+        handle
     }
 
     fn release_handle(&mut self, handle: u32) {
-        self.slab.release(handle);
-        self.slab.recycle(handle);
+        assert!(
+            self.live_handles.remove(&handle),
+            "Attempted to release object handle {handle}, but it is not live"
+        );
+        self.free_handles.insert(handle);
     }
+
+    fn mark_live(&mut self, handle: u32) {
+        assert!(
+            self.live_handles.insert(handle),
+            "Object handle {handle} is already live"
+        );
+    }
+}
+
+fn next_object_handle_after(handle: u32) -> u32 {
+    handle
+        .checked_add(1)
+        .expect("u32 object handle space exhausted")
 }
 
 /// Allocates IDs and handles used by the runtime.
@@ -432,7 +440,7 @@ mod tests {
 
     #[test]
     fn slab_reuses_recycled_ids_in_order() {
-        let mut slab = IdSlab::new(10_u64, true);
+        let mut slab = IdSlab::new(10_u64);
         let first = slab.alloc();
         let second = slab.alloc();
         assert_eq!(first, 10);
@@ -449,7 +457,7 @@ mod tests {
 
     #[test]
     fn reserve_exact_removes_id_from_free_list() {
-        let mut slab = IdSlab::new(10_u64, true);
+        let mut slab = IdSlab::new(10_u64);
         let id = slab.alloc();
         slab.release(id);
         slab.recycle(id);
@@ -463,7 +471,7 @@ mod tests {
 
     #[test]
     fn recycle_if_released_leaves_reobserved_id_live() {
-        let mut slab = IdSlab::new(10_u64, true);
+        let mut slab = IdSlab::new(10_u64);
         let id = slab.alloc();
         slab.release(id);
         slab.reserve_exact(id);
@@ -543,11 +551,25 @@ mod tests {
     }
 
     #[test]
-    fn object_handles_are_not_reused_after_release() {
+    fn object_handles_reuse_released_handles() {
         let mut handles = ObjectHandles::new();
         let first = handles.next_handle();
         let second = handles.next_handle();
+        assert_eq!(first, 1);
         handles.release_handle(first);
-        assert_eq!(handles.next_handle(), second + 1);
+        assert_eq!(handles.next_handle(), first);
+        assert_eq!(second, first + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "u32 object handle space exhausted")]
+    fn object_handles_panic_on_overflow() {
+        let mut handles = ObjectHandles {
+            live_handles: BTreeSet::new(),
+            free_handles: BTreeSet::new(),
+            next_handle: u32::MAX,
+        };
+
+        handles.next_handle();
     }
 }

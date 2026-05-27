@@ -37,13 +37,15 @@ pub(crate) const JSIDX_RESERVED: u64 = JSIDX_OFFSET + 4;
 ///
 /// Unlike wasm-bindgen which runs in a single-threaded Wasm environment,
 /// this implementation uses the IPC protocol to communicate with JS.
+#[repr(transparent)]
 pub struct JsValue {
     #[doc(hidden)]
     pub idx: u64,
+    // A JsValue id is only meaningful inside the thread-local runtime that
+    // created it. Opt out of Send + Sync so the type cannot cross runtimes.
+    #[doc(hidden)]
+    pub _not_send_sync: core::marker::PhantomData<*const ()>,
 }
-
-unsafe impl Send for JsValue {}
-unsafe impl Sync for JsValue {}
 
 impl JsValue {
     /// The `null` JS value constant.
@@ -61,7 +63,10 @@ impl JsValue {
     /// Create a new JsValue from an index (const fn for static values).
     #[inline]
     const fn _new(idx: u64) -> JsValue {
-        JsValue { idx }
+        JsValue {
+            idx,
+            _not_send_sync: core::marker::PhantomData,
+        }
     }
 
     /// Create a new JsValue from a heap ID.
@@ -69,7 +74,7 @@ impl JsValue {
     /// This is called internally when decoding a value from JS.
     #[inline]
     pub(crate) fn from_id(id: u64) -> Self {
-        Self { idx: id }
+        Self::_new(id)
     }
 
     /// Get the heap ID for this value.
@@ -148,7 +153,7 @@ impl Clone for JsValue {
     fn clone(&self) -> JsValue {
         // Reserved values don't need cloning - they're constants
         if self.idx < JSIDX_RESERVED {
-            return JsValue { idx: self.idx };
+            return JsValue::_new(self.idx);
         }
 
         // Clone the value on the JS heap
@@ -736,20 +741,14 @@ where
     }
 }
 
-impl<T> From<crate::Clamped<Vec<T>>> for JsValue
-where
-    Vec<T>: crate::BinaryEncode + crate::EncodeTypeDef,
-{
-    fn from(vector: crate::Clamped<Vec<T>>) -> Self {
-        crate::__rt::wbg_cast(vector.0)
+impl From<crate::Clamped<Vec<u8>>> for JsValue {
+    fn from(vector: crate::Clamped<Vec<u8>>) -> Self {
+        crate::__rt::wbg_cast(vector)
     }
 }
 
-impl<T> From<crate::Clamped<Box<[T]>>> for JsValue
-where
-    Box<[T]>: crate::BinaryEncode + crate::EncodeTypeDef,
-{
-    fn from(vector: crate::Clamped<Box<[T]>>) -> Self {
-        crate::__rt::wbg_cast(vector.0)
+impl From<crate::Clamped<Box<[u8]>>> for JsValue {
+    fn from(vector: crate::Clamped<Box<[u8]>>) -> Self {
+        crate::__rt::wbg_cast(crate::Clamped(vector.0.into_vec()))
     }
 }
