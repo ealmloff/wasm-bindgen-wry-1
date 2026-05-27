@@ -347,7 +347,7 @@ macro_rules! try_from_js_value_small_int {
         $(
             impl convert::TryFromJsValue for $ty {
                 fn try_from_js_value_ref(val: &JsValue) -> Option<$ty> {
-                    val.as_f64().map(|n| (n as u32) as $ty)
+                    val.as_f64().map(|n| n as $ty)
                 }
             }
         )*
