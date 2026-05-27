@@ -220,12 +220,14 @@ fn consume_js_to_rust_prelude(data: &mut DecodedData) {
     let heap_ref_count = data
         .take_u32()
         .expect("Failed to read deferred heap-ref count");
-    let heap_ref_request_id = match (heap_ref_request_id, heap_ref_count) {
-        (0, 0) => None,
+    let deferred_heap_ref_ids = match (heap_ref_request_id, heap_ref_count) {
+        (_, 0) => alloc::vec::Vec::new(),
         (0, _) => panic!("Deferred heap refs require a non-zero request ID"),
-        (id, _) => Some(id),
+        (request_id, count) => {
+            with_runtime(|runtime| runtime.get_next_inbound_js_heap_ids(request_id, count))
+        }
     };
-    data.set_deferred_heap_ref_request(heap_ref_request_id, heap_ref_count);
+    data.set_deferred_heap_ref_ids(deferred_heap_ref_ids);
 
     let install_ack_count = data
         .take_u32()

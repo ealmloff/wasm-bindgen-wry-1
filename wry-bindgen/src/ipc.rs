@@ -8,7 +8,7 @@
 //! - string buffer: from str_offset to end
 
 use alloc::string::{String, ToString};
-use alloc::vec::Vec;
+use alloc::vec::{IntoIter, Vec};
 use base64::Engine;
 use core::fmt;
 
@@ -233,16 +233,7 @@ pub struct DecodedData<'a> {
     u16_buf: &'a [u16],
     u32_buf: &'a [u32],
     str_buf: &'a [u8],
-    deferred_heap_ref_request_id: Option<u32>,
-    deferred_heap_ref_count: u32,
-    deferred_heap_refs_decoded: u32,
-    deferred_heap_ref_ids: Vec<u64>,
-}
-
-pub(crate) struct DeferredHeapRef {
-    pub(crate) request_id: u32,
-    pub(crate) index: u32,
-    pub(crate) count: u32,
+    deferred_heap_ref_ids: IntoIter<u64>,
 }
 
 impl<'a> DecodedData<'a> {
@@ -287,64 +278,22 @@ impl<'a> DecodedData<'a> {
             u16_buf,
             u32_buf,
             str_buf,
-            deferred_heap_ref_request_id: None,
-            deferred_heap_ref_count: 0,
-            deferred_heap_refs_decoded: 0,
-            deferred_heap_ref_ids: Vec::new(),
+            deferred_heap_ref_ids: Vec::new().into_iter(),
         })
     }
 
-    pub(crate) fn set_deferred_heap_ref_request(&mut self, request_id: Option<u32>, count: u32) {
-        self.deferred_heap_ref_request_id = request_id;
-        self.deferred_heap_ref_count = count;
-        self.deferred_heap_refs_decoded = 0;
-        self.deferred_heap_ref_ids.clear();
+    pub(crate) fn set_deferred_heap_ref_ids(&mut self, ids: Vec<u64>) {
+        self.deferred_heap_ref_ids = ids.into_iter();
     }
 
-    pub(crate) fn take_deferred_heap_ref(&mut self) -> Result<DeferredHeapRef, DecodeError> {
-        if self.deferred_heap_refs_decoded >= self.deferred_heap_ref_count {
-            return Err(DecodeError::Custom(
-                "decoded more deferred heap refs than JS declared".to_string(),
-            ));
-        }
-        let index = self.deferred_heap_refs_decoded;
-        self.deferred_heap_refs_decoded += 1;
-        let request_id = self.deferred_heap_ref_request_id.ok_or_else(|| {
-            DecodeError::Custom("missing deferred heap-ref request ID".to_string())
-        })?;
-
-        Ok(DeferredHeapRef {
-            request_id,
-            index,
-            count: self.deferred_heap_ref_count,
+    pub(crate) fn take_deferred_heap_ref_id(&mut self) -> Result<u64, DecodeError> {
+        self.deferred_heap_ref_ids.next().ok_or_else(|| {
+            DecodeError::Custom("decoded more deferred heap refs than JS declared".to_string())
         })
-    }
-
-    pub(crate) fn has_deferred_heap_ref_ids(&self) -> bool {
-        !self.deferred_heap_ref_ids.is_empty()
-    }
-
-    pub(crate) fn set_deferred_heap_ref_ids(&mut self, ids: Vec<u64>) -> Result<(), DecodeError> {
-        if ids.len() != self.deferred_heap_ref_count as usize {
-            return Err(DecodeError::Custom(format!(
-                "allocated {} deferred heap-ref IDs for {} declared refs",
-                ids.len(),
-                self.deferred_heap_ref_count
-            )));
-        }
-        self.deferred_heap_ref_ids = ids;
-        Ok(())
-    }
-
-    pub(crate) fn deferred_heap_ref_id(&self, index: u32) -> Result<u64, DecodeError> {
-        self.deferred_heap_ref_ids
-            .get(index as usize)
-            .copied()
-            .ok_or_else(|| DecodeError::Custom("missing deferred heap-ref ID".to_string()))
     }
 
     pub(crate) fn deferred_heap_refs_complete(&self) -> bool {
-        self.deferred_heap_refs_decoded == self.deferred_heap_ref_count
+        self.deferred_heap_ref_ids.len() == 0
     }
 
     /// Take a u8 from the buffer.
