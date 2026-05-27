@@ -41,6 +41,9 @@ pub struct Runtime {
     /// Rust-owned object handles to drop after the current encoded JS call
     /// has finished executing.
     objects_to_free: Vec<Vec<u32>>,
+    /// Heap IDs whose JS drop operation was batched and can only be recycled
+    /// after the batch has actually executed in JS.
+    heap_ids_to_recycle_after_flush: Vec<u64>,
     /// The ipc layer used to communicate with the JS runtime
     ipc: WryIPC,
     /// The id of the webview this is associated with
@@ -63,6 +66,7 @@ impl Runtime {
             objects: BTreeMap::new(),
             removed_objects: BTreeMap::new(),
             objects_to_free: Vec::new(),
+            heap_ids_to_recycle_after_flush: Vec::new(),
             ipc,
             webview_id,
             thread_locals: BTreeMap::new(),
@@ -140,6 +144,18 @@ impl Runtime {
 
     pub fn recycle_heap_id(&mut self, id: u64) {
         self.id_allocator.recycle_heap_id(id);
+    }
+
+    pub fn recycle_heap_id_if_released(&mut self, id: u64) -> bool {
+        self.id_allocator.recycle_heap_id_if_released(id)
+    }
+
+    pub fn defer_heap_id_recycle_until_flush(&mut self, id: u64) {
+        self.heap_ids_to_recycle_after_flush.push(id);
+    }
+
+    pub fn take_heap_ids_to_recycle_after_flush(&mut self) -> Vec<u64> {
+        core::mem::take(&mut self.heap_ids_to_recycle_after_flush)
     }
 
     /// Take the message data and reset the batch for reuse.
@@ -314,6 +330,7 @@ impl Runtime {
     /// Remove an exported object and return it.
     pub(crate) fn remove_object<T: 'static>(&mut self, handle: u32) -> T {
         let boxed = self.objects.remove(&handle).expect("invalid handle");
+        self.id_allocator.release_object_handle(handle);
         self.removed_objects.insert(handle, "typed remove_object");
         let cell = boxed.downcast::<RefCell<T>>().expect("type mismatch");
         cell.into_inner()
@@ -326,6 +343,7 @@ impl Runtime {
     ) -> Option<Box<dyn Any>> {
         let object = self.objects.remove(&handle);
         if object.is_some() {
+            self.id_allocator.release_object_handle(handle);
             self.removed_objects.insert(handle, reason);
         }
         object
@@ -456,14 +474,7 @@ pub(crate) fn queue_js_drop(id: u64) {
     };
     if let Some(id) = id {
         crate::js_helpers::js_drop_heap_ref(id);
-        let _ = RUNTIME.try_with(|state| {
-            let Ok(mut runtime_stack) = state.try_borrow_mut() else {
-                return;
-            };
-            if let Some(runtime) = runtime_stack.last_mut() {
-                runtime.recycle_heap_id(id);
-            }
-        });
+        recycle_heap_id_after_js_drop(id);
     }
 }
 
@@ -500,15 +511,25 @@ pub(crate) fn queue_js_dispose_and_drop_rust_function(id: u64) {
     };
     if let Some(id) = id {
         crate::js_helpers::js_dispose_and_drop_rust_function(id);
-        let _ = RUNTIME.try_with(|state| {
-            let Ok(mut runtime_stack) = state.try_borrow_mut() else {
-                return;
-            };
-            if let Some(runtime) = runtime_stack.last_mut() {
-                runtime.recycle_heap_id(id);
-            }
-        });
+        recycle_heap_id_after_js_drop(id);
     }
+}
+
+fn recycle_heap_id_after_js_drop(id: u64) {
+    let _ = RUNTIME.try_with(|state| {
+        let Ok(mut runtime_stack) = state.try_borrow_mut() else {
+            return;
+        };
+        let Some(runtime) = runtime_stack.last_mut() else {
+            return;
+        };
+
+        if runtime.is_batching() {
+            runtime.defer_heap_id_recycle_until_flush(id);
+        } else {
+            runtime.recycle_heap_id(id);
+        }
+    });
 }
 
 /// Drop a Rust-owned object now, or after the current encoded JS operation
@@ -589,7 +610,7 @@ pub(crate) fn run_js_sync<R: BatchableResult>(
     let ids = with_runtime(|state| state.pop_and_release_ids());
     for id in ids {
         crate::js_helpers::js_drop_heap_ref(id);
-        with_runtime(|state| state.recycle_heap_id(id));
+        recycle_heap_id_after_js_drop(id);
     }
 
     let objects = with_runtime(|state| state.pop_and_release_objects());
@@ -630,8 +651,18 @@ pub(crate) fn flush_and_then<R>(mut then: impl for<'a> FnMut(DecodedData<'a>) ->
     });
     loop {
         if let Some(result) = crate::runtime::progress_js_with(request_id, &mut then) {
+            recycle_heap_ids_after_flush();
             return result;
         }
+    }
+}
+
+fn recycle_heap_ids_after_flush() {
+    let ids = with_runtime(|state| state.take_heap_ids_to_recycle_after_flush());
+    for id in ids {
+        with_runtime(|state| {
+            state.recycle_heap_id_if_released(id);
+        });
     }
 }
 

@@ -75,6 +75,11 @@ async fn async_test_with_js_context<Fut: std::future::Future<Output = ()>, F: Fn
 }
 
 async fn run_main_thread_tests() {
+    if std::env::args().any(|arg| arg == "--wry-repro-exported-struct-heap-ref") {
+        test_with_js_context(structs::test_exported_struct_arg_before_heap_ref_arg).await;
+        return;
+    }
+
     // Opaque-id stress first — reproduces duplicate Rust ownership of the
     // same JS heap id before later tests can perturb heap allocation shape.
     async fn run_opaque_id_stress() {

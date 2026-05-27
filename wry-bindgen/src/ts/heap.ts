@@ -160,6 +160,7 @@ class JSHeap {
   pushReservationScope(ids: number[]): void {
     this.reservationStack.push({ ids, nextIndex: 0 });
     for (const id of ids) {
+      this.freeIds.delete(id);
       this.maxId = Math.max(this.maxId, id + 1);
     }
   }
