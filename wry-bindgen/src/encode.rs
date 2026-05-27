@@ -1317,6 +1317,19 @@ macro_rules! impl_fnmut_stub_ref {
             }
         }
 
+        // Trait objects like `dyn FnMut(&Event)` are commonly inferred as
+        // higher-ranked over the borrowed argument lifetime.
+        #[allow(coherence_leak_check)]
+        impl<R, $first, $($rest,)*> crate::WasmClosure for dyn FnMut(&$first, $($rest),*) -> R
+            where
+            $first: 'static,
+            $($rest: 'static,)*
+            R: 'static,
+        {
+            type Static = dyn FnMut(&$first, $($rest),*) -> R;
+            type AsMut = dyn FnMut(&$first, $($rest),*) -> R;
+        }
+
         // WasmClosure for dyn Fn(&First, ...) -> R (supports reentrant calls)
         impl<R, $first, $($rest,)*> crate::WryWasmClosure<(BorrowedFirstArg, fn(&$first, $($rest),*) -> R)> for dyn Fn(&$first, $($rest),*) -> R
             where
@@ -1336,6 +1349,17 @@ macro_rules! impl_fnmut_stub_ref {
                     },
                 )
             }
+        }
+
+        #[allow(coherence_leak_check)]
+        impl<R, $first, $($rest,)*> crate::WasmClosure for dyn Fn(&$first, $($rest),*) -> R
+            where
+            $first: 'static,
+            $($rest: 'static,)*
+            R: 'static,
+        {
+            type Static = dyn Fn(&$first, $($rest),*) -> R;
+            type AsMut = dyn FnMut(&$first, $($rest),*) -> R;
         }
 
         // IntoClosure for F: FnMut(&First, ...) -> R -> Closure<dyn FnMut(&First, ...) -> R>
@@ -1377,6 +1401,62 @@ macro_rules! impl_fnmut_stub_ref {
                         result.encode(encoder);
                     },
                 )
+            }
+        }
+
+        #[allow(coherence_leak_check)]
+        impl<R, F, $first, $($rest,)*> IntoWasmClosure<dyn FnMut(&$first, $($rest),*) -> R> for F
+            where F: FnMut(&$first, $($rest),*) -> R + 'static,
+            $first: RefFromBinaryDecode + EncodeTypeDef + 'static,
+            $($rest: BinaryDecode + EncodeTypeDef + 'static,)*
+            R: BinaryEncode + EncodeTypeDef + 'static,
+        {
+            fn into_closure(self) -> crate::Closure<dyn FnMut(&$first, $($rest),*) -> R> {
+                <F as IntoClosure<(BorrowedFirstArg, fn(&$first, $($rest),*) -> R), crate::Closure<dyn FnMut(&$first, $($rest),*) -> R>>>::into_closure(self)
+            }
+
+            fn into_closure_box(self: Box<Self>) -> crate::Closure<dyn FnMut(&$first, $($rest),*) -> R> {
+                <F as IntoWasmClosure<dyn FnMut(&$first, $($rest),*) -> R>>::into_closure(*self)
+            }
+        }
+
+        #[allow(coherence_leak_check)]
+        impl<R, $first, $($rest,)*> IntoWasmClosure<dyn FnMut(&$first, $($rest),*) -> R> for dyn FnMut(&$first, $($rest),*) -> R
+            where
+            $first: RefFromBinaryDecode + EncodeTypeDef + 'static,
+            $($rest: BinaryDecode + EncodeTypeDef + 'static,)*
+            R: BinaryEncode + EncodeTypeDef + 'static,
+        {
+            fn into_closure_box(self: Box<Self>) -> crate::Closure<dyn FnMut(&$first, $($rest),*) -> R> {
+                <Self as crate::WryWasmClosure<(BorrowedFirstArg, fn(&$first, $($rest),*) -> R)>>::into_js_closure(self)
+            }
+        }
+
+        #[allow(coherence_leak_check)]
+        impl<R, F, $first, $($rest,)*> IntoWasmClosure<dyn Fn(&$first, $($rest),*) -> R> for F
+            where F: Fn(&$first, $($rest),*) -> R + 'static,
+            $first: RefFromBinaryDecode + EncodeTypeDef + 'static,
+            $($rest: BinaryDecode + EncodeTypeDef + 'static,)*
+            R: BinaryEncode + EncodeTypeDef + 'static,
+        {
+            fn into_closure(self) -> crate::Closure<dyn Fn(&$first, $($rest),*) -> R> {
+                <F as IntoClosure<(BorrowedFirstArg, fn(&$first, $($rest),*) -> R), crate::Closure<dyn Fn(&$first, $($rest),*) -> R>>>::into_closure(self)
+            }
+
+            fn into_closure_box(self: Box<Self>) -> crate::Closure<dyn Fn(&$first, $($rest),*) -> R> {
+                <F as IntoWasmClosure<dyn Fn(&$first, $($rest),*) -> R>>::into_closure(*self)
+            }
+        }
+
+        #[allow(coherence_leak_check)]
+        impl<R, $first, $($rest,)*> IntoWasmClosure<dyn Fn(&$first, $($rest),*) -> R> for dyn Fn(&$first, $($rest),*) -> R
+            where
+            $first: RefFromBinaryDecode + EncodeTypeDef + 'static,
+            $($rest: BinaryDecode + EncodeTypeDef + 'static,)*
+            R: BinaryEncode + EncodeTypeDef + 'static,
+        {
+            fn into_closure_box(self: Box<Self>) -> crate::Closure<dyn Fn(&$first, $($rest),*) -> R> {
+                <Self as crate::WryWasmClosure<(BorrowedFirstArg, fn(&$first, $($rest),*) -> R)>>::into_js_closure(self)
             }
         }
     };
