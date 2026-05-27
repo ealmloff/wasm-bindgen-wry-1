@@ -237,9 +237,6 @@ impl Runtime {
     }
 
     pub(crate) fn take_encoder(&mut self) -> EncodedData {
-        if self.is_empty() {
-            self.encoder = Self::new_encoder_for_evaluate(&mut self.id_allocator);
-        }
         let next = Self::new_encoder_for_evaluate(&mut self.id_allocator);
         core::mem::replace(&mut self.encoder, next)
     }
@@ -695,5 +692,44 @@ pub fn force_flush() {
     let has_pending = with_runtime(|state| !state.is_empty());
     if has_pending {
         flush_and_return::<()>();
+    }
+}
+
+#[cfg(test)]
+mod take_encoder_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::ipc::IPCMessage;
+    use crate::runtime::WryIPC;
+
+    fn test_runtime() -> Runtime {
+        let (ipc, _senders) = WryIPC::new(Arc::new(|_| {}));
+        Runtime::new(ipc, 0)
+    }
+
+    fn request_id(encoder: &EncodedData) -> u32 {
+        IPCMessage::new(encoder.to_bytes())
+            .header()
+            .expect("encoded message should have a header")
+            .request_id
+    }
+
+    #[test]
+    fn empty_take_encoder_should_not_skip_rust_request_ids() {
+        let mut runtime = test_runtime();
+        assert!(runtime.is_empty());
+
+        let first = runtime.take_encoder();
+        assert!(runtime.is_empty());
+        let second = runtime.take_encoder();
+
+        let first_id = request_id(&first);
+        let second_id = request_id(&second);
+        assert_eq!(
+            second_id,
+            first_id + 1,
+            "empty take_encoder skipped a request ID: first={first_id}, second={second_id}"
+        );
     }
 }

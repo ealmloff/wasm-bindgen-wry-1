@@ -340,7 +340,11 @@ fn generate_type(ty: &ImportType, krate: &TokenStream) -> syn::Result<TokenStrea
         }
     };
 
-    // Generate From and AsRef impls for parent types
+    // Generate owned From and borrowed AsRef impls for parent types.
+    //
+    // Keep this aligned with upstream wasm-bindgen: a borrowed upcast should
+    // stay borrowed. Emitting From<&Child> for Parent forces the parent wrapper
+    // to implement Clone, which plain extern types do not do by default.
     let mut from_parents = TokenStream::new();
     from_parents.extend(quote_spanned! {span=>
         impl #impl_generics ::core::convert::AsRef<#rust_name #ty_generics> for #rust_name #ty_generics #where_clause {
@@ -356,11 +360,6 @@ fn generate_type(ty: &ImportType, krate: &TokenStream) -> syn::Result<TokenStrea
         } else {
             quote_spanned! {span=> <#parent as #krate::JsCast>::unchecked_from_js(::core::convert::Into::into(val.obj)) }
         };
-        let parent_from_ref = if index == 0 {
-            quote_spanned! {span=> ::core::clone::Clone::clone(&val.obj) }
-        } else {
-            quote_spanned! {span=> <#parent as #krate::JsCast>::unchecked_from_js(::core::convert::Into::into(val)) }
-        };
         let parent_ref = if index == 0 {
             quote_spanned! {span=> &self.obj }
         } else {
@@ -370,12 +369,6 @@ fn generate_type(ty: &ImportType, krate: &TokenStream) -> syn::Result<TokenStrea
             impl #impl_generics ::core::convert::From<#rust_name #ty_generics> for #parent #where_clause {
                 fn from(val: #rust_name #ty_generics) -> #parent {
                     #parent_from_owned
-                }
-            }
-
-            impl #impl_generics ::core::convert::From<&#rust_name #ty_generics> for #parent #where_clause {
-                fn from(val: &#rust_name #ty_generics) -> #parent {
-                    #parent_from_ref
                 }
             }
 
