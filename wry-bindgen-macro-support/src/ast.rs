@@ -92,6 +92,8 @@ pub struct ImportType {
     pub is_type_of: Option<syn::Expr>,
     /// Whether automatic upcast impls should be suppressed
     pub no_upcast: bool,
+    /// Whether automatic Promising impls should be suppressed
+    pub no_promising: bool,
 }
 
 /// An imported JavaScript function
@@ -881,6 +883,7 @@ fn parse_foreign_type(t: syn::ForeignItemType, attrs: BindgenAttrs) -> syn::Resu
         vendor_prefixes,
         is_type_of,
         no_upcast: attrs.no_upcast.is_some(),
+        no_promising: attrs.no_promising.is_some(),
     })
 }
 

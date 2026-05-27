@@ -1,11 +1,6 @@
-import { DataEncoder } from "./encoding";
 import {
-  handleBinaryResponse,
-  MessageType,
-  sync_request_binary,
   CALL_EXPORT_FN_ID,
-  allocateJsRequestId,
-  pushMessageHeader,
+  sendEvaluateToRust,
 } from "./ipc";
 import { parseTypeDef, TypeClass } from "./types";
 
@@ -46,21 +41,15 @@ function callExport(
 
   window.jsHeap.pushBorrowFrame();
 
-  const requestId = allocateJsRequestId();
-  const pendingHeapRefs = window.jsHeap.deferHeapRefs(requestId);
-  const encoder = new DataEncoder(pendingHeapRefs);
-  pushMessageHeader(encoder, MessageType.Evaluate, requestId);
-  encoder.pushU32(CALL_EXPORT_FN_ID);
-  encoder.pushStr(exportName);
-
-  for (let i = 0; i < args.length; i++) {
-    typeFromBytes(argTypeDefs[i]).encode(encoder, args[i]);
-  }
-
   try {
-    const response = sync_request_binary(`/__wbg__/handler`, encoder.finalize());
-    const decoder = handleBinaryResponse(response, requestId);
-    window.jsHeap.releaseEmptyDeferredHeapRefs(pendingHeapRefs);
+    const decoder = sendEvaluateToRust((encoder) => {
+      encoder.pushU32(CALL_EXPORT_FN_ID);
+      encoder.pushStr(exportName);
+
+      for (let i = 0; i < args.length; i++) {
+        typeFromBytes(argTypeDefs[i]).encode(encoder, args[i]);
+      }
+    });
 
     if (returnTypeDef === null) {
       if (decoder && !decoder.isEmpty()) {

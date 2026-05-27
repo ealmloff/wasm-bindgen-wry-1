@@ -13,7 +13,7 @@ use core::cell::RefCell;
 use core::future::poll_fn;
 use core::pin::{Pin, pin};
 use futures_util::FutureExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::sync::Arc;
 
 use http::Response;
@@ -69,6 +69,20 @@ impl WryBindgenResponder {
     fn respond(self, response: Response<Vec<u8>>) {
         self.respond.respond(response);
     }
+
+    fn respond_ipc(self, response: IPCMessage) {
+        let body = response.into_data();
+        // Encode as base64 - sync XMLHttpRequest cannot use responseType="arraybuffer"
+        let engine = base64::engine::general_purpose::STANDARD;
+        let body_base64 = engine.encode(&body);
+        self.respond(
+            http::Response::builder()
+                .status(200)
+                .header("Content-Type", "text/plain")
+                .body(body_base64.into_bytes())
+                .expect("Failed to build response"),
+        );
+    }
 }
 
 /// Decode request data from the dioxus-data header.
@@ -93,8 +107,18 @@ impl Default for WebviewLoadingState {
     }
 }
 
-/// Shared state for managing async protocol responses.
+/// Shared state for one webview instance.
 struct WebviewState {
+    /// Protocol message routing for this webview.
+    messages: WebviewMessageLayer,
+    // The state of the webview. Either loading (with queued messages) or loaded.
+    loading_state: WebviewLoadingState,
+    // A function that evaluates scripts in the webview
+    evaluate_script: Box<dyn FnMut(&str)>,
+}
+
+/// Transport-owned IPC routing state for one webview.
+struct WebviewMessageLayer {
     /// Sync HTTP responders for JS-originated calls that are suspended while
     /// Rust runs and may send nested JS work before the final response.
     response_channels: HashMap<u32, WryBindgenResponder>,
@@ -106,12 +130,8 @@ struct WebviewState {
     /// JS-to-Rust message, which proves JS has resumed and consumed the
     /// previous response payload.
     pending_js_consumed_actions: Vec<JsConsumedAction>,
-    /// The sender used to send IPC messages to the webview
+    /// The sender used to forward decoded IPC messages to the Rust runtime.
     sender: IPCSenders,
-    // The state of the webview. Either loading (with queued messages) or loaded.
-    loading_state: WebviewLoadingState,
-    // A function that evaluates scripts in the webview
-    evaluate_script: Box<dyn FnMut(&str)>,
 }
 
 struct RustEvaluateRoute {
@@ -123,12 +143,24 @@ impl WebviewState {
     /// Create a new webview state.
     fn new(sender: IPCSenders, evaluate_script: impl FnMut(&str) + 'static) -> Self {
         Self {
+            messages: WebviewMessageLayer::new(sender),
+            loading_state: WebviewLoadingState::default(),
+            evaluate_script: Box::new(evaluate_script),
+        }
+    }
+
+    fn evaluate_script(&mut self, script: &str) {
+        (self.evaluate_script)(script);
+    }
+}
+
+impl WebviewMessageLayer {
+    fn new(sender: IPCSenders) -> Self {
+        Self {
             response_channels: HashMap::new(),
             rust_evaluate_routes: HashMap::new(),
             pending_js_consumed_actions: Vec::new(),
             sender,
-            loading_state: WebviewLoadingState::default(),
-            evaluate_script: Box::new(evaluate_script),
         }
     }
 
@@ -136,8 +168,13 @@ impl WebviewState {
         if id == 0 {
             panic!("Cannot store responder for response channel 0");
         }
-        if self.response_channels.insert(id, responder).is_some() {
-            panic!("Overwriting existing response channel {id}");
+        match self.response_channels.entry(id) {
+            Entry::Vacant(channel) => {
+                channel.insert(responder);
+            }
+            Entry::Occupied(_) => {
+                panic!("Overwriting existing response channel {id}");
+            }
         }
     }
 
@@ -149,7 +186,7 @@ impl WebviewState {
         let Some(responder) = self.take_response_channel(id) else {
             return false;
         };
-        Self::respond_with(responder, response);
+        responder.respond_ipc(response);
         true
     }
 
@@ -159,18 +196,16 @@ impl WebviewState {
         route_request_id: Option<u32>,
         js_consumed_actions: Vec<JsConsumedAction>,
     ) {
-        if self
-            .rust_evaluate_routes
-            .insert(
-                request_id,
-                RustEvaluateRoute {
+        match self.rust_evaluate_routes.entry(request_id) {
+            Entry::Vacant(route) => {
+                route.insert(RustEvaluateRoute {
                     route_request_id,
                     js_consumed_actions,
-                },
-            )
-            .is_some()
-        {
-            panic!("Overwriting existing Rust Evaluate route {request_id}");
+                });
+            }
+            Entry::Occupied(_) => {
+                panic!("Overwriting existing Rust Evaluate route {request_id}");
+            }
         }
     }
 
@@ -186,22 +221,101 @@ impl WebviewState {
         core::mem::take(&mut self.pending_js_consumed_actions)
     }
 
-    fn respond_with(responder: WryBindgenResponder, response: IPCMessage) {
-        let body = response.into_data();
-        // Encode as base64 - sync XMLHttpRequest cannot use responseType="arraybuffer"
-        let engine = base64::engine::general_purpose::STANDARD;
-        let body_base64 = engine.encode(&body);
-        responder.respond(
-            http::Response::builder()
-                .status(200)
-                .header("Content-Type", "text/plain")
-                .body(body_base64.into_bytes())
-                .expect("Failed to build response"),
-        );
+    fn receive_js_message(&mut self, msg: IPCMessage, responder: WryBindgenResponder) {
+        let msg_type = msg.ty().unwrap();
+        let header = msg.header().unwrap();
+        let mut js_consumed_actions;
+        let mut response_channel_id = None;
+
+        match msg_type {
+            // New call from JS - save the sync response channel and
+            // wait for the Rust application thread to respond.
+            MessageType::Evaluate => {
+                js_consumed_actions = self.take_pending_js_consumed_actions();
+                self.set_response_channel(header.request_id, responder);
+                response_channel_id = Some(header.request_id);
+            }
+            // Response from JS to a previous Rust Evaluate. The route was
+            // recorded when Wry delivered that Evaluate to JS.
+            MessageType::Respond => {
+                let Some(route) = self.take_rust_evaluate_route(header.request_id) else {
+                    responder.respond(error_response());
+                    return;
+                };
+                js_consumed_actions = self.take_pending_js_consumed_actions();
+                js_consumed_actions.extend(route.js_consumed_actions);
+                match route.route_request_id {
+                    Some(route_request_id) => {
+                        self.set_response_channel(route_request_id, responder);
+                        response_channel_id = Some(route_request_id);
+                    }
+                    None => {
+                        responder.respond(blank_response());
+                    }
+                }
+            }
+        }
+
+        if !self
+            .sender
+            .start_send(InboundIPCMessage::new(msg, js_consumed_actions))
+        {
+            self.respond_channel_with_error(response_channel_id);
+        }
     }
 
-    fn evaluate_script(&mut self, script: &str) {
-        (self.evaluate_script)(script);
+    fn receive_rust_message(&mut self, ipc_msg: OutboundIPCMessage) -> Option<IPCMessage> {
+        let header = ipc_msg.message.header().unwrap();
+        let ty = ipc_msg.message.ty().unwrap();
+        let route_request_id = ipc_msg.route_request_id;
+        let js_consumed_actions = ipc_msg.js_consumed_actions;
+        let message = ipc_msg.message;
+
+        match ty {
+            MessageType::Respond => {
+                let Some(route_request_id) = route_request_id else {
+                    panic!(
+                        "Rust response {} did not specify a JS response route",
+                        header.request_id
+                    );
+                };
+                self.queue_js_consumed_actions(js_consumed_actions);
+                if self.respond_to_channel(route_request_id, message) {
+                    return None;
+                }
+                panic!(
+                    "No JS response channel {} for IPC message {}",
+                    route_request_id, header.request_id
+                );
+            }
+            MessageType::Evaluate => {
+                self.set_rust_evaluate_route(
+                    header.request_id,
+                    route_request_id,
+                    js_consumed_actions,
+                );
+
+                if let Some(route_request_id) = route_request_id {
+                    if self.respond_to_channel(route_request_id, message) {
+                        return None;
+                    }
+                    panic!(
+                        "No JS response channel {} for IPC message {}",
+                        route_request_id, header.request_id
+                    );
+                }
+            }
+        }
+
+        Some(message)
+    }
+
+    fn respond_channel_with_error(&mut self, response_channel_id: Option<u32>) {
+        if let Some(response_channel_id) = response_channel_id {
+            if let Some(responder) = self.take_response_channel(response_channel_id) {
+                responder.respond(error_response());
+            }
+        }
     }
 }
 
@@ -320,51 +434,7 @@ impl ProtocolHandler {
                 responder.respond(error_response());
                 return None;
             };
-            let msg_type = msg.ty().unwrap();
-            let header = msg.header().unwrap();
-            let mut js_consumed_actions;
-            let mut response_channel_id = None;
-            match msg_type {
-                // New call from JS - save the sync response channel and
-                // wait for the Rust application thread to respond.
-                MessageType::Evaluate => {
-                    js_consumed_actions = webview_state.take_pending_js_consumed_actions();
-                    webview_state.set_response_channel(header.request_id, responder);
-                    response_channel_id = Some(header.request_id);
-                }
-                // Response from JS to a previous Rust Evaluate. The route was
-                // recorded when Wry delivered that Evaluate to JS.
-                MessageType::Respond => {
-                    let Some(route) = webview_state.take_rust_evaluate_route(header.request_id)
-                    else {
-                        responder.respond(error_response());
-                        return None;
-                    };
-                    js_consumed_actions = webview_state.take_pending_js_consumed_actions();
-                    js_consumed_actions.extend(route.js_consumed_actions);
-                    match route.route_request_id {
-                        Some(route_request_id) => {
-                            webview_state.set_response_channel(route_request_id, responder);
-                            response_channel_id = Some(route_request_id);
-                        }
-                        None => {
-                            responder.respond(blank_response());
-                        }
-                    }
-                }
-            }
-            if !webview_state
-                .sender
-                .start_send(InboundIPCMessage::new(msg, js_consumed_actions))
-            {
-                if let Some(response_channel_id) = response_channel_id {
-                    if let Some(responder) =
-                        webview_state.take_response_channel(response_channel_id)
-                    {
-                        responder.respond(error_response());
-                    }
-                }
-            }
+            webview_state.messages.receive_js_message(msg, responder);
             return None;
         }
 
@@ -494,48 +564,9 @@ impl WryBindgen {
         webview_state: &mut WebviewState,
         ipc_msg: OutboundIPCMessage,
     ) {
-        let header = ipc_msg.message.header().unwrap();
-        let ty = ipc_msg.message.ty().unwrap();
-        let route_request_id = ipc_msg.route_request_id;
-        let js_consumed_actions = ipc_msg.js_consumed_actions;
-        let message = ipc_msg.message;
-
-        match ty {
-            MessageType::Respond => {
-                let Some(route_request_id) = route_request_id else {
-                    panic!(
-                        "Rust response {} did not specify a JS response route",
-                        header.request_id
-                    );
-                };
-                webview_state.queue_js_consumed_actions(js_consumed_actions);
-                if webview_state.respond_to_channel(route_request_id, message) {
-                    return;
-                }
-                panic!(
-                    "No JS response channel {} for IPC message {}",
-                    route_request_id, header.request_id
-                );
-            }
-            MessageType::Evaluate => {
-                webview_state.set_rust_evaluate_route(
-                    header.request_id,
-                    route_request_id,
-                    js_consumed_actions,
-                );
-
-                if let Some(route_request_id) = route_request_id {
-                    if webview_state.respond_to_channel(route_request_id, message) {
-                        return;
-                    }
-                    panic!(
-                        "No JS response channel {} for IPC message {}",
-                        route_request_id, header.request_id
-                    );
-                }
-            }
-        }
-
+        let Some(message) = webview_state.messages.receive_rust_message(ipc_msg) else {
+            return;
+        };
         let decoded = message.decoded().unwrap();
         if let DecodedVariant::Evaluate { .. } = decoded {
             // Encode the binary data as base64 and pass to JS

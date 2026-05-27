@@ -1,7 +1,7 @@
 From ed6830e8d0b44da00031c45e49c392d4022b826f Mon Sep 17 00:00:00 2001
 From: Evan Almloff <evanalmloff@gmail.com>
 Date: Wed, 27 May 2026 12:06:09 -0500
-Subject: [PATCH 3/3] Use JsThreadLocal for native js-sys state
+Subject: [PATCH 3/4] Use JsThreadLocal for native js-sys state
 
 ---
  crates/js-sys/src/futures/queue.rs |  9 +++++++++

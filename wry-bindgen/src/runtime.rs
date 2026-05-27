@@ -15,7 +15,7 @@ use spin::RwLock;
 use crate::BinaryDecode;
 use crate::batch::with_runtime;
 use crate::function::{CALL_EXPORT_FN_ID, DROP_NATIVE_REF_FN_ID, RustCallback};
-use crate::ipc::{DecodeContext, MessageType};
+use crate::ipc::{DecodeContext, MessageHeader, MessageType};
 use crate::ipc::{DecodedData, DecodedVariant, InboundIPCMessage, OutboundIPCMessage};
 use crate::object_store::ObjectHandle;
 
@@ -170,6 +170,22 @@ pub(crate) fn progress_js_with<O>(
             .write()
             .recv_blocking_for(request_id)
     })?;
+    dispatch_inbound_message(&response, Some(request_id), &mut with_respond)
+}
+
+pub async fn handle_callbacks() {
+    let receiver = with_runtime(|runtime| runtime.ipc().receivers.read().eval_receiver.clone());
+
+    while let Ok(response) = receiver.recv().await {
+        dispatch_inbound_message(&response, None, &mut |_| unreachable!());
+    }
+}
+
+fn dispatch_inbound_message<O>(
+    response: &InboundIPCMessage,
+    expected_respond_request_id: Option<u32>,
+    with_respond: &mut impl for<'a> FnMut(DecodedData<'a>) -> O,
+) -> Option<O> {
     with_runtime(|runtime| {
         runtime.apply_js_consumed_actions(response.js_consumed_actions.iter().copied())
     });
@@ -180,47 +196,28 @@ pub(crate) fn progress_js_with<O>(
         .expect("Failed to decode response");
     match decoder {
         DecodedVariant::Respond { header, mut data } => {
-            debug_assert_eq!(header.request_id, request_id);
-            consume_js_to_rust_prelude(&mut data, Some(header.request_id));
+            if let Some(expected_request_id) = expected_respond_request_id {
+                debug_assert_eq!(header.request_id, expected_request_id);
+            }
+            prepare_js_to_rust_data(&mut data, header.request_id);
             Some(with_respond(data))
         }
-        DecodedVariant::Evaluate { header, mut data } => {
-            consume_js_to_rust_prelude(&mut data, Some(header.request_id));
-            with_runtime(|runtime| runtime.push_inbound_js_request(header.request_id));
-            handle_rust_callback(&mut data);
-            with_runtime(|runtime| runtime.pop_inbound_js_request(header.request_id));
+        DecodedVariant::Evaluate { header, data } => {
+            handle_inbound_evaluate(header, data);
             None
         }
     }
 }
 
-pub async fn handle_callbacks() {
-    let receiver = with_runtime(|runtime| runtime.ipc().receivers.read().eval_receiver.clone());
-
-    while let Ok(response) = receiver.recv().await {
-        with_runtime(|runtime| {
-            runtime.apply_js_consumed_actions(response.js_consumed_actions.iter().copied())
-        });
-        let decoder = response
-            .message
-            .decoded()
-            .expect("Failed to decode response");
-        match decoder {
-            DecodedVariant::Respond { .. } => unreachable!(),
-            DecodedVariant::Evaluate { header, mut data } => {
-                consume_js_to_rust_prelude(&mut data, Some(header.request_id));
-                with_runtime(|runtime| runtime.push_inbound_js_request(header.request_id));
-                handle_rust_callback(&mut data);
-                with_runtime(|runtime| runtime.pop_inbound_js_request(header.request_id));
-            }
-        }
-    }
+fn handle_inbound_evaluate(header: MessageHeader, mut data: DecodedData<'_>) {
+    prepare_js_to_rust_data(&mut data, header.request_id);
+    with_runtime(|runtime| runtime.push_inbound_js_request(header.request_id));
+    handle_rust_callback(&mut data);
+    with_runtime(|runtime| runtime.pop_inbound_js_request(header.request_id));
 }
 
-fn consume_js_to_rust_prelude(data: &mut DecodedData, request_id: Option<u32>) {
-    if let Some(request_id) = request_id {
-        data.set_context(DecodeContext::DeferredHeapRefs { request_id });
-    }
+fn prepare_js_to_rust_data(data: &mut DecodedData, request_id: u32) {
+    data.set_context(DecodeContext::DeferredHeapRefs { request_id });
 }
 
 /// Handle a Rust callback invocation from JavaScript.

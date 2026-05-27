@@ -34,6 +34,11 @@ pub trait FromWasmAbi: BinaryDecode + EncodeTypeDef {
     /// This is only a compatibility hook for crates that preserve `JsValue`
     /// references through serde or similar adapters. Generated Wry bindings use
     /// the binary protocol instead.
+    ///
+    /// # Safety
+    ///
+    /// The caller must pass an id for a live JavaScript heap value that is valid
+    /// for `Self`.
     #[inline]
     unsafe fn from_abi(js: u32) -> Self
     where
@@ -57,6 +62,12 @@ pub trait WasmAbi {}
 
 /// Marker for types that can be borrowed from wasm-bindgen-shaped APIs.
 pub trait RefFromWasmAbi {
+    /// Recreate a non-dropping reference anchor from a heap id.
+    ///
+    /// # Safety
+    ///
+    /// The caller must pass an id for a live JavaScript heap value that remains
+    /// valid for the returned anchor.
     #[inline]
     unsafe fn ref_from_abi(js: u32) -> AbiRef<Self>
     where

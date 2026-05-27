@@ -149,29 +149,27 @@ impl Runtime {
     /// Take the message data and reset the batch for reuse.
     /// Includes ID installation and placeholder reservation metadata at the start of the message.
     pub(crate) fn take_message(&mut self) -> (OutboundIPCMessage, Vec<u64>) {
-        let install_ids = self.pending_install_id_batches();
         let reserved_ids = self.take_reserved_placeholder_ids();
         let mut encoder = self.take_encoder();
         let heap_ids_to_recycle_after_flush = encoder.take_heap_ids_to_recycle_after_flush();
-        prepend_rust_to_js_evaluate_prelude(&mut encoder, &install_ids, &reserved_ids);
-        let actions = take_js_consumed_actions(&mut encoder, &install_ids);
         (
-            OutboundIPCMessage::new(
-                crate::ipc::IPCMessage::new(encoder.to_bytes()),
-                self.current_js_request_id(),
-                actions,
-            ),
+            self.finish_rust_to_js_message(encoder, Some(&reserved_ids)),
             heap_ids_to_recycle_after_flush,
         )
     }
 
     /// Add Rust-to-JS response metadata and turn the encoder into a response message.
-    pub(crate) fn finish_respond_message(
+    pub(crate) fn finish_respond_message(&mut self, encoder: EncodedData) -> OutboundIPCMessage {
+        self.finish_rust_to_js_message(encoder, None)
+    }
+
+    fn finish_rust_to_js_message(
         &mut self,
         mut encoder: EncodedData,
+        reserved_ids: Option<&[u64]>,
     ) -> OutboundIPCMessage {
         let install_ids = self.pending_install_id_batches();
-        prepend_rust_to_js_respond_prelude(&mut encoder, &install_ids);
+        prepend_rust_to_js_prelude(&mut encoder, &install_ids, reserved_ids);
         let actions = take_js_consumed_actions(&mut encoder, &install_ids);
         OutboundIPCMessage::new(
             crate::ipc::IPCMessage::new(encoder.to_bytes()),
@@ -236,8 +234,8 @@ impl Runtime {
     }
 
     /// Mark deferred JS heap-ref requests as installed by JS.
-    pub(crate) fn ack_pending_install_ids(&mut self, ids: impl IntoIterator<Item = u32>) {
-        self.id_allocator.ack_pending_install_ids(ids);
+    pub(crate) fn ack_pending_install_id(&mut self, request_id: u32) {
+        self.id_allocator.ack_pending_install_id(request_id);
     }
 
     /// Take IDs JS should reserve for pending Rust-to-JS return values.
@@ -276,10 +274,8 @@ impl Runtime {
     }
 
     /// Mark type IDs as available in JS after JS acknowledges parsing them.
-    pub(crate) fn ack_type_ids(&mut self, ids: impl IntoIterator<Item = u32>) {
-        for id in ids {
-            self.type_cache.ack_type_id(id);
-        }
+    pub(crate) fn ack_type_id(&mut self, type_id: u32) {
+        self.type_cache.ack_type_id(type_id);
     }
 
     pub(crate) fn apply_js_consumed_actions(
@@ -289,10 +285,10 @@ impl Runtime {
         for action in actions {
             match action {
                 JsConsumedAction::HeapRefsInstalled { request_id } => {
-                    self.ack_pending_install_ids([request_id]);
+                    self.ack_pending_install_id(request_id);
                 }
                 JsConsumedAction::TypeDefinitionParsed { type_id } => {
-                    self.ack_type_ids([type_id]);
+                    self.ack_type_id(type_id);
                 }
             }
         }
@@ -399,23 +395,16 @@ fn push_install_batches(buf: &mut Vec<u32>, batches: &[PendingInstallIds]) {
     }
 }
 
-fn prepend_rust_to_js_respond_prelude(
+fn prepend_rust_to_js_prelude(
     encoder: &mut EncodedData,
     install_ids: &[PendingInstallIds],
+    reserved_ids: Option<&[u64]>,
 ) {
     let mut prelude = Vec::new();
     push_install_batches(&mut prelude, install_ids);
-    encoder.insert_u32s(1, &prelude);
-}
-
-fn prepend_rust_to_js_evaluate_prelude(
-    encoder: &mut EncodedData,
-    install_ids: &[PendingInstallIds],
-    reserved_ids: &[u64],
-) {
-    let mut prelude = Vec::new();
-    push_install_batches(&mut prelude, install_ids);
-    push_id_list(&mut prelude, reserved_ids);
+    if let Some(reserved_ids) = reserved_ids {
+        push_id_list(&mut prelude, reserved_ids);
+    }
     encoder.insert_u32s(1, &prelude);
 }
 

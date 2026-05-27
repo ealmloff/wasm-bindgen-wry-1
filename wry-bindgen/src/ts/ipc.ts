@@ -103,6 +103,23 @@ function sync_request_binary(
   return null;
 }
 
+function sendEvaluateToRust(
+  encodePayload: (encoder: DataEncoder) => void
+): DataDecoder | null {
+  const requestId = allocateJsRequestId();
+  const pendingHeapRefs = window.jsHeap.deferHeapRefs(requestId);
+  const encoder = new DataEncoder(pendingHeapRefs);
+  pushMessageHeader(encoder, MessageType.Evaluate, requestId);
+  encodePayload(encoder);
+
+  try {
+    const response = sync_request_binary(`/__wbg__/handler`, encoder.finalize());
+    return handleBinaryResponse(response, requestId);
+  } finally {
+    window.jsHeap.releaseEmptyDeferredHeapRefs(pendingHeapRefs);
+  }
+}
+
 /**
  * Entry point for Rust to call JS functions using binary protocol.
  * Handles batched operations - reads and executes operations until buffer is exhausted.
@@ -299,6 +316,7 @@ function handleBinaryResponse(
 export {
   evaluate_from_rust_binary,
   handleBinaryResponse,
+  sendEvaluateToRust,
   sync_request_binary,
   MessageType,
   DROP_NATIVE_REF_FN_ID,

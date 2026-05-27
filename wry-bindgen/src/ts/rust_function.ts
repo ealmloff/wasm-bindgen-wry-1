@@ -1,11 +1,6 @@
-import { DataEncoder } from "./encoding";
 import {
-  handleBinaryResponse,
-  MessageType,
-  sync_request_binary,
   DROP_NATIVE_REF_FN_ID,
-  allocateJsRequestId,
-  pushMessageHeader,
+  sendEvaluateToRust,
 } from "./ipc";
 import { TypeClass } from "./types";
 
@@ -21,14 +16,10 @@ enum RustFunctionPolicy {
  */
 function dropNativeRef(fnId: number): void {
   // Build Evaluate message to drop native ref: [DROP_NATIVE_REF_FN_ID, fn_id]
-  const encoder = new DataEncoder();
-  const requestId = allocateJsRequestId();
-  pushMessageHeader(encoder, MessageType.Evaluate, requestId);
-  encoder.pushU32(DROP_NATIVE_REF_FN_ID);
-  encoder.pushU32(fnId);
-
-  const response = sync_request_binary(`/__wbg__/handler`, encoder.finalize());
-  handleBinaryResponse(response, requestId);
+  sendEvaluateToRust((encoder) => {
+    encoder.pushU32(DROP_NATIVE_REF_FN_ID);
+    encoder.pushU32(fnId);
+  });
 }
 
 const nativeRefRegistry = new FinalizationRegistry<number>((fnId: number) => {
@@ -78,24 +69,17 @@ class RustFunction {
     this.activeCalls++;
     // Push a borrow frame before encoding args - nested calls won't clear our borrowed refs
     window.jsHeap.pushBorrowFrame();
-    // Build Evaluate message: [0, fn_id]
-    const requestId = allocateJsRequestId();
-    const pendingHeapRefs = window.jsHeap.deferHeapRefs(requestId);
-    const encoder = new DataEncoder(pendingHeapRefs);
-    pushMessageHeader(encoder, MessageType.Evaluate, requestId);
-    encoder.pushU32(0); // Call argument function
-    encoder.pushU32(this.fnId);
-    // Encode arguments (may put borrowed refs on the borrow stack)
-    for (let i = 0; i < this.paramTypes.length; i++) {
-      this.paramTypes[i].encode(encoder, args[i]);
-    }
-
-    let result: ReturnType<typeof handleBinaryResponse> = null;
+    let result: ReturnType<typeof sendEvaluateToRust> = null;
     try {
       // Send to Rust and get response (Rust may call back to JS during this)
-      const response = sync_request_binary(`/__wbg__/handler`, encoder.finalize());
-      result = handleBinaryResponse(response, requestId);
-      window.jsHeap.releaseEmptyDeferredHeapRefs(pendingHeapRefs);
+      result = sendEvaluateToRust((encoder) => {
+        encoder.pushU32(0); // Call argument function
+        encoder.pushU32(this.fnId);
+        // Encode arguments (may put borrowed refs on the borrow stack)
+        for (let i = 0; i < this.paramTypes.length; i++) {
+          this.paramTypes[i].encode(encoder, args[i]);
+        }
+      });
     } finally {
       // Pop the borrow frame - clears borrowed refs from this call
       window.jsHeap.popBorrowFrame();

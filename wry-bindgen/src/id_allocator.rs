@@ -235,13 +235,11 @@ impl HeapIds {
             .collect()
     }
 
-    fn ack_pending_install_ids(&mut self, ids: impl IntoIterator<Item = u32>) {
-        for id in ids {
-            self.pending_install_ids.remove(&id);
-            if let Some(dropped_ids) = self.pending_install_drops.remove(&id) {
-                for dropped_id in dropped_ids {
-                    self.recycle_heap_id(dropped_id);
-                }
+    fn ack_pending_install_id(&mut self, request_id: u32) {
+        self.pending_install_ids.remove(&request_id);
+        if let Some(dropped_ids) = self.pending_install_drops.remove(&request_id) {
+            for dropped_id in dropped_ids {
+                self.recycle_heap_id(dropped_id);
             }
         }
     }
@@ -402,8 +400,8 @@ impl IdAllocator {
     }
 
     /// Mark deferred JS heap-ref requests as installed by JS.
-    pub(crate) fn ack_pending_install_ids(&mut self, ids: impl IntoIterator<Item = u32>) {
-        self.heap.ack_pending_install_ids(ids);
+    pub(crate) fn ack_pending_install_id(&mut self, request_id: u32) {
+        self.heap.ack_pending_install_id(request_id);
     }
 
     /// Take IDs JS should reserve for pending Rust-to-JS return values.
@@ -494,7 +492,7 @@ mod tests {
         let next = heap.next_placeholder_id();
         assert_ne!(next, id);
 
-        heap.ack_pending_install_ids([7]);
+        heap.ack_pending_install_id(7);
         assert_eq!(heap.next_placeholder_id(), id);
     }
 

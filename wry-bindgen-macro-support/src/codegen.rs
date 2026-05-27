@@ -61,6 +61,79 @@ fn generate_member_type_helpers(
     }
 }
 
+fn generate_js_export_spec(
+    static_name: &str,
+    export_name: TokenStream,
+    body: TokenStream,
+    krate: &TokenStream,
+    span: proc_macro2::Span,
+) -> TokenStream {
+    let static_ident = format_ident!("{static_name}");
+    quote_spanned! {span=>
+        const _: () = {
+            #[allow(non_upper_case_globals)]
+            static #static_ident: #krate::JsExportSpec = #krate::JsExportSpec::new(
+                #export_name,
+                |decoder| {
+                    #body
+                }
+            );
+
+            #krate::inventory::submit! {
+                #static_ident
+            }
+        };
+    }
+}
+
+struct ClassMemberSpec<'a> {
+    static_name: &'a str,
+    class_name: TokenStream,
+    member_name: TokenStream,
+    export_name: TokenStream,
+    arg_count: TokenStream,
+    type_helpers: TokenStream,
+    member_kind: TokenStream,
+}
+
+fn generate_js_class_member_spec(
+    spec: ClassMemberSpec<'_>,
+    krate: &TokenStream,
+    span: proc_macro2::Span,
+) -> TokenStream {
+    let static_ident = format_ident!("{}", spec.static_name);
+    let ClassMemberSpec {
+        class_name,
+        member_name,
+        export_name,
+        arg_count,
+        type_helpers,
+        member_kind,
+        ..
+    } = spec;
+
+    quote_spanned! {span=>
+        const _: () = {
+            #type_helpers
+
+            #[allow(non_upper_case_globals)]
+            static #static_ident: #krate::JsClassMemberSpec = #krate::JsClassMemberSpec::new(
+                #class_name,
+                #member_name,
+                #export_name,
+                #arg_count,
+                __wry_arg_types,
+                __wry_return_type,
+                #member_kind
+            );
+
+            #krate::inventory::submit! {
+                #static_ident
+            }
+        };
+    }
+}
+
 /// Generate code for the entire program
 pub fn generate(program: &Program) -> syn::Result<TokenStream> {
     let mut tokens = TokenStream::new();
@@ -429,6 +502,16 @@ fn generate_type(ty: &ImportType, krate: &TokenStream) -> syn::Result<TokenStrea
 
     };
 
+    let promising_impl = if ty.no_promising {
+        quote! {}
+    } else {
+        quote_spanned! {span=>
+            impl #impl_generics #krate::sys::Promising for #rust_name #ty_generics #where_clause {
+                type Resolution = #rust_name #ty_generics;
+            }
+        }
+    };
+
     let mut upcast_impls = TokenStream::new();
     if !ty.no_upcast {
         upcast_impls.extend(quote_spanned! {span=>
@@ -526,6 +609,7 @@ fn generate_type(ty: &ImportType, krate: &TokenStream) -> syn::Result<TokenStrea
         #batchable_impl
         #jscast_impl
         #generic_trait_impls
+        #promising_impl
         #upcast_impls
     })
 }
@@ -1792,26 +1876,19 @@ fn generate_export_struct(s: &ExportStruct, krate: &TokenStream) -> syn::Result<
 
     // Generate drop function
     let drop_fn_name = format!("{js_name}::__drop");
-    let drop_impl = quote_spanned! {span=>
-        // Drop function for the struct
-        const _: () = {
-            #[allow(non_upper_case_globals)]
-            static __DROP_SPEC: #krate::JsExportSpec = #krate::JsExportSpec::new(
-                #drop_fn_name,
-                |decoder| {
-                    let handle = <#krate::object_store::ObjectHandle as #krate::BinaryDecode>::decode(
-                        decoder
-                    )?;
-                    #krate::object_store::drop_object(handle);
-                    Ok(#krate::EncodedData::new())
-                }
-            );
-
-            #krate::inventory::submit! {
-                __DROP_SPEC
-            }
-        };
-    };
+    let drop_impl = generate_js_export_spec(
+        "__DROP_SPEC",
+        quote_spanned! {span=> #drop_fn_name },
+        quote_spanned! {span=>
+            let handle = <#krate::object_store::ObjectHandle as #krate::BinaryDecode>::decode(
+                decoder
+            )?;
+            #krate::object_store::drop_object(handle);
+            Ok(#krate::EncodedData::new())
+        },
+        krate,
+        span,
+    );
 
     // Generate inspectable methods if enabled
     let inspectable_impl = if s.is_inspectable {
@@ -1928,45 +2005,33 @@ fn generate_field_accessor(
         }
     };
 
-    let getter_impl = quote_spanned! {span=>
-        const _: () = {
-            #[allow(non_upper_case_globals)]
-            static __GETTER_SPEC: #krate::JsExportSpec = #krate::JsExportSpec::new(
-                #getter_name,
-                |decoder| {
-                    let handle = <#krate::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
-                    #getter_body
-                }
-            );
-
-            #krate::inventory::submit! {
-                __GETTER_SPEC
-            }
-        };
-    };
+    let getter_impl = generate_js_export_spec(
+        "__GETTER_SPEC",
+        quote_spanned! {span=> #getter_name },
+        quote_spanned! {span=>
+            let handle = <#krate::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
+            #getter_body
+        },
+        krate,
+        span,
+    );
 
     // Generate setter (unless readonly)
     let setter_impl = if !field.readonly {
-        quote_spanned! {span=>
-            const _: () = {
-                #[allow(non_upper_case_globals)]
-                static __SETTER_SPEC: #krate::JsExportSpec = #krate::JsExportSpec::new(
-                    #setter_name,
-                    |decoder| {
-                        let handle = <#krate::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
-                        let val = <#field_ty as #krate::BinaryDecode>::decode(decoder)?;
-                        #krate::object_store::with_object_mut::<#struct_name, _>(handle, |obj| {
-                            obj.#field_name = val;
-                        });
-                        Ok(#krate::EncodedData::new())
-                    }
-                );
-
-                #krate::inventory::submit! {
-                    __SETTER_SPEC
-                }
-            };
-        }
+        generate_js_export_spec(
+            "__SETTER_SPEC",
+            quote_spanned! {span=> #setter_name },
+            quote_spanned! {span=>
+                let handle = <#krate::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
+                let val = <#field_ty as #krate::BinaryDecode>::decode(decoder)?;
+                #krate::object_store::with_object_mut::<#struct_name, _>(handle, |obj| {
+                    obj.#field_name = val;
+                });
+                Ok(#krate::EncodedData::new())
+            },
+            krate,
+            span,
+        )
     } else {
         TokenStream::new()
     };
@@ -1975,52 +2040,38 @@ fn generate_field_accessor(
     let js_class_name = struct_name.to_string();
     let getter_type_helpers =
         generate_member_type_helpers(&[], Some(quote_spanned! {span=> #field_ty }), krate, span);
-    let getter_member_spec = quote_spanned! {span=>
-        const _: () = {
-            #getter_type_helpers
-
-            #[allow(non_upper_case_globals)]
-            static __GETTER_MEMBER_SPEC: #krate::JsClassMemberSpec = #krate::JsClassMemberSpec::new(
-                #js_class_name,
-                #js_field_name,
-                #getter_name,
-                0,
-                __wry_arg_types,
-                __wry_return_type,
-                #krate::JsClassMemberKind::Getter
-            );
-
-            #krate::inventory::submit! {
-                __GETTER_MEMBER_SPEC
-            }
-        };
-    };
+    let getter_member_spec = generate_js_class_member_spec(
+        ClassMemberSpec {
+            static_name: "__GETTER_MEMBER_SPEC",
+            class_name: quote_spanned! {span=> #js_class_name },
+            member_name: quote_spanned! {span=> #js_field_name },
+            export_name: quote_spanned! {span=> #getter_name },
+            arg_count: quote_spanned! {span=> 0 },
+            type_helpers: getter_type_helpers,
+            member_kind: quote_spanned! {span=> #krate::JsClassMemberKind::Getter },
+        },
+        krate,
+        span,
+    );
 
     // Generate JsClassMemberSpec for the property setter (unless readonly)
     let setter_member_spec = if !field.readonly {
         let setter_arg_types = vec![quote_spanned! {span=> #field_ty }];
         let setter_type_helpers =
             generate_member_type_helpers(&setter_arg_types, None, krate, span);
-        quote_spanned! {span=>
-            const _: () = {
-                #setter_type_helpers
-
-                #[allow(non_upper_case_globals)]
-                static __SETTER_MEMBER_SPEC: #krate::JsClassMemberSpec = #krate::JsClassMemberSpec::new(
-                    #js_class_name,
-                    #js_field_name,
-                    #setter_name,
-                    1,
-                    __wry_arg_types,
-                    __wry_return_type,
-                    #krate::JsClassMemberKind::Setter
-                );
-
-                #krate::inventory::submit! {
-                    __SETTER_MEMBER_SPEC
-                }
-            };
-        }
+        generate_js_class_member_spec(
+            ClassMemberSpec {
+                static_name: "__SETTER_MEMBER_SPEC",
+                class_name: quote_spanned! {span=> #js_class_name },
+                member_name: quote_spanned! {span=> #js_field_name },
+                export_name: quote_spanned! {span=> #setter_name },
+                arg_count: quote_spanned! {span=> 1 },
+                type_helpers: setter_type_helpers,
+                member_kind: quote_spanned! {span=> #krate::JsClassMemberKind::Setter },
+            },
+            krate,
+            span,
+        )
     } else {
         TokenStream::new()
     };
@@ -2064,94 +2115,76 @@ fn generate_inspectable(
         generate_member_type_helpers(&[], string_return_type.clone(), krate, span);
     let to_string_type_helpers = generate_member_type_helpers(&[], string_return_type, krate, span);
 
+    let to_json_export_spec = generate_js_export_spec(
+        "__TO_JSON_SPEC",
+        quote_spanned! {span=> #to_json_name },
+        quote_spanned! {span=>
+            let handle = <#krate::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
+            #krate::object_store::with_object::<#struct_name, _>(handle, |obj| {
+                // Create a simple JSON-like representation
+                let mut json = ::alloc::string::String::from("{");
+                #(
+                    json.push_str(&::alloc::format!("\"{}\":{:?},", #field_names, obj.#field_idents));
+                )*
+                if json.ends_with(',') {
+                    json.pop();
+                }
+                json.push('}');
+                let mut encoder = #krate::EncodedData::new();
+                <::alloc::string::String as #krate::BinaryEncode>::encode(json, &mut encoder);
+                Ok(encoder)
+            })
+        },
+        krate,
+        span,
+    );
+    let to_json_member_spec = generate_js_class_member_spec(
+        ClassMemberSpec {
+            static_name: "__TO_JSON_MEMBER_SPEC",
+            class_name: quote_spanned! {span=> #js_name_str },
+            member_name: quote_spanned! {span=> "toJSON" },
+            export_name: quote_spanned! {span=> #to_json_name },
+            arg_count: quote_spanned! {span=> 0 },
+            type_helpers: to_json_type_helpers,
+            member_kind: quote_spanned! {span=> #krate::JsClassMemberKind::Method },
+        },
+        krate,
+        span,
+    );
+    let to_string_export_spec = generate_js_export_spec(
+        "__TO_STRING_SPEC",
+        quote_spanned! {span=> #to_string_name },
+        quote_spanned! {span=>
+            let handle = <#krate::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
+            #krate::object_store::with_object::<#struct_name, _>(handle, |obj| {
+                let s = ::alloc::format!("[object {}]", #struct_name_str);
+                let mut encoder = #krate::EncodedData::new();
+                <::alloc::string::String as #krate::BinaryEncode>::encode(s, &mut encoder);
+                Ok(encoder)
+            })
+        },
+        krate,
+        span,
+    );
+    let to_string_member_spec = generate_js_class_member_spec(
+        ClassMemberSpec {
+            static_name: "__TO_STRING_MEMBER_SPEC",
+            class_name: quote_spanned! {span=> #js_name_str },
+            member_name: quote_spanned! {span=> "toString" },
+            export_name: quote_spanned! {span=> #to_string_name },
+            arg_count: quote_spanned! {span=> 0 },
+            type_helpers: to_string_type_helpers,
+            member_kind: quote_spanned! {span=> #krate::JsClassMemberKind::Method },
+        },
+        krate,
+        span,
+    );
+
     Ok(quote_spanned! {span=>
-        const _: () = {
-            #[allow(non_upper_case_globals)]
-            static __TO_JSON_SPEC: #krate::JsExportSpec = #krate::JsExportSpec::new(
-                #to_json_name,
-                |decoder| {
-                    let handle = <#krate::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
-                    #krate::object_store::with_object::<#struct_name, _>(handle, |obj| {
-                        // Create a simple JSON-like representation
-                        let mut json = ::alloc::string::String::from("{");
-                        #(
-                            json.push_str(&::alloc::format!("\"{}\":{:?},", #field_names, obj.#field_idents));
-                        )*
-                        if json.ends_with(',') {
-                            json.pop();
-                        }
-                        json.push('}');
-                        let mut encoder = #krate::EncodedData::new();
-                        <::alloc::string::String as #krate::BinaryEncode>::encode(json, &mut encoder);
-                        Ok(encoder)
-                    })
-                }
-            );
-
-            #krate::inventory::submit! {
-                __TO_JSON_SPEC
-            }
-        };
-
-        // JsClassMemberSpec for toJSON method
-        const _: () = {
-            #to_json_type_helpers
-
-            #[allow(non_upper_case_globals)]
-            static __TO_JSON_MEMBER_SPEC: #krate::JsClassMemberSpec = #krate::JsClassMemberSpec::new(
-                #js_name_str,
-                "toJSON",
-                #to_json_name,
-                0,
-                __wry_arg_types,
-                __wry_return_type,
-                #krate::JsClassMemberKind::Method
-            );
-
-            #krate::inventory::submit! {
-                __TO_JSON_MEMBER_SPEC
-            }
-        };
-
-        const _: () = {
-            #[allow(non_upper_case_globals)]
-            static __TO_STRING_SPEC: #krate::JsExportSpec = #krate::JsExportSpec::new(
-                #to_string_name,
-                |decoder| {
-                    let handle = <#krate::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
-                    #krate::object_store::with_object::<#struct_name, _>(handle, |obj| {
-                        let s = ::alloc::format!("[object {}]", #struct_name_str);
-                        let mut encoder = #krate::EncodedData::new();
-                        <::alloc::string::String as #krate::BinaryEncode>::encode(s, &mut encoder);
-                        Ok(encoder)
-                    })
-                }
-            );
-
-            #krate::inventory::submit! {
-                __TO_STRING_SPEC
-            }
-        };
-
-        // JsClassMemberSpec for toString method
-        const _: () = {
-            #to_string_type_helpers
-
-            #[allow(non_upper_case_globals)]
-            static __TO_STRING_MEMBER_SPEC: #krate::JsClassMemberSpec = #krate::JsClassMemberSpec::new(
-                #js_name_str,
-                "toString",
-                #to_string_name,
-                0,
-                __wry_arg_types,
-                __wry_return_type,
-                #krate::JsClassMemberKind::Method
-            );
-
-            #krate::inventory::submit! {
-                __TO_STRING_MEMBER_SPEC
-            }
-        };
+        #to_json_export_spec
+        #to_json_member_spec
+        #to_string_export_spec
+        #to_string_member_spec
     })
 }
 
@@ -2400,44 +2433,32 @@ fn generate_export_method(method: &ExportMethod, krate: &TokenStream) -> syn::Re
         ),
     };
 
-    let js_class_member_spec = quote_spanned! {span=>
-        const _: () = {
-            #member_type_helpers
-
-            #[allow(non_upper_case_globals)]
-            static __CLASS_MEMBER_SPEC: #krate::JsClassMemberSpec = #krate::JsClassMemberSpec::new(
-                #class_str,
-                #member_name,
-                #export_name,
-                #arg_count,
-                __wry_arg_types,
-                __wry_return_type,
-                #member_kind
-            );
-
-            #krate::inventory::submit! {
-                __CLASS_MEMBER_SPEC
-            }
-        };
-    };
+    let js_class_member_spec = generate_js_class_member_spec(
+        ClassMemberSpec {
+            static_name: "__CLASS_MEMBER_SPEC",
+            class_name: quote_spanned! {span=> #class_str },
+            member_name: quote_spanned! {span=> #member_name },
+            export_name: quote_spanned! {span=> #export_name },
+            arg_count: quote_spanned! {span=> #arg_count },
+            type_helpers: member_type_helpers,
+            member_kind,
+        },
+        krate,
+        span,
+    );
+    let export_spec = generate_js_export_spec(
+        "__EXPORT_SPEC",
+        quote_spanned! {span=> #export_name },
+        quote_spanned! {span=>
+            #method_body
+        },
+        krate,
+        span,
+    );
 
     Ok(quote_spanned! {span=>
         #method_impl
-
-        const _: () = {
-            #[allow(non_upper_case_globals)]
-            static __EXPORT_SPEC: #krate::JsExportSpec = #krate::JsExportSpec::new(
-                #export_name,
-                |decoder| {
-                    #method_body
-                }
-            );
-
-            #krate::inventory::submit! {
-                __EXPORT_SPEC
-            }
-        };
-
+        #export_spec
         #js_class_member_spec
     })
 }

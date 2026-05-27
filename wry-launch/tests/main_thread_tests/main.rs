@@ -266,6 +266,7 @@ fn build_tests() -> Vec<TestCase> {
         is_type_of::test_is_type_of_with_dyn_into,
         is_type_of::test_is_type_of_with_dyn_ref,
         is_type_of::test_has_type_with_is_type_of,
+        wasm_bindgen_compat::test_imported_type_promising_compat,
         wasm_bindgen_compat::test_convert_traits_are_marker_bounds,
         wasm_bindgen_compat::test_jsvalue_abi_ref_preserves_heap_ref,
         wasm_bindgen_compat::test_u128_try_from_bigint_preserves_range,

@@ -1,10 +1,30 @@
 use wasm_bindgen::{
-    JsError, JsValue,
+    JsError, JsValue, Promising,
     convert::{
         FromWasmAbi, IntoWasmAbi, OptionFromWasmAbi, OptionIntoWasmAbi, RefFromWasmAbi, WasmAbi,
     },
     wasm_bindgen,
 };
+
+#[wasm_bindgen]
+extern "C" {
+    type DefaultPromisingCompatType;
+
+    #[wasm_bindgen(no_promising)]
+    type ManualPromisingCompatType;
+}
+
+impl Promising for ManualPromisingCompatType {
+    type Resolution = JsValue;
+}
+
+pub(crate) fn test_imported_type_promising_compat() {
+    fn assert_default<T: Promising<Resolution = T>>() {}
+    fn assert_manual<T: Promising<Resolution = JsValue>>() {}
+
+    assert_default::<DefaultPromisingCompatType>();
+    assert_manual::<ManualPromisingCompatType>();
+}
 
 pub(crate) fn test_convert_traits_are_marker_bounds() {
     fn assert_into<T: IntoWasmAbi>() {}

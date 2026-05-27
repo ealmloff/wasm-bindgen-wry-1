@@ -806,24 +806,6 @@ impl<T> DerefMut for Clamped<T> {
     }
 }
 
-/// Wrapper type for imported thread-local JavaScript statics.
-#[cfg(feature = "std")]
-#[deprecated = "use with `#[wasm_bindgen(thread_local_v2)]` instead"]
-pub struct JsStatic<T: 'static> {
-    #[doc(hidden)]
-    pub __inner: &'static std::thread::LocalKey<T>,
-}
-
-#[cfg(feature = "std")]
-#[allow(deprecated)]
-impl<T: 'static> Deref for JsStatic<T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        self.__inner.with(|ptr| unsafe { &*(ptr as *const T) })
-    }
-}
-
 mod parent {
     use crate::{Ref, RefMut};
 
@@ -877,6 +859,73 @@ mod parent {
 
 pub use crate::__rt::{Ref, RefMut};
 pub use parent::Parent;
+
+macro_rules! impl_js_value_wire {
+    (for $ty:ty, field $field:ident) => {
+        impl $crate::EncodeTypeDef for $ty {
+            fn encode_type_def(buf: &mut $crate::alloc::vec::Vec<u8>) {
+                <$crate::JsValue as $crate::EncodeTypeDef>::encode_type_def(buf);
+            }
+        }
+
+        impl $crate::BinaryEncode for $ty {
+            fn encode(self, encoder: &mut $crate::EncodedData) {
+                <$crate::JsValue as $crate::BinaryEncode>::encode(self.$field, encoder);
+            }
+        }
+
+        impl $crate::BinaryDecode for $ty {
+            fn decode(
+                decoder: &mut $crate::DecodedData,
+            ) -> ::core::result::Result<Self, $crate::DecodeError> {
+                <$crate::JsValue as $crate::BinaryDecode>::decode(decoder)
+                    .map(::core::convert::Into::into)
+            }
+        }
+
+        impl $crate::BatchableResult for $ty {
+            fn try_placeholder(
+                batch: &mut $crate::batch::Runtime,
+            ) -> ::core::option::Option<Self> {
+                ::core::option::Option::Some(
+                    <$crate::JsValue as $crate::BatchableResult>::try_placeholder(batch)?.into(),
+                )
+            }
+        }
+    };
+    (impl<$($generics:ident),*> for $ty:ty, field $field:ident) => {
+        impl<$($generics),*> $crate::EncodeTypeDef for $ty {
+            fn encode_type_def(buf: &mut $crate::alloc::vec::Vec<u8>) {
+                <$crate::JsValue as $crate::EncodeTypeDef>::encode_type_def(buf);
+            }
+        }
+
+        impl<$($generics),*> $crate::BinaryEncode for $ty {
+            fn encode(self, encoder: &mut $crate::EncodedData) {
+                <$crate::JsValue as $crate::BinaryEncode>::encode(self.$field, encoder);
+            }
+        }
+
+        impl<$($generics),*> $crate::BinaryDecode for $ty {
+            fn decode(
+                decoder: &mut $crate::DecodedData,
+            ) -> ::core::result::Result<Self, $crate::DecodeError> {
+                <$crate::JsValue as $crate::BinaryDecode>::decode(decoder)
+                    .map(::core::convert::Into::into)
+            }
+        }
+
+        impl<$($generics),*> $crate::BatchableResult for $ty {
+            fn try_placeholder(
+                batch: &mut $crate::batch::Runtime,
+            ) -> ::core::option::Option<Self> {
+                ::core::option::Option::Some(
+                    <$crate::JsValue as $crate::BatchableResult>::try_placeholder(batch)?.into(),
+                )
+            }
+        }
+    };
+}
 
 /// A JavaScript Error object.
 ///
@@ -950,29 +999,7 @@ impl JsCast for JsError {
     }
 }
 
-impl EncodeTypeDef for JsError {
-    fn encode_type_def(buf: &mut alloc::vec::Vec<u8>) {
-        JsValue::encode_type_def(buf);
-    }
-}
-
-impl BinaryEncode for JsError {
-    fn encode(self, encoder: &mut EncodedData) {
-        self.value.encode(encoder);
-    }
-}
-
-impl BinaryDecode for JsError {
-    fn decode(decoder: &mut DecodedData) -> Result<Self, DecodeError> {
-        JsValue::decode(decoder).map(Into::into)
-    }
-}
-
-impl BatchableResult for JsError {
-    fn try_placeholder(batch: &mut batch::Runtime) -> Option<Self> {
-        Some(<JsValue as BatchableResult>::try_placeholder(batch)?.into())
-    }
-}
+impl_js_value_wire!(for JsError, field value);
 
 unsafe impl __rt::marker::ErasableGeneric for JsError {
     type Repr = JsValue;
@@ -993,9 +1020,7 @@ pub mod sys {
     use core::{fmt, marker::PhantomData, ops::Deref};
 
     use crate::{
-        BinaryDecode, BinaryEncode, DecodeError, DecodedData, EncodeTypeDef, EncodedData,
-        ErasableGeneric, IntoJsGeneric, JsCast, JsError, JsGeneric, JsValue, batch::Runtime,
-        convert::UpcastFrom,
+        ErasableGeneric, IntoJsGeneric, JsCast, JsError, JsGeneric, JsValue, convert::UpcastFrom,
     };
 
     /// Marker trait for values that are either a resolution value or a promise-like value.
@@ -1071,29 +1096,7 @@ pub mod sys {
                 }
             }
 
-            impl EncodeTypeDef for $name {
-                fn encode_type_def(buf: &mut alloc::vec::Vec<u8>) {
-                    JsValue::encode_type_def(buf);
-                }
-            }
-
-            impl BinaryEncode for $name {
-                fn encode(self, encoder: &mut EncodedData) {
-                    self.obj.encode(encoder);
-                }
-            }
-
-            impl BinaryDecode for $name {
-                fn decode(decoder: &mut DecodedData) -> Result<Self, DecodeError> {
-                    JsValue::decode(decoder).map(Into::into)
-                }
-            }
-
-            impl crate::BatchableResult for $name {
-                fn try_placeholder(batch: &mut Runtime) -> Option<Self> {
-                    Some(<JsValue as crate::BatchableResult>::try_placeholder(batch)?.into())
-                }
-            }
+            impl_js_value_wire!(for $name, field obj);
 
             unsafe impl crate::__rt::marker::ErasableGeneric for $name {
                 type Repr = JsValue;
@@ -1276,29 +1279,7 @@ pub mod sys {
         }
     }
 
-    impl<T> EncodeTypeDef for JsOption<T> {
-        fn encode_type_def(buf: &mut alloc::vec::Vec<u8>) {
-            JsValue::encode_type_def(buf);
-        }
-    }
-
-    impl<T> BinaryEncode for JsOption<T> {
-        fn encode(self, encoder: &mut EncodedData) {
-            self.obj.encode(encoder);
-        }
-    }
-
-    impl<T> BinaryDecode for JsOption<T> {
-        fn decode(decoder: &mut DecodedData) -> Result<Self, DecodeError> {
-            JsValue::decode(decoder).map(Into::into)
-        }
-    }
-
-    impl<T> crate::BatchableResult for JsOption<T> {
-        fn try_placeholder(batch: &mut Runtime) -> Option<Self> {
-            Some(<JsValue as crate::BatchableResult>::try_placeholder(batch)?.into())
-        }
-    }
+    impl_js_value_wire!(impl<T> for JsOption<T>, field obj);
 
     unsafe impl<T> crate::__rt::marker::ErasableGeneric for JsOption<T> {
         type Repr = JsValue;
