@@ -8,13 +8,15 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
-use crate::Closure;
-use crate::WasmClosureFnOnce;
 use crate::batch::{Runtime, with_runtime};
 use crate::convert::RefFromBinaryDecode;
 use crate::ipc::{DecodeContext, DecodeError, DecodedData, EncodedData};
 use crate::object_store::ObjectHandle;
 use crate::value::JsValue;
+use crate::{
+    Closure, IntoWasmClosure, IntoWasmClosureRef, IntoWasmClosureRefMut, WasmClosureFnOnce,
+    WasmClosureFnOnceAbort,
+};
 
 /// Trait for encoding Rust values into the binary protocol.
 /// Each type specifies how to serialize itself.
@@ -844,6 +846,195 @@ macro_rules! impl_fnmut_stub {
             }
         }
 
+        impl<R, F, $($arg,)*> IntoWasmClosure<dyn FnMut($($arg),*) -> R> for F
+            where F: FnMut($($arg),*) -> R + 'static,
+            $($arg: BinaryDecode + EncodeTypeDef + 'static, )*
+            R: BinaryEncode + EncodeTypeDef + 'static,
+        {
+            fn into_closure(self) -> crate::Closure<dyn FnMut($($arg),*) -> R> {
+                <F as IntoClosure<fn($($arg),*) -> R, crate::Closure<dyn FnMut($($arg),*) -> R>>>::into_closure(self)
+            }
+
+            fn into_closure_box(self: Box<Self>) -> crate::Closure<dyn FnMut($($arg),*) -> R> {
+                <F as IntoWasmClosure<dyn FnMut($($arg),*) -> R>>::into_closure(*self)
+            }
+        }
+
+        impl<R, $($arg,)*> IntoWasmClosure<dyn FnMut($($arg),*) -> R> for dyn FnMut($($arg),*) -> R
+            where
+            $($arg: BinaryDecode + EncodeTypeDef + 'static, )*
+            R: BinaryEncode + EncodeTypeDef + 'static,
+        {
+            fn into_closure_box(self: Box<Self>) -> crate::Closure<dyn FnMut($($arg),*) -> R> {
+                <Self as crate::WryWasmClosure<fn($($arg),*) -> R>>::into_js_closure(self)
+            }
+        }
+
+        impl<R, F, $($arg,)*> IntoWasmClosure<dyn Fn($($arg),*) -> R> for F
+            where F: Fn($($arg),*) -> R + 'static,
+            $($arg: BinaryDecode + EncodeTypeDef + 'static, )*
+            R: BinaryEncode + EncodeTypeDef + 'static,
+        {
+            fn into_closure(self) -> crate::Closure<dyn Fn($($arg),*) -> R> {
+                <F as IntoClosure<fn($($arg),*) -> R, crate::Closure<dyn Fn($($arg),*) -> R>>>::into_closure(self)
+            }
+
+            fn into_closure_box(self: Box<Self>) -> crate::Closure<dyn Fn($($arg),*) -> R> {
+                <F as IntoWasmClosure<dyn Fn($($arg),*) -> R>>::into_closure(*self)
+            }
+        }
+
+        impl<R, $($arg,)*> IntoWasmClosure<dyn Fn($($arg),*) -> R> for dyn Fn($($arg),*) -> R
+            where
+            $($arg: BinaryDecode + EncodeTypeDef + 'static, )*
+            R: BinaryEncode + EncodeTypeDef + 'static,
+        {
+            fn into_closure_box(self: Box<Self>) -> crate::Closure<dyn Fn($($arg),*) -> R> {
+                <Self as crate::WryWasmClosure<fn($($arg),*) -> R>>::into_js_closure(self)
+            }
+        }
+
+        impl<R, F, $($arg,)*> IntoWasmClosureRef<dyn Fn($($arg),*) -> R> for F
+            where F: Fn($($arg),*) -> R,
+            $($arg: BinaryDecode + EncodeTypeDef + 'static, )*
+            R: BinaryEncode + EncodeTypeDef + 'static,
+        {
+            #[allow(non_snake_case)]
+            #[allow(unused)]
+            fn into_scoped_closure_ref<'a>(t: &'a Self) -> crate::ScopedClosure<'a, <dyn Fn($($arg),*) -> R as crate::WasmClosure>::Static> {
+                let t: &(dyn Fn($($arg),*) -> R) = t;
+                let ptr = t as *const dyn Fn($($arg),*) -> R;
+                let (data_ptr, vtable_ptr): (usize, usize) = unsafe { core::mem::transmute(ptr) };
+                let callback = crate::function::RustCallback::new_fn(
+                    move |decoder: &mut DecodedData, encoder: &mut EncodedData| {
+                        let ptr: *const dyn Fn($($arg),*) -> R = unsafe {
+                            core::mem::transmute((data_ptr, vtable_ptr))
+                        };
+                        let f: &dyn Fn($($arg),*) -> R = unsafe { &*ptr };
+                        decode_args!(decoder; [$($arg,)*] => {
+                            let result = f($($arg),*);
+                            result.encode(encoder);
+                        });
+                    },
+                );
+                let handle = crate::object_store::insert_object(callback);
+                let value = crate::__rt::wbg_cast::<CallbackKey<fn($($arg),*) -> R>, crate::JsValue>(
+                    CallbackKey::new_with_policy(handle, CallbackPolicy::RustOwned),
+                );
+                crate::ScopedClosure {
+                    _phantom: PhantomData,
+                    rust_callback: Some(handle),
+                    drop_rust_callback_on_drop: true,
+                    value,
+                }
+            }
+        }
+
+        impl<R, $($arg,)*> IntoWasmClosureRef<dyn Fn($($arg),*) -> R> for dyn Fn($($arg),*) -> R
+            where
+            $($arg: BinaryDecode + EncodeTypeDef + 'static, )*
+            R: BinaryEncode + EncodeTypeDef + 'static,
+        {
+            #[allow(non_snake_case)]
+            #[allow(unused)]
+            fn into_scoped_closure_ref<'a>(t: &'a Self) -> crate::ScopedClosure<'a, <dyn Fn($($arg),*) -> R as crate::WasmClosure>::Static> {
+                let ptr = t as *const dyn Fn($($arg),*) -> R;
+                let (data_ptr, vtable_ptr): (usize, usize) = unsafe { core::mem::transmute(ptr) };
+                let callback = crate::function::RustCallback::new_fn(
+                    move |decoder: &mut DecodedData, encoder: &mut EncodedData| {
+                        let ptr: *const dyn Fn($($arg),*) -> R = unsafe {
+                            core::mem::transmute((data_ptr, vtable_ptr))
+                        };
+                        let f: &dyn Fn($($arg),*) -> R = unsafe { &*ptr };
+                        decode_args!(decoder; [$($arg,)*] => {
+                            let result = f($($arg),*);
+                            result.encode(encoder);
+                        });
+                    },
+                );
+                let handle = crate::object_store::insert_object(callback);
+                let value = crate::__rt::wbg_cast::<CallbackKey<fn($($arg),*) -> R>, crate::JsValue>(
+                    CallbackKey::new_with_policy(handle, CallbackPolicy::RustOwned),
+                );
+                crate::ScopedClosure {
+                    _phantom: PhantomData,
+                    rust_callback: Some(handle),
+                    drop_rust_callback_on_drop: true,
+                    value,
+                }
+            }
+        }
+
+        impl<R, F, $($arg,)*> IntoWasmClosureRefMut<dyn FnMut($($arg),*) -> R> for F
+            where F: FnMut($($arg),*) -> R,
+            $($arg: BinaryDecode + EncodeTypeDef + 'static, )*
+            R: BinaryEncode + EncodeTypeDef + 'static,
+        {
+            #[allow(non_snake_case)]
+            #[allow(unused)]
+            fn into_scoped_closure_ref_mut<'a>(t: &'a mut Self) -> crate::ScopedClosure<'a, <dyn FnMut($($arg),*) -> R as crate::WasmClosure>::Static> {
+                let t: &mut dyn FnMut($($arg),*) -> R = t;
+                let ptr = t as *mut dyn FnMut($($arg),*) -> R;
+                let (data_ptr, vtable_ptr): (usize, usize) = unsafe { core::mem::transmute(ptr) };
+                let callback = crate::function::RustCallback::new_fn_mut(
+                    move |decoder: &mut DecodedData, encoder: &mut EncodedData| {
+                        let ptr: *mut dyn FnMut($($arg),*) -> R = unsafe {
+                            core::mem::transmute((data_ptr, vtable_ptr))
+                        };
+                        let f: &mut dyn FnMut($($arg),*) -> R = unsafe { &mut *ptr };
+                        decode_args!(decoder; [$($arg,)*] => {
+                            let result = f($($arg),*);
+                            result.encode(encoder);
+                        });
+                    },
+                );
+                let handle = crate::object_store::insert_object(callback);
+                let value = crate::__rt::wbg_cast::<CallbackKey<fn($($arg),*) -> R>, crate::JsValue>(
+                    CallbackKey::new_with_policy(handle, CallbackPolicy::RustOwned),
+                );
+                crate::ScopedClosure {
+                    _phantom: PhantomData,
+                    rust_callback: Some(handle),
+                    drop_rust_callback_on_drop: true,
+                    value,
+                }
+            }
+        }
+
+        impl<R, $($arg,)*> IntoWasmClosureRefMut<dyn FnMut($($arg),*) -> R> for dyn FnMut($($arg),*) -> R
+            where
+            $($arg: BinaryDecode + EncodeTypeDef + 'static, )*
+            R: BinaryEncode + EncodeTypeDef + 'static,
+        {
+            #[allow(non_snake_case)]
+            #[allow(unused)]
+            fn into_scoped_closure_ref_mut<'a>(t: &'a mut Self) -> crate::ScopedClosure<'a, <dyn FnMut($($arg),*) -> R as crate::WasmClosure>::Static> {
+                let ptr = t as *mut dyn FnMut($($arg),*) -> R;
+                let (data_ptr, vtable_ptr): (usize, usize) = unsafe { core::mem::transmute(ptr) };
+                let callback = crate::function::RustCallback::new_fn_mut(
+                    move |decoder: &mut DecodedData, encoder: &mut EncodedData| {
+                        let ptr: *mut dyn FnMut($($arg),*) -> R = unsafe {
+                            core::mem::transmute((data_ptr, vtable_ptr))
+                        };
+                        let f: &mut dyn FnMut($($arg),*) -> R = unsafe { &mut *ptr };
+                        decode_args!(decoder; [$($arg,)*] => {
+                            let result = f($($arg),*);
+                            result.encode(encoder);
+                        });
+                    },
+                );
+                let handle = crate::object_store::insert_object(callback);
+                let value = crate::__rt::wbg_cast::<CallbackKey<fn($($arg),*) -> R>, crate::JsValue>(
+                    CallbackKey::new_with_policy(handle, CallbackPolicy::RustOwned),
+                );
+                crate::ScopedClosure {
+                    _phantom: PhantomData,
+                    rust_callback: Some(handle),
+                    drop_rust_callback_on_drop: true,
+                    value,
+                }
+            }
+        }
     };
 }
 
@@ -1204,7 +1395,7 @@ impl_fnmut_stub_ref!(A1, A2, A3, A4, A5, A6, A7, A8);
 /// This wraps an FnOnce in an FnMut that panics if called more than once.
 macro_rules! impl_fn_once {
     ($($arg:ident),*) => {
-        impl<R, F, $($arg,)*> WasmClosureFnOnce<dyn FnMut($($arg),*) -> R, fn($($arg),*) -> R> for F
+        impl<R, F, $($arg,)*> WasmClosureFnOnce<dyn FnMut($($arg),*) -> R, fn($($arg),*) -> R, R> for F
         where
             F: FnOnce($($arg),*) -> R + 'static,
             $($arg: BinaryDecode + EncodeTypeDef + 'static,)*
@@ -1227,6 +1418,19 @@ macro_rules! impl_fn_once {
                 )
             }
         }
+
+        impl<R, F, $($arg,)*> WasmClosureFnOnceAbort<dyn FnMut($($arg),*) -> R, fn($($arg),*) -> R, R> for F
+        where
+            F: FnOnce($($arg),*) -> R + 'static,
+            $($arg: BinaryDecode + EncodeTypeDef + 'static,)*
+            R: BinaryEncode + EncodeTypeDef + 'static,
+        {
+            #[allow(non_snake_case)]
+            #[allow(unused_variables)]
+            fn into_closure(self) -> Closure<dyn FnMut($($arg),*) -> R> {
+                <F as WasmClosureFnOnce<dyn FnMut($($arg),*) -> R, fn($($arg),*) -> R, R>>::into_closure(self)
+            }
+        }
     };
 }
 
@@ -1244,7 +1448,7 @@ impl_fn_once!(A1, A2, A3, A4, A5, A6, A7, A8);
 /// This uses RefFromBinaryDecode for the first arg and BinaryDecode for the rest.
 macro_rules! impl_fn_once_ref {
     ($first:ident $(, $rest:ident)*) => {
-        impl<R, F, $first, $($rest,)*> WasmClosureFnOnce<dyn FnMut(&$first, $($rest),*) -> R, (BorrowedFirstArg, fn(&$first, $($rest),*) -> R)> for F
+        impl<R, F, $first, $($rest,)*> WasmClosureFnOnce<dyn FnMut(&$first, $($rest),*) -> R, (BorrowedFirstArg, fn(&$first, $($rest),*) -> R), R> for F
         where
             F: FnOnce(&$first, $($rest),*) -> R + 'static,
             $first: RefFromBinaryDecode + EncodeTypeDef + 'static,
@@ -1264,6 +1468,20 @@ macro_rules! impl_fn_once_ref {
                         result.encode(encoder);
                     },
                 )
+            }
+        }
+
+        impl<R, F, $first, $($rest,)*> WasmClosureFnOnceAbort<dyn FnMut(&$first, $($rest),*) -> R, (BorrowedFirstArg, fn(&$first, $($rest),*) -> R), R> for F
+        where
+            F: FnOnce(&$first, $($rest),*) -> R + 'static,
+            $first: RefFromBinaryDecode + EncodeTypeDef + 'static,
+            $($rest: BinaryDecode + EncodeTypeDef + 'static,)*
+            R: BinaryEncode + EncodeTypeDef + 'static,
+        {
+            #[allow(non_snake_case)]
+            #[allow(unused_variables)]
+            fn into_closure(self) -> Closure<dyn FnMut(&$first, $($rest),*) -> R> {
+                <F as WasmClosureFnOnce<dyn FnMut(&$first, $($rest),*) -> R, (BorrowedFirstArg, fn(&$first, $($rest),*) -> R), R>>::into_closure(self)
             }
         }
     };

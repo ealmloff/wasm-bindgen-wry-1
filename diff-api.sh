@@ -67,18 +67,10 @@ filter_cosmetic() {
         /WasmSlice/ { next }
         /WasmAbi/ { next }
         /WasmPrimitive/ { next }
-        /WasmClosure/ { next }
-        /IntoWasmClosure/ { next }
         /into_abi/ { next }
         /from_abi/ { next }
         /::Abi/ { next }
         /::Anchor/ { next }
-        /JsStatic/ { next }
-        /impl core::ops.*for &wasm_bindgen::JsValue$/ { next }
-        /impl<'\''a> core::cmp::PartialEq<&'\''a/ { next }
-        /\?core::marker::Sized/ { next }
-        /^pub struct wasm_bindgen::JsError$/ { next }
-        /^pub struct wasm_bindgen::prelude::JsError$/ { next }
         { print }
     '
 }
@@ -150,12 +142,24 @@ main() {
     echo "============================================="
 
     local missing_api="$tmp_dir/missing-api.txt"
+    local extra_api="$tmp_dir/extra-api.txt"
     comm -23 "$upstream_filtered" "$wry_filtered" >"$missing_api"
+    comm -13 "$upstream_filtered" "$wry_filtered" >"$extra_api"
 
     if [[ -s "$missing_api" ]]; then
         cat "$missing_api"
     else
-        echo "No missing APIs found after filters."
+        echo "No missing APIs found after ABI/convert filters."
+    fi
+
+    echo ""
+    echo "APIs in wry-bindgen but NOT in wasm-bindgen:"
+    echo "============================================="
+
+    if [[ -s "$extra_api" ]]; then
+        cat "$extra_api"
+    else
+        echo "No extra APIs found after ABI/convert filters."
     fi
 }
 

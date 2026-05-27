@@ -323,12 +323,14 @@ impl ProtocolHandler {
             let msg_type = msg.ty().unwrap();
             let header = msg.header().unwrap();
             let mut js_consumed_actions;
+            let mut response_channel_id = None;
             match msg_type {
                 // New call from JS - save the sync response channel and
                 // wait for the Rust application thread to respond.
                 MessageType::Evaluate => {
                     js_consumed_actions = webview_state.take_pending_js_consumed_actions();
                     webview_state.set_response_channel(header.request_id, responder);
+                    response_channel_id = Some(header.request_id);
                 }
                 // Response from JS to a previous Rust Evaluate. The route was
                 // recorded when Wry delivered that Evaluate to JS.
@@ -343,6 +345,7 @@ impl ProtocolHandler {
                     match route.route_request_id {
                         Some(route_request_id) => {
                             webview_state.set_response_channel(route_request_id, responder);
+                            response_channel_id = Some(route_request_id);
                         }
                         None => {
                             responder.respond(blank_response());
@@ -350,9 +353,18 @@ impl ProtocolHandler {
                     }
                 }
             }
-            webview_state
+            if !webview_state
                 .sender
-                .start_send(InboundIPCMessage::new(msg, js_consumed_actions));
+                .start_send(InboundIPCMessage::new(msg, js_consumed_actions))
+            {
+                if let Some(response_channel_id) = response_channel_id {
+                    if let Some(responder) =
+                        webview_state.take_response_channel(response_channel_id)
+                    {
+                        responder.respond(error_response());
+                    }
+                }
+            }
             return None;
         }
 
@@ -638,4 +650,51 @@ pub fn not_found_response() -> http::Response<Vec<u8>> {
         .status(404)
         .body(b"Not Found".to_vec())
         .expect("Failed to build not found response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ipc::EncodedData;
+
+    fn handler_request(message_type: MessageType, request_id: u32) -> http::Request<Vec<u8>> {
+        let mut data = EncodedData::new();
+        data.push_u8(message_type as u8);
+        data.push_u32(request_id);
+
+        let engine = base64::engine::general_purpose::STANDARD;
+        let body_base64 = engine.encode(data.to_bytes());
+
+        http::Request::builder()
+            .uri("wry://index.html/__wbg__/handler")
+            .header("dioxus-data", body_base64)
+            .body(Vec::new())
+            .expect("failed to build request")
+    }
+
+    #[test]
+    fn handler_responds_error_when_evaluate_arrives_after_runtime_drop() {
+        let bindgen = WryBindgen::new(|_| {});
+        let app_builder = bindgen.app_builder();
+        let protocol_handler = app_builder.protocol_handler();
+        drop(app_builder);
+
+        let response = Rc::new(RefCell::new(None));
+        let captured_response = response.clone();
+        let request = handler_request(MessageType::Evaluate, 1);
+
+        let unhandled = protocol_handler.handle_request(
+            "wry",
+            |_| {},
+            &request,
+            move |response| *captured_response.borrow_mut() = Some(response),
+        );
+
+        assert!(unhandled.is_none());
+        let response = response
+            .borrow_mut()
+            .take()
+            .expect("closed runtime should receive an error response");
+        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+    }
 }

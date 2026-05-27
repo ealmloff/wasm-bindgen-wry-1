@@ -72,18 +72,10 @@ pub(crate) struct IPCSenders {
 }
 
 impl IPCSenders {
-    pub(crate) fn start_send(&self, msg: InboundIPCMessage) {
+    pub(crate) fn start_send(&self, msg: InboundIPCMessage) -> bool {
         match msg.message.ty().unwrap() {
-            MessageType::Evaluate => {
-                self.eval_sender
-                    .try_send(msg)
-                    .expect("Failed to send evaluate message");
-            }
-            MessageType::Respond => {
-                self.respond_sender
-                    .unbounded_send(msg)
-                    .expect("Failed to send respond message");
-            }
+            MessageType::Evaluate => self.eval_sender.try_send(msg).is_ok(),
+            MessageType::Respond => self.respond_sender.unbounded_send(msg).is_ok(),
         }
     }
 }

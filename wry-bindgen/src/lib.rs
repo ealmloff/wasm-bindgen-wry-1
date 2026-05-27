@@ -454,24 +454,6 @@ to_js_value!(());
 from_js_value!(());
 
 impl<T: ?Sized> ScopedClosure<'static, T> {
-    pub fn new<M, F: IntoClosure<M, Self>>(f: F) -> Self {
-        f.into_closure()
-    }
-
-    /// Create a `Closure` from a function that can only be called once.
-    ///
-    /// Since we have no way of enforcing that JS cannot attempt to call this
-    /// `FnOnce` more than once, this produces a `Closure<dyn FnMut(A...) -> R>`
-    /// that will panic if called more than once.
-    pub fn once<F, M>(fn_once: F) -> Closure<T>
-    where
-        F: WasmClosureFnOnce<T, M>,
-    {
-        let mut closure = fn_once.into_closure();
-        closure.drop_rust_callback_on_drop = false;
-        closure
-    }
-
     /// Wrap a raw closure. Only for use by generated code.
     pub(crate) fn wrap_encode_decode<FnPtr>(
         encode_decode: impl Fn(&mut DecodedData, &mut EncodedData) + 'static,
@@ -539,7 +521,10 @@ impl<T: ?Sized> ScopedClosure<'static, T> {
     }
 }
 
-impl<'a, T: ?Sized> ScopedClosure<'a, T> {
+impl<'a, T> ScopedClosure<'a, T>
+where
+    T: ?Sized + WasmClosure,
+{
     /// Returns the JavaScript function value for this closure.
     pub fn as_js_value(&self) -> &JsValue {
         &self.value
@@ -555,9 +540,52 @@ impl<T: ?Sized> Drop for ScopedClosure<'_, T> {
     }
 }
 
+impl<T: ?Sized> Unpin for ScopedClosure<'_, T> {}
+
+/// Marker for closures that are safe to invoke through panic-catching glue.
+#[doc(hidden)]
+pub trait MaybeUnwindSafe {}
+
+impl<T: ?Sized> MaybeUnwindSafe for T {}
+
+/// A trait for converting a Rust closure into the JS closure type `T`.
+#[doc(hidden)]
+pub trait IntoWasmClosure<T: ?Sized> {
+    fn into_closure(self) -> Closure<T>
+    where
+        Self: Sized,
+    {
+        unreachable!("unsized closure objects must be converted from Box<Self>")
+    }
+
+    fn into_closure_box(self: Box<Self>) -> Closure<T>;
+}
+
+/// A trait for converting a shared borrowed Rust closure into the JS closure type `T`.
+#[doc(hidden)]
+pub trait IntoWasmClosureRef<T: ?Sized> {
+    fn into_scoped_closure_ref<'a>(t: &'a Self) -> ScopedClosure<'a, T::Static>
+    where
+        T: WasmClosure;
+}
+
+/// A trait for converting a mutably borrowed Rust closure into the JS closure type `T`.
+#[doc(hidden)]
+pub trait IntoWasmClosureRefMut<T: ?Sized> {
+    fn into_scoped_closure_ref_mut<'a>(t: &'a mut Self) -> ScopedClosure<'a, T::Static>
+    where
+        T: WasmClosure;
+}
+
 /// A trait for converting an `FnOnce(A...) -> R` into a `Closure<dyn FnMut(A...) -> R>`.
 #[doc(hidden)]
-pub trait WasmClosureFnOnce<T: ?Sized, M>: Sized + 'static {
+pub trait WasmClosureFnOnce<T: ?Sized, A, R>: Sized + 'static {
+    fn into_closure(self) -> Closure<T>;
+}
+
+/// A trait for converting an aborting `FnOnce(A...) -> R` into a closure.
+#[doc(hidden)]
+pub trait WasmClosureFnOnceAbort<T: ?Sized, A, R>: Sized + 'static {
     fn into_closure(self) -> Closure<T>;
 }
 
@@ -567,7 +595,10 @@ impl<T: ?Sized> AsRef<JsValue> for ScopedClosure<'_, T> {
     }
 }
 
-impl<T: ?Sized> core::fmt::Debug for ScopedClosure<'_, T> {
+impl<T> core::fmt::Debug for ScopedClosure<'_, T>
+where
+    T: ?Sized,
+{
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Closure")
             .field("value", &self.value)
@@ -576,6 +607,7 @@ impl<T: ?Sized> core::fmt::Debug for ScopedClosure<'_, T> {
 }
 
 /// Upstream-compatible marker trait for closure signatures.
+#[doc(hidden)]
 pub trait WasmClosure {
     /// The `'static` version of this closure type.
     type Static: ?Sized;
@@ -584,25 +616,140 @@ pub trait WasmClosure {
 }
 
 /// Internal trait for closure types that can be wrapped and passed to JavaScript.
+#[doc(hidden)]
 pub trait WryWasmClosure<M> {
     /// Create a Closure from a boxed closure.
     fn into_js_closure(boxed: Box<Self>) -> Closure<Self>;
 }
 
-impl<T: ?Sized> ScopedClosure<'static, T> {
+impl<T> ScopedClosure<'static, T>
+where
+    T: ?Sized + WasmClosure,
+{
+    pub fn new<F>(t: F) -> Self
+    where
+        F: IntoWasmClosure<T> + MaybeUnwindSafe + 'static,
+    {
+        Self::own(t)
+    }
+
+    pub fn own<F>(t: F) -> Self
+    where
+        F: IntoWasmClosure<T> + MaybeUnwindSafe + 'static,
+    {
+        <F as IntoWasmClosure<T>>::into_closure(t)
+    }
+
+    pub fn own_aborting<F>(t: F) -> Self
+    where
+        F: IntoWasmClosure<T> + 'static,
+    {
+        <F as IntoWasmClosure<T>>::into_closure(t)
+    }
+
+    pub fn own_assert_unwind_safe<F>(t: F) -> Self
+    where
+        F: IntoWasmClosure<T> + 'static,
+    {
+        <F as IntoWasmClosure<T>>::into_closure(t)
+    }
+
+    pub fn wrap<F>(data: Box<F>) -> Self
+    where
+        F: IntoWasmClosure<T> + ?Sized + MaybeUnwindSafe,
+    {
+        <F as IntoWasmClosure<T>>::into_closure_box(data)
+    }
+
+    pub fn wrap_aborting<F>(data: Box<F>) -> Self
+    where
+        F: IntoWasmClosure<T> + ?Sized,
+    {
+        <F as IntoWasmClosure<T>>::into_closure_box(data)
+    }
+
+    pub fn wrap_assert_unwind_safe<F>(data: Box<F>) -> Self
+    where
+        F: IntoWasmClosure<T> + ?Sized,
+    {
+        <F as IntoWasmClosure<T>>::into_closure_box(data)
+    }
+
+    pub fn borrow<'a, F>(t: &'a F) -> ScopedClosure<'a, T::Static>
+    where
+        F: IntoWasmClosureRef<T> + MaybeUnwindSafe + ?Sized,
+    {
+        F::into_scoped_closure_ref(t)
+    }
+
+    pub fn borrow_aborting<'a, F>(t: &'a F) -> ScopedClosure<'a, T::Static>
+    where
+        F: IntoWasmClosureRef<T> + ?Sized,
+    {
+        F::into_scoped_closure_ref(t)
+    }
+
+    pub fn borrow_assert_unwind_safe<'a, F>(t: &'a F) -> ScopedClosure<'a, T::Static>
+    where
+        F: IntoWasmClosureRef<T> + ?Sized,
+    {
+        F::into_scoped_closure_ref(t)
+    }
+
+    pub fn borrow_mut<'a, F>(t: &'a mut F) -> ScopedClosure<'a, T::Static>
+    where
+        F: IntoWasmClosureRefMut<T> + MaybeUnwindSafe + ?Sized,
+    {
+        F::into_scoped_closure_ref_mut(t)
+    }
+
+    pub fn borrow_mut_aborting<'a, F>(t: &'a mut F) -> ScopedClosure<'a, T::Static>
+    where
+        F: IntoWasmClosureRefMut<T> + ?Sized,
+    {
+        F::into_scoped_closure_ref_mut(t)
+    }
+
+    pub fn borrow_mut_assert_unwind_safe<'a, F>(t: &'a mut F) -> ScopedClosure<'a, T::Static>
+    where
+        F: IntoWasmClosureRefMut<T> + ?Sized,
+    {
+        F::into_scoped_closure_ref_mut(t)
+    }
+
+    /// Create a `Closure` from a function that can only be called once.
+    ///
+    /// Since we have no way of enforcing that JS cannot attempt to call this
+    /// `FnOnce` more than once, this produces a `Closure<dyn FnMut(A...) -> R>`
+    /// that will panic if called more than once.
+    pub fn once<F, A, R>(fn_once: F) -> Self
+    where
+        F: WasmClosureFnOnce<T, A, R> + MaybeUnwindSafe,
+    {
+        let mut closure = <F as WasmClosureFnOnce<T, A, R>>::into_closure(fn_once);
+        closure.drop_rust_callback_on_drop = false;
+        closure
+    }
+
+    pub fn once_aborting<F, A, R>(fn_once: F) -> Self
+    where
+        F: WasmClosureFnOnceAbort<T, A, R>,
+    {
+        let mut closure = <F as WasmClosureFnOnceAbort<T, A, R>>::into_closure(fn_once);
+        closure.drop_rust_callback_on_drop = false;
+        closure
+    }
+
+    pub fn once_assert_unwind_safe<F, A, R>(fn_once: F) -> Self
+    where
+        F: WasmClosureFnOnceAbort<T, A, R>,
+    {
+        Self::once_aborting(fn_once)
+    }
+
     /// Forgets the closure, leaking it.
     pub fn forget(self) {
         core::mem::forget(self);
-    }
-
-    /// Wrap a boxed closure to create a `Closure`.
-    ///
-    /// This is the classic wasm-bindgen API for creating closures from boxed trait objects.
-    pub fn wrap<M>(data: Box<T>) -> Closure<T>
-    where
-        T: WryWasmClosure<M>,
-    {
-        T::into_js_closure(data)
     }
 
     /// Converts the `Closure` into a `JsValue`.
@@ -616,11 +763,11 @@ impl<T: ?Sized> ScopedClosure<'static, T> {
     /// and return the underlying `JsValue` directly.
     ///
     /// This is a convenience method that combines `once` and `into_js_value`.
-    pub fn once_into_js<F, M>(fn_once: F) -> JsValue
+    pub fn once_into_js<F, A, R>(fn_once: F) -> JsValue
     where
-        F: WasmClosureFnOnce<T, M>,
+        F: WasmClosureFnOnce<T, A, R> + MaybeUnwindSafe,
     {
-        Closure::once(fn_once).into_js_value()
+        Self::once(fn_once).into_js_value()
     }
 }
 
@@ -656,6 +803,24 @@ impl<T> Deref for Clamped<T> {
 impl<T> DerefMut for Clamped<T> {
     fn deref_mut(&mut self) -> &mut T {
         &mut self.0
+    }
+}
+
+/// Wrapper type for imported thread-local JavaScript statics.
+#[cfg(feature = "std")]
+#[deprecated = "use with `#[wasm_bindgen(thread_local_v2)]` instead"]
+pub struct JsStatic<T: 'static> {
+    #[doc(hidden)]
+    pub __inner: &'static std::thread::LocalKey<T>,
+}
+
+#[cfg(feature = "std")]
+#[allow(deprecated)]
+impl<T: crate::convert::FromWasmAbi + 'static> Deref for JsStatic<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.__inner.with(|ptr| unsafe { &*(ptr as *const T) })
     }
 }
 
@@ -1257,7 +1422,7 @@ pub use wry_bindgen_macro::wasm_bindgen;
 // Re-export inventory for macro use
 pub use inventory;
 
-use crate::encode::{CallbackKey, IntoClosure};
+use crate::encode::CallbackKey;
 use crate::function::RustCallback;
 use crate::object_store::insert_object;
 
