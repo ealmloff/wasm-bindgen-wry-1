@@ -1,13 +1,11 @@
-import { DataEncoder, DeferredHeapRefDataEncoder } from "./encoding";
+import { DataEncoder } from "./encoding";
 import {
   handleBinaryResponse,
   MessageType,
   sync_request_binary,
   DROP_NATIVE_REF_FN_ID,
-  prependJsToRustPrelude,
   allocateJsRequestId,
   pushMessageHeader,
-  rustCallResponseChannels,
 } from "./ipc";
 import { TypeClass } from "./types";
 
@@ -25,18 +23,12 @@ function dropNativeRef(fnId: number): void {
   // Build Evaluate message to drop native ref: [DROP_NATIVE_REF_FN_ID, fn_id]
   const encoder = new DataEncoder();
   const requestId = allocateJsRequestId();
-  pushMessageHeader(encoder, MessageType.Evaluate, requestId, requestId);
+  pushMessageHeader(encoder, MessageType.Evaluate, requestId);
   encoder.pushU32(DROP_NATIVE_REF_FN_ID);
   encoder.pushU32(fnId);
 
-  rustCallResponseChannels.push(requestId);
-  try {
-    prependJsToRustPrelude(encoder);
-    const response = sync_request_binary(`/__wbg__/handler`, encoder.finalize());
-    handleBinaryResponse(response, requestId);
-  } finally {
-    rustCallResponseChannels.pop();
-  }
+  const response = sync_request_binary(`/__wbg__/handler`, encoder.finalize());
+  handleBinaryResponse(response, requestId);
 }
 
 const nativeRefRegistry = new FinalizationRegistry<number>((fnId: number) => {
@@ -48,14 +40,14 @@ const nativeRefRegistry = new FinalizationRegistry<number>((fnId: number) => {
  * Registered with FinalizationRegistry so Rust is notified when this is GC'd.
  */
 class RustFunction {
-  private fnId: number;
-  private paramTypes: TypeClass[];
-  private returnType: TypeClass;
-  private dropAfterCall: boolean;
-  private disposed: boolean;
-  private activeCalls: number;
-  private dropNativeWhenIdle: boolean;
-  private finalizerToken: object | null;
+  declare private fnId: number;
+  declare private paramTypes: TypeClass[];
+  declare private returnType: TypeClass;
+  declare private dropAfterCall: boolean;
+  declare private disposed: boolean;
+  declare private activeCalls: number;
+  declare private dropNativeWhenIdle: boolean;
+  declare private finalizerToken: object | null;
 
   constructor(
     fnId: number,
@@ -86,12 +78,11 @@ class RustFunction {
     this.activeCalls++;
     // Push a borrow frame before encoding args - nested calls won't clear our borrowed refs
     window.jsHeap.pushBorrowFrame();
-    const pendingHeapRefs = window.jsHeap.deferHeapRefs();
-
     // Build Evaluate message: [0, fn_id]
-    const encoder = new DeferredHeapRefDataEncoder(pendingHeapRefs);
     const requestId = allocateJsRequestId();
-    pushMessageHeader(encoder, MessageType.Evaluate, requestId, requestId);
+    const pendingHeapRefs = window.jsHeap.deferHeapRefs(requestId);
+    const encoder = new DataEncoder(pendingHeapRefs);
+    pushMessageHeader(encoder, MessageType.Evaluate, requestId);
     encoder.pushU32(0); // Call argument function
     encoder.pushU32(this.fnId);
     // Encode arguments (may put borrowed refs on the borrow stack)
@@ -100,15 +91,12 @@ class RustFunction {
     }
 
     let result: ReturnType<typeof handleBinaryResponse> = null;
-    rustCallResponseChannels.push(requestId);
     try {
       // Send to Rust and get response (Rust may call back to JS during this)
-      prependJsToRustPrelude(encoder);
       const response = sync_request_binary(`/__wbg__/handler`, encoder.finalize());
       result = handleBinaryResponse(response, requestId);
       window.jsHeap.releaseEmptyDeferredHeapRefs(pendingHeapRefs);
     } finally {
-      rustCallResponseChannels.pop();
       // Pop the borrow frame - clears borrowed refs from this call
       window.jsHeap.popBorrowFrame();
       this.activeCalls--;

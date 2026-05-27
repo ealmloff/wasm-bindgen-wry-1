@@ -1,6 +1,6 @@
 [package]
 name = "wasm-bindgen"
-version = "0.2.106"
+version = "0.2.122"
 edition = "2024"
 description = "Shim crate that re-exports either wry-bindgen (desktop) or wasm-bindgen (wasm32)"
 license = "MIT OR Apache-2.0"
@@ -13,7 +13,7 @@ enable-interning = []
 msrv = []
 
 [dependencies]
-wasm-bindgen-macro = { path = "../wasm-bindgen-macro", package = "wasm-bindgen-macro", version = "=0.2.106" }
+wasm-bindgen-macro = { path = "../wasm-bindgen-macro", package = "wasm-bindgen-macro", version = "=0.2.122" }
 
 # Desktop implementation
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

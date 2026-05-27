@@ -4,16 +4,18 @@
 import { DeferredHeapRefs } from "./heap";
 
 class DataEncoder {
-  private u8Buf: number[];
-  private u16Buf: number[];
-  private u32Buf: number[];
-  private strBuf: number[]; // UTF-8 bytes
+  declare private u8Buf: number[];
+  declare private u16Buf: number[];
+  declare private u32Buf: number[];
+  declare private strBuf: number[]; // UTF-8 bytes
+  declare private heapRefs?: DeferredHeapRefs;
 
-  constructor() {
+  constructor(heapRefs?: DeferredHeapRefs) {
     this.u8Buf = [];
     this.u16Buf = [];
     this.u32Buf = [];
     this.strBuf = [];
+    this.heapRefs = heapRefs;
   }
 
   pushU8(value: number) {
@@ -66,26 +68,12 @@ class DataEncoder {
   }
 
   pushHeapRef(value: unknown) {
-    this.pushU64(window.jsHeap.insert(value));
-  }
-
-  deferredHeapRefRequestId(): number {
-    return 0;
-  }
-
-  deferredHeapRefCount(): number {
-    return 0;
-  }
-
-  prependU32s(values: number[]) {
-    this.u32Buf = values.concat(this.u32Buf);
-  }
-
-  insertU32s(index: number, values: number[]) {
-    const clampedIndex = Math.max(0, Math.min(index, this.u32Buf.length));
-    this.u32Buf = this.u32Buf
-      .slice(0, clampedIndex)
-      .concat(values, this.u32Buf.slice(clampedIndex));
+    // JS never mints heap IDs. It records the value and waits for Rust to
+    // install an exact slot for this request.
+    if (!this.heapRefs) {
+      throw new Error("Cannot encode JS heap ref without a Rust allocation request");
+    }
+    this.heapRefs.push(value);
   }
 
   finalize(): ArrayBuffer {
@@ -127,42 +115,21 @@ class DataEncoder {
   }
 }
 
-class DeferredHeapRefDataEncoder extends DataEncoder {
-  private heapRefs: DeferredHeapRefs;
-
-  constructor(heapRefs: DeferredHeapRefs) {
-    super();
-    this.heapRefs = heapRefs;
-  }
-
-  pushHeapRef(value: unknown) {
-    this.heapRefs.push(value);
-  }
-
-  deferredHeapRefRequestId(): number {
-    return this.heapRefs.id();
-  }
-
-  deferredHeapRefCount(): number {
-    return this.heapRefs.count();
-  }
-}
-
 /**
  * Decoder for reading binary messages from Rust.
  */
 class DataDecoder {
-  private u8Buf: Uint8Array;
-  private u8Offset: number;
+  declare private u8Buf: Uint8Array;
+  declare private u8Offset: number;
 
-  private u16Buf: Uint16Array;
-  private u16Offset: number;
+  declare private u16Buf: Uint16Array;
+  declare private u16Offset: number;
 
-  private u32Buf: Uint32Array;
-  private u32Offset: number;
+  declare private u32Buf: Uint32Array;
+  declare private u32Offset: number;
 
-  private strBuf: string;
-  private strOffset: number;
+  declare private strBuf: string;
+  declare private strOffset: number;
 
   constructor(data: ArrayBuffer) {
     const headerView = new DataView(data, 0, 12);
@@ -308,4 +275,4 @@ class DataDecoder {
   }
 }
 
-export { DataDecoder, DataEncoder, DeferredHeapRefDataEncoder };
+export { DataDecoder, DataEncoder };

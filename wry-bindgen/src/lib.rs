@@ -42,6 +42,7 @@ pub use intern::*;
 /// Allows `use wasm_bindgen::closure::Closure;`
 pub mod closure {
     pub use crate::Closure;
+    pub use crate::ScopedClosure;
     pub use crate::WasmClosure;
 }
 
@@ -52,6 +53,24 @@ pub mod __rt {
         __wry_submit_js_function, JsValue, LazyJsFunction,
         encode::{BatchableResult, BinaryEncode, EncodeTypeDef},
     };
+
+    pub mod marker {
+        /// Marker for types whose generic parameters erase to one stable runtime representation.
+        ///
+        /// # Safety
+        /// Implementors must have the same runtime representation as `Repr`.
+        pub unsafe trait ErasableGeneric {
+            type Repr: 'static;
+        }
+
+        unsafe impl<T: ErasableGeneric> ErasableGeneric for &T {
+            type Repr = &'static T::Repr;
+        }
+
+        unsafe impl<T: ErasableGeneric> ErasableGeneric for &mut T {
+            type Repr = &'static mut T::Repr;
+        }
+    }
 
     /// Cast between types via the binary protocol.
     ///
@@ -251,17 +270,20 @@ to_js_value!(String);
 to_js_value!(());
 from_js_value!(());
 
-/// Closure type for passing Rust closures to JavaScript.
-pub struct Closure<T: ?Sized> {
+/// Borrowed or owned closure handle for passing Rust closures to JavaScript.
+pub struct ScopedClosure<'a, T: ?Sized> {
     // careful: must be Box<T> not just T because unsized PhantomData
     // seems to have weird interaction with Pin<>
-    _phantom: core::marker::PhantomData<Box<T>>,
+    _phantom: core::marker::PhantomData<(&'a (), Box<T>)>,
     rust_callback: Option<object_store::ObjectHandle>,
     drop_rust_callback_on_drop: bool,
     pub(crate) value: JsValue,
 }
 
-impl<T: ?Sized> Closure<T> {
+/// Owned closure handle. This follows upstream wasm-bindgen's alias direction.
+pub type Closure<T> = ScopedClosure<'static, T>;
+
+impl<T: ?Sized> ScopedClosure<'static, T> {
     pub fn new<M, F: IntoClosure<M, Self>>(f: F) -> Self {
         f.into_closure()
     }
@@ -278,11 +300,6 @@ impl<T: ?Sized> Closure<T> {
         let mut closure = fn_once.into_closure();
         closure.drop_rust_callback_on_drop = false;
         closure
-    }
-
-    /// Forgets the closure, leaking it.
-    pub fn forget(self) {
-        core::mem::forget(self);
     }
 
     /// Wrap a raw closure. Only for use by generated code.
@@ -352,7 +369,19 @@ impl<T: ?Sized> Closure<T> {
     }
 }
 
-impl<T: ?Sized> Drop for Closure<T> {
+impl<'a, T: ?Sized> ScopedClosure<'a, T> {
+    /// Forgets the closure, leaking it.
+    pub fn forget(self) {
+        core::mem::forget(self);
+    }
+
+    /// Returns the JavaScript function value for this closure.
+    pub fn as_js_value(&self) -> &JsValue {
+        &self.value
+    }
+}
+
+impl<T: ?Sized> Drop for ScopedClosure<'_, T> {
     fn drop(&mut self) {
         if self.drop_rust_callback_on_drop && self.rust_callback.take().is_some() {
             crate::batch::queue_js_dispose_and_drop_rust_function(self.value.id());
@@ -367,13 +396,13 @@ pub trait WasmClosureFnOnce<T: ?Sized, M>: Sized + 'static {
     fn into_closure(self) -> Closure<T>;
 }
 
-impl<T: ?Sized> AsRef<JsValue> for Closure<T> {
+impl<T: ?Sized> AsRef<JsValue> for ScopedClosure<'_, T> {
     fn as_ref(&self) -> &JsValue {
         &self.value
     }
 }
 
-impl<T: ?Sized> core::fmt::Debug for Closure<T> {
+impl<T: ?Sized> core::fmt::Debug for ScopedClosure<'_, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Closure")
             .field("value", &self.value)
@@ -381,20 +410,27 @@ impl<T: ?Sized> core::fmt::Debug for Closure<T> {
     }
 }
 
-/// Trait for closure types that can be wrapped and passed to JavaScript.
-/// This trait is implemented for all `dyn FnMut(...)` variants.
-pub trait WasmClosure<M> {
+/// Upstream-compatible marker trait for closure signatures.
+pub trait WasmClosure {
+    /// The `'static` version of this closure type.
+    type Static: ?Sized;
+    /// The mutable version of this closure type.
+    type AsMut: ?Sized;
+}
+
+/// Internal trait for closure types that can be wrapped and passed to JavaScript.
+pub trait WryWasmClosure<M> {
     /// Create a Closure from a boxed closure.
     fn into_js_closure(boxed: Box<Self>) -> Closure<Self>;
 }
 
-impl<T: ?Sized> Closure<T> {
+impl<T: ?Sized> ScopedClosure<'static, T> {
     /// Wrap a boxed closure to create a `Closure`.
     ///
     /// This is the classic wasm-bindgen API for creating closures from boxed trait objects.
     pub fn wrap<M>(data: Box<T>) -> Closure<T>
     where
-        T: WasmClosure<M>,
+        T: WryWasmClosure<M>,
     {
         T::into_js_closure(data)
     }
@@ -413,7 +449,6 @@ impl<T: ?Sized> Closure<T> {
     pub fn once_into_js<F, M>(fn_once: F) -> JsValue
     where
         F: WasmClosureFnOnce<T, M>,
-        T: Sized,
     {
         Closure::once(fn_once).into_js_value()
     }
@@ -426,6 +461,10 @@ use core::ops::{Deref, DerefMut};
 pub use cast::JsCast;
 pub use lazy::JsThreadLocal;
 pub use value::JsValue;
+
+unsafe impl __rt::marker::ErasableGeneric for JsValue {
+    type Repr = JsValue;
+}
 
 /// A wrapper type around slices and vectors for binding the `Uint8ClampedArray` in JS.
 ///
@@ -477,6 +516,12 @@ impl From<JsError> for JsValue {
     }
 }
 
+impl From<JsValue> for JsError {
+    fn from(value: JsValue) -> Self {
+        JsError { value }
+    }
+}
+
 impl<T> From<Option<T>> for JsValue
 where
     T: Into<JsValue>,
@@ -518,11 +563,420 @@ impl JsCast for JsError {
     }
 }
 
+impl EncodeTypeDef for JsError {
+    fn encode_type_def(buf: &mut alloc::vec::Vec<u8>) {
+        JsValue::encode_type_def(buf);
+    }
+}
+
+impl BinaryEncode for JsError {
+    fn encode(self, encoder: &mut EncodedData) {
+        self.value.encode(encoder);
+    }
+}
+
+impl BinaryDecode for JsError {
+    fn decode(decoder: &mut DecodedData) -> Result<Self, DecodeError> {
+        JsValue::decode(decoder).map(Into::into)
+    }
+
+    fn decode_inbound(decoder: &mut DecodedData) -> Result<Self, DecodeError> {
+        <JsValue as BinaryDecode>::decode_inbound(decoder).map(Into::into)
+    }
+}
+
+impl BatchableResult for JsError {
+    fn try_placeholder(batch: &mut batch::Runtime) -> Option<Self> {
+        Some(<JsValue as BatchableResult>::try_placeholder(batch)?.into())
+    }
+}
+
+unsafe impl __rt::marker::ErasableGeneric for JsError {
+    type Repr = JsValue;
+}
+
+impl IntoJsGeneric for JsError {
+    type JsCanon = Self;
+
+    fn to_js(self) -> Self {
+        self
+    }
+}
+
+impl convert::IntoWasmAbi for JsError {
+    type Abi = <JsValue as convert::IntoWasmAbi>::Abi;
+
+    fn into_abi(self) -> Self::Abi {
+        self.value.into_abi()
+    }
+}
+
+impl convert::FromWasmAbi for JsError {
+    type Abi = <JsValue as convert::FromWasmAbi>::Abi;
+
+    unsafe fn from_abi(js: Self::Abi) -> Self {
+        unsafe { <JsValue as convert::FromWasmAbi>::from_abi(js) }.into()
+    }
+}
+
+impl convert::UpcastFrom<JsError> for JsError {}
+impl convert::UpcastFrom<JsError> for JsValue {}
+
+pub mod sys {
+    use core::{fmt, marker::PhantomData, ops::Deref};
+
+    use crate::{
+        BinaryDecode, BinaryEncode, DecodeError, DecodedData, EncodeTypeDef, EncodedData,
+        IntoJsGeneric, JsCast, JsGeneric, JsValue,
+        batch::Runtime,
+        convert::{FromWasmAbi, IntoWasmAbi, UpcastFrom},
+    };
+
+    /// Marker trait for values that are either a resolution value or a promise-like value.
+    pub trait Promising {
+        type Resolution;
+    }
+
+    macro_rules! js_primitive {
+        ($name:ident, $const_name:ident, $value:expr, $display:literal, $check:expr) => {
+            #[derive(Clone, PartialEq)]
+            #[repr(transparent)]
+            pub struct $name {
+                pub obj: JsValue,
+            }
+
+            impl $name {
+                pub const $const_name: $name = Self { obj: $value };
+            }
+
+            impl Eq for $name {}
+
+            impl Default for $name {
+                fn default() -> Self {
+                    Self::$const_name
+                }
+            }
+
+            impl fmt::Debug for $name {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str($display)
+                }
+            }
+
+            impl fmt::Display for $name {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str($display)
+                }
+            }
+
+            impl AsRef<JsValue> for $name {
+                fn as_ref(&self) -> &JsValue {
+                    &self.obj
+                }
+            }
+
+            impl From<$name> for JsValue {
+                fn from(value: $name) -> JsValue {
+                    value.obj
+                }
+            }
+
+            impl From<&$name> for JsValue {
+                fn from(value: &$name) -> JsValue {
+                    value.obj.clone()
+                }
+            }
+
+            impl From<JsValue> for $name {
+                fn from(obj: JsValue) -> Self {
+                    Self { obj }
+                }
+            }
+
+            impl JsCast for $name {
+                fn instanceof(value: &JsValue) -> bool {
+                    $check(value)
+                }
+
+                fn is_type_of(value: &JsValue) -> bool {
+                    $check(value)
+                }
+
+                fn unchecked_from_js(value: JsValue) -> Self {
+                    Self { obj: value }
+                }
+
+                fn unchecked_from_js_ref(value: &JsValue) -> &Self {
+                    unsafe { &*(value as *const JsValue as *const Self) }
+                }
+            }
+
+            impl EncodeTypeDef for $name {
+                fn encode_type_def(buf: &mut alloc::vec::Vec<u8>) {
+                    JsValue::encode_type_def(buf);
+                }
+            }
+
+            impl BinaryEncode for $name {
+                fn encode(self, encoder: &mut EncodedData) {
+                    self.obj.encode(encoder);
+                }
+            }
+
+            impl BinaryDecode for $name {
+                fn decode(decoder: &mut DecodedData) -> Result<Self, DecodeError> {
+                    JsValue::decode(decoder).map(Into::into)
+                }
+
+                fn decode_inbound(decoder: &mut DecodedData) -> Result<Self, DecodeError> {
+                    <JsValue as BinaryDecode>::decode_inbound(decoder).map(Into::into)
+                }
+            }
+
+            impl crate::BatchableResult for $name {
+                fn try_placeholder(batch: &mut Runtime) -> Option<Self> {
+                    Some(<JsValue as crate::BatchableResult>::try_placeholder(batch)?.into())
+                }
+            }
+
+            unsafe impl crate::__rt::marker::ErasableGeneric for $name {
+                type Repr = JsValue;
+            }
+
+            impl IntoJsGeneric for $name {
+                type JsCanon = Self;
+
+                fn to_js(self) -> Self {
+                    self
+                }
+            }
+
+            impl IntoWasmAbi for $name {
+                type Abi = <JsValue as IntoWasmAbi>::Abi;
+
+                fn into_abi(self) -> Self::Abi {
+                    self.obj.into_abi()
+                }
+            }
+
+            impl FromWasmAbi for $name {
+                type Abi = <JsValue as FromWasmAbi>::Abi;
+
+                unsafe fn from_abi(js: Self::Abi) -> Self {
+                    unsafe { <JsValue as FromWasmAbi>::from_abi(js) }.into()
+                }
+            }
+
+            impl UpcastFrom<$name> for $name {}
+            impl UpcastFrom<$name> for JsValue {}
+        };
+    }
+
+    js_primitive!(
+        Undefined,
+        UNDEFINED,
+        JsValue::UNDEFINED,
+        "undefined",
+        JsValue::is_undefined
+    );
+    js_primitive!(Null, NULL, JsValue::NULL, "null", JsValue::is_null);
+
+    impl UpcastFrom<()> for Undefined {}
+    impl UpcastFrom<Undefined> for () {}
+    impl UpcastFrom<()> for JsValue {}
+    impl UpcastFrom<()> for () {}
+
+    #[derive(Clone, PartialEq)]
+    #[repr(transparent)]
+    pub struct JsOption<T = JsValue> {
+        pub obj: JsValue,
+        pub generics: PhantomData<fn() -> T>,
+    }
+
+    impl<T: JsGeneric> JsOption<T> {
+        #[inline]
+        pub fn new() -> Self {
+            Undefined::UNDEFINED.unchecked_into()
+        }
+
+        #[inline]
+        pub fn wrap(value: T) -> Self {
+            value.unchecked_into()
+        }
+
+        #[inline]
+        pub fn from_option(value: Option<T>) -> Self {
+            match value {
+                Some(value) => Self::wrap(value),
+                None => Self::new(),
+            }
+        }
+
+        #[inline]
+        pub fn is_empty(&self) -> bool {
+            self.obj.is_null() || self.obj.is_undefined()
+        }
+
+        #[inline]
+        pub fn as_option(&self) -> Option<T>
+        where
+            T: Clone,
+        {
+            if self.is_empty() {
+                None
+            } else {
+                Some(self.deref().clone().unchecked_into())
+            }
+        }
+
+        #[inline]
+        pub fn into_option(self) -> Option<T> {
+            if self.is_empty() {
+                None
+            } else {
+                Some(self.unchecked_into())
+            }
+        }
+    }
+
+    impl<T: JsGeneric> Default for JsOption<T> {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl<T> AsRef<JsValue> for JsOption<T> {
+        fn as_ref(&self) -> &JsValue {
+            &self.obj
+        }
+    }
+
+    impl<T: JsGeneric> Deref for JsOption<T> {
+        type Target = T;
+
+        fn deref(&self) -> &T {
+            T::unchecked_from_js_ref(&self.obj)
+        }
+    }
+
+    impl<T> From<JsOption<T>> for JsValue {
+        fn from(value: JsOption<T>) -> JsValue {
+            value.obj
+        }
+    }
+
+    impl<T> From<&JsOption<T>> for JsValue {
+        fn from(value: &JsOption<T>) -> JsValue {
+            value.obj.clone()
+        }
+    }
+
+    impl<T> From<JsValue> for JsOption<T> {
+        fn from(obj: JsValue) -> Self {
+            Self {
+                obj,
+                generics: PhantomData,
+            }
+        }
+    }
+
+    impl<T: JsGeneric> JsCast for JsOption<T> {
+        fn instanceof(value: &JsValue) -> bool {
+            T::is_type_of(value) || value.is_null() || value.is_undefined()
+        }
+
+        fn unchecked_from_js(value: JsValue) -> Self {
+            value.into()
+        }
+
+        fn unchecked_from_js_ref(value: &JsValue) -> &Self {
+            unsafe { &*(value as *const JsValue as *const Self) }
+        }
+    }
+
+    impl<T> EncodeTypeDef for JsOption<T> {
+        fn encode_type_def(buf: &mut alloc::vec::Vec<u8>) {
+            JsValue::encode_type_def(buf);
+        }
+    }
+
+    impl<T> BinaryEncode for JsOption<T> {
+        fn encode(self, encoder: &mut EncodedData) {
+            self.obj.encode(encoder);
+        }
+    }
+
+    impl<T> BinaryDecode for JsOption<T> {
+        fn decode(decoder: &mut DecodedData) -> Result<Self, DecodeError> {
+            JsValue::decode(decoder).map(Into::into)
+        }
+
+        fn decode_inbound(decoder: &mut DecodedData) -> Result<Self, DecodeError> {
+            <JsValue as BinaryDecode>::decode_inbound(decoder).map(Into::into)
+        }
+    }
+
+    impl<T> crate::BatchableResult for JsOption<T> {
+        fn try_placeholder(batch: &mut Runtime) -> Option<Self> {
+            Some(<JsValue as crate::BatchableResult>::try_placeholder(batch)?.into())
+        }
+    }
+
+    unsafe impl<T> crate::__rt::marker::ErasableGeneric for JsOption<T> {
+        type Repr = JsValue;
+    }
+
+    impl<T: JsGeneric> IntoJsGeneric for JsOption<T> {
+        type JsCanon = Self;
+
+        fn to_js(self) -> Self {
+            self
+        }
+    }
+
+    impl<T> IntoWasmAbi for JsOption<T> {
+        type Abi = <JsValue as IntoWasmAbi>::Abi;
+
+        fn into_abi(self) -> Self::Abi {
+            self.obj.into_abi()
+        }
+    }
+
+    impl<T> FromWasmAbi for JsOption<T> {
+        type Abi = <JsValue as FromWasmAbi>::Abi;
+
+        unsafe fn from_abi(js: Self::Abi) -> Self {
+            unsafe { <JsValue as FromWasmAbi>::from_abi(js) }.into()
+        }
+    }
+
+    impl UpcastFrom<JsValue> for JsOption<JsValue> {}
+    impl<T> UpcastFrom<Undefined> for JsOption<T> {}
+    impl<T> UpcastFrom<Null> for JsOption<T> {}
+    impl<T> UpcastFrom<()> for JsOption<T> {}
+    impl<T> UpcastFrom<JsOption<T>> for JsValue {}
+    impl<T, U> UpcastFrom<JsOption<U>> for JsOption<T> where T: UpcastFrom<U> {}
+
+    impl Promising for JsValue {
+        type Resolution = JsValue;
+    }
+
+    impl Promising for () {
+        type Resolution = Undefined;
+    }
+
+    impl<T: Promising> Promising for Option<T> {
+        type Resolution = Option<T::Resolution>;
+    }
+}
+
 // Re-export commonly used items
 pub use batch::batch;
+pub use convert::{IntoJsGeneric, JsGeneric};
 pub use encode::{BatchableResult, BinaryDecode, BinaryEncode, EncodeTypeDef};
 pub use function::JSFunction;
 pub use ipc::{DecodeError, DecodedData, EncodedData};
+pub use sys::{JsOption, Null, Promising, Undefined};
 
 // Re-export the macros
 pub use wry_bindgen_macro::link_to;
@@ -536,6 +990,7 @@ use crate::function::RustCallback;
 use crate::object_store::insert_object;
 
 // Re-export function registry types
+pub use __rt::marker::ErasableGeneric;
 pub use function_registry::{
     InlineJsModule, JsClassMemberKind, JsClassMemberSpec, JsExportSpec, JsFunctionSpec,
     LazyJsFunction,
@@ -557,9 +1012,9 @@ pub use function_registry::{
 #[doc(hidden)]
 macro_rules! __wry_call_js_function {
     ($js_code:expr, $fn_type:ty, ($($args:expr),*)) => {{
-        static __FUNC: $crate::LazyJsFunction<$fn_type> = $crate::__wry_submit_js_function!($js_code);
+        let __func: $crate::LazyJsFunction<$fn_type> = $crate::__wry_submit_js_function!($js_code);
 
-        __FUNC.call($($args),*)
+        __func.call($($args),*)
     }};
 }
 
@@ -690,9 +1145,11 @@ pub mod prelude {
     pub use crate::WasmClosure;
     pub use crate::batch::batch;
     pub use crate::cast::JsCast;
+    pub use crate::convert::{IntoJsGeneric, JsGeneric, Upcast, UpcastFrom};
     pub use crate::encode::{BatchableResult, BinaryDecode, BinaryEncode, EncodeTypeDef};
     pub use crate::function::JSFunction;
     pub use crate::lazy::JsThreadLocal;
+    pub use crate::sys::{JsOption, Null, Promising, Undefined};
     pub use crate::value::JsValue;
     pub use crate::wasm_bindgen;
 }

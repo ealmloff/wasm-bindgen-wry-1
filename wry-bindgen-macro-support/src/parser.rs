@@ -21,6 +21,30 @@ fn parse_any_ident(input: ParseStream) -> syn::Result<String> {
     Err(input.error("expected identifier"))
 }
 
+fn parse_path_string(value: &str, span: Span) -> syn::Result<Path> {
+    syn::parse_str(value)
+        .map_err(|err| syn::Error::new(span, format!("invalid path `{value}`: {err}")))
+}
+
+fn parse_path_value(input: ParseStream, span: Span) -> syn::Result<Path> {
+    if input.peek(LitStr) {
+        let lit = input.parse::<LitStr>()?;
+        parse_path_string(&lit.value(), lit.span())
+    } else {
+        input
+            .parse()
+            .map_err(|err| syn::Error::new(span, format!("expected path: {err}")))
+    }
+}
+
+fn parse_string_or_ident(input: ParseStream) -> syn::Result<String> {
+    if input.peek(LitStr) {
+        Ok(input.parse::<LitStr>()?.value())
+    } else {
+        parse_any_ident(input)
+    }
+}
+
 /// Parsed wasm_bindgen attributes
 #[derive(Debug, Default)]
 pub struct BindgenAttrs {
@@ -45,7 +69,7 @@ pub struct BindgenAttrs {
     /// The `extends` attribute - type inheritance
     pub extends: Vec<(Span, Path)>,
     /// The `static_method_of` attribute - static method
-    pub static_method_of: Option<(Span, Ident)>,
+    pub static_method_of: Option<(Span, String)>,
     /// The `variadic` attribute - variable arguments
     pub variadic: Option<Span>,
     /// The `typescript_type` attribute - TypeScript type override
@@ -78,6 +102,10 @@ pub struct BindgenAttrs {
     pub getter_with_clone: Option<Span>,
     /// The `module` attribute - path to external JS module file (read at compile time)
     pub module: Option<(Span, String)>,
+    /// The `no_upcast` attribute - suppress generated generic upcast impls
+    pub no_upcast: Option<Span>,
+    /// The `no_promising` attribute - suppress generated Promising impls upstream
+    pub no_promising: Option<Span>,
 }
 
 impl BindgenAttrs {
@@ -160,7 +188,7 @@ enum BindgenAttr {
     Constructor(Span),
     Catch(Span),
     Extends(Span, Path),
-    StaticMethodOf(Span, Ident),
+    StaticMethodOf(Span, String),
     Variadic(Span),
     TypescriptType(Span, String),
     InlineJs(Span, Expr),
@@ -177,6 +205,8 @@ enum BindgenAttr {
     Skip(Span),
     GetterWithClone(Span),
     Module(Span, String),
+    NoUpcast(Span),
+    NoPromising(Span),
 }
 
 impl Parse for BindgenAttr {
@@ -207,11 +237,7 @@ impl Parse for BindgenAttr {
 
             "js_class" => {
                 input.parse::<Token![=]>()?;
-                let name = if input.peek(LitStr) {
-                    input.parse::<LitStr>()?.value()
-                } else {
-                    input.parse::<Ident>()?.to_string()
-                };
+                let name = parse_string_or_ident(input)?;
                 Ok(BindgenAttr::JsClass(span, name))
             }
 
@@ -238,7 +264,7 @@ impl Parse for BindgenAttr {
                     if input.peek(LitStr) {
                         Some(input.parse::<LitStr>()?.value())
                     } else {
-                        Some(input.parse::<Ident>()?.to_string())
+                        Some(parse_any_ident(input)?)
                     }
                 } else {
                     None
@@ -252,7 +278,7 @@ impl Parse for BindgenAttr {
                     if input.peek(LitStr) {
                         Some(input.parse::<LitStr>()?.value())
                     } else {
-                        Some(input.parse::<Ident>()?.to_string())
+                        Some(parse_any_ident(input)?)
                     }
                 } else {
                     None
@@ -262,14 +288,14 @@ impl Parse for BindgenAttr {
 
             "extends" => {
                 input.parse::<Token![=]>()?;
-                let path: Path = input.parse()?;
+                let path = parse_path_value(input, span)?;
                 Ok(BindgenAttr::Extends(span, path))
             }
 
             "static_method_of" => {
                 input.parse::<Token![=]>()?;
-                let ident: Ident = input.parse()?;
-                Ok(BindgenAttr::StaticMethodOf(span, ident))
+                let class = parse_string_or_ident(input)?;
+                Ok(BindgenAttr::StaticMethodOf(span, class))
             }
 
             "typescript_type" => {
@@ -303,6 +329,8 @@ impl Parse for BindgenAttr {
             "inspectable" => Ok(BindgenAttr::Inspectable(span)),
             "skip" => Ok(BindgenAttr::Skip(span)),
             "getter_with_clone" => Ok(BindgenAttr::GetterWithClone(span)),
+            "no_upcast" => Ok(BindgenAttr::NoUpcast(span)),
+            "no_promising" => Ok(BindgenAttr::NoPromising(span)),
 
             "module" => {
                 input.parse::<Token![=]>()?;
@@ -327,7 +355,19 @@ impl Parse for BindgenAttr {
 
             "vendor_prefix" => {
                 input.parse::<Token![=]>()?;
-                let ident: Ident = input.parse()?;
+                let ident = if input.peek(LitStr) {
+                    let lit = input.parse::<LitStr>()?;
+                    let value = lit.value();
+                    syn::parse_str::<Ident>(&value).map_err(|err| {
+                        syn::Error::new(
+                            lit.span(),
+                            format!("invalid vendor_prefix `{value}`: {err}"),
+                        )
+                    })?;
+                    Ident::new(&value, lit.span())
+                } else {
+                    input.parse()?
+                };
                 Ok(BindgenAttr::VendorPrefix(span, ident))
             }
 
@@ -552,6 +592,18 @@ pub fn parse_attrs(attr: TokenStream) -> syn::Result<BindgenAttrs> {
                     ));
                 }
                 result.module = Some((span, path));
+            }
+            BindgenAttr::NoUpcast(span) => {
+                if result.no_upcast.is_some() {
+                    return Err(syn::Error::new(span, "duplicate `no_upcast` attribute"));
+                }
+                result.no_upcast = Some(span);
+            }
+            BindgenAttr::NoPromising(span) => {
+                if result.no_promising.is_some() {
+                    return Err(syn::Error::new(span, "duplicate `no_promising` attribute"));
+                }
+                result.no_promising = Some(span);
             }
         }
     }

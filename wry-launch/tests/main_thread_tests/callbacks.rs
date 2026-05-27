@@ -249,6 +249,34 @@ pub(crate) fn test_js_callback_heap_ref_arg_with_pending_placeholders() {
     assert!(called.get(), "callback was not called");
 }
 
+pub(crate) fn test_js_callback_multiple_heap_ref_args_share_request_id() {
+    #[wasm_bindgen(inline_js = r#"
+        export function call_callback_with_two_heap_ref_args(cb) {
+            cb({ label: 11 }, { label: 22 });
+        }
+
+        export function read_multi_heap_ref_label(obj) {
+            return obj.label;
+        }
+    "#)]
+    extern "C" {
+        fn call_callback_with_two_heap_ref_args(cb: &Closure<dyn FnMut(JsValue, JsValue)>);
+        fn read_multi_heap_ref_label(obj: &JsValue) -> u32;
+    }
+
+    let called = std::rc::Rc::new(Cell::new(false));
+    let called_clone = called.clone();
+    let callback = Closure::new(move |first: JsValue, second: JsValue| {
+        assert_eq!(read_multi_heap_ref_label(&first), 11);
+        assert_eq!(read_multi_heap_ref_label(&second), 22);
+        called_clone.set(true);
+    });
+
+    call_callback_with_two_heap_ref_args(&callback);
+
+    assert!(called.get(), "callback was not called");
+}
+
 // Tests for &mut dyn Fn with multiple arities
 pub(crate) fn test_mut_dyn_fn_many_arity() {
     #[wasm_bindgen(inline_js = r#"

@@ -8,6 +8,7 @@ members = [
     "examples/gloo",
     "examples/dioxus-web",
     "examples/yew",
+    "examples/leptos",
     "examples/piet",
     "examples/tiptap",
     "examples/openstreetmap"

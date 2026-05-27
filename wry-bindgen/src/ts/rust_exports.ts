@@ -4,10 +4,8 @@ import {
   MessageType,
   sync_request_binary,
   CALL_EXPORT_FN_ID,
-  prependJsToRustPrelude,
   allocateJsRequestId,
   pushMessageHeader,
-  rustCallResponseChannels,
 } from "./ipc";
 
 /**
@@ -18,7 +16,7 @@ const exportRegistry = new FinalizationRegistry<{ handle: number; className: str
   // Build Evaluate message to drop the object: call ClassName::__drop with handle
   const encoder = new DataEncoder();
   const requestId = allocateJsRequestId();
-  pushMessageHeader(encoder, MessageType.Evaluate, requestId, requestId);
+  pushMessageHeader(encoder, MessageType.Evaluate, requestId);
   encoder.pushU32(CALL_EXPORT_FN_ID);
   // Encode the export name as a string
   const dropName = `${info.className}::__drop`;
@@ -26,14 +24,8 @@ const exportRegistry = new FinalizationRegistry<{ handle: number; className: str
   // Encode the handle as u32
   encoder.pushU32(info.handle);
 
-  rustCallResponseChannels.push(requestId);
-  try {
-    prependJsToRustPrelude(encoder);
-    const response = sync_request_binary(`/__wbg__/handler`, encoder.finalize());
-    handleBinaryResponse(response, requestId);
-  } finally {
-    rustCallResponseChannels.pop();
-  }
+  const response = sync_request_binary(`/__wbg__/handler`, encoder.finalize());
+  handleBinaryResponse(response, requestId);
 });
 
 /**
@@ -45,7 +37,7 @@ function callExport(exportName: string, ...args: any[]): any {
 
   const encoder = new DataEncoder();
   const requestId = allocateJsRequestId();
-  pushMessageHeader(encoder, MessageType.Evaluate, requestId, requestId);
+  pushMessageHeader(encoder, MessageType.Evaluate, requestId);
   encoder.pushU32(CALL_EXPORT_FN_ID);
   // Encode the export name as a string
   encoder.pushStr(exportName);
@@ -58,9 +50,7 @@ function callExport(exportName: string, ...args: any[]): any {
     }
   }
 
-  rustCallResponseChannels.push(requestId);
   try {
-    prependJsToRustPrelude(encoder);
     const response = sync_request_binary(`/__wbg__/handler`, encoder.finalize());
     const decoder = handleBinaryResponse(response, requestId);
 
@@ -70,7 +60,6 @@ function callExport(exportName: string, ...args: any[]): any {
       return decoder.takeI32();
     }
   } finally {
-    rustCallResponseChannels.pop();
     window.jsHeap.popBorrowFrame();
   }
 

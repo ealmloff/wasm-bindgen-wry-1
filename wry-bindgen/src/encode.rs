@@ -525,6 +525,21 @@ impl<T: EncodeTypeDef, E: EncodeTypeDef> EncodeTypeDef for Result<T, E> {
     }
 }
 
+impl<T: BinaryEncode, E: BinaryEncode> BinaryEncode for Result<T, E> {
+    fn encode(self, encoder: &mut EncodedData) {
+        match self {
+            Ok(value) => {
+                encoder.push_u8(1);
+                value.encode(encoder);
+            }
+            Err(error) => {
+                encoder.push_u8(0);
+                error.encode(encoder);
+            }
+        }
+    }
+}
+
 impl<T: BinaryDecode, E: BinaryDecode> BinaryDecode for Result<T, E> {
     fn decode(decoder: &mut DecodedData) -> Result<Self, DecodeError> {
         let is_ok = decoder.take_u8()? != 0;
@@ -561,15 +576,25 @@ impl BinaryEncode for JsValue {
 
 impl BinaryDecode for JsValue {
     fn decode(decoder: &mut DecodedData) -> Result<Self, DecodeError> {
+        // JS-originated responses also defer heap-ref ID assignment to Rust.
+        // If the decoder is tied to a JS request/response ID, no heap ID is
+        // present on the wire.
+        if let Some(request_id) = decoder.deferred_heap_ref_request_id_opt() {
+            let id = with_runtime(|runtime| runtime.get_next_inbound_js_heap_id(request_id));
+            return Ok(JsValue::from_id(id));
+        }
+
         let id = decoder.take_u64()?;
         with_runtime(|runtime| runtime.observe_js_heap_id(id));
         Ok(JsValue::from_id(id))
     }
 
     fn decode_inbound(decoder: &mut DecodedData) -> Result<Self, DecodeError> {
-        // JS-originated heap refs are implicit on the wire. The JS-to-Rust
-        // prelude assigns the whole frame before argument decoding begins.
-        Ok(JsValue::from_id(decoder.take_deferred_heap_ref_id()?))
+        // JS-originated heap refs are implicit on the wire. Allocate each Rust
+        // heap ID as the callback signature actually decodes a JsValue.
+        let request_id = decoder.deferred_heap_ref_request_id()?;
+        let id = with_runtime(|runtime| runtime.get_next_inbound_js_heap_id(request_id));
+        Ok(JsValue::from_id(id))
     }
 }
 
@@ -603,35 +628,53 @@ impl_value_type!(
 );
 
 /// Marker trait for types that can be cheaply cloned for encoding.
-pub trait CloneForEncode: Clone {}
-
-impl CloneForEncode for bool {}
-impl CloneForEncode for u8 {}
-impl CloneForEncode for u16 {}
-impl CloneForEncode for u32 {}
-impl CloneForEncode for u64 {}
-impl CloneForEncode for i8 {}
-impl CloneForEncode for i16 {}
-impl CloneForEncode for i32 {}
-impl CloneForEncode for i64 {}
-impl CloneForEncode for f32 {}
-impl CloneForEncode for f64 {}
-impl CloneForEncode for usize {}
-impl CloneForEncode for isize {}
-impl CloneForEncode for String {}
-
-// Blanket implementation for references to types that implement CloneForEncode
-// Note: We only implement for P=() to avoid conflicts with RustCallbackMarker impls
-impl<T: BinaryEncode + CloneForEncode> BinaryEncode for &T {
-    fn encode(self, encoder: &mut EncodedData) {
-        self.clone().encode(encoder);
-    }
+macro_rules! ref_encode_via_clone {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl BinaryEncode for &$ty {
+                fn encode(self, encoder: &mut EncodedData) {
+                    self.clone().encode(encoder);
+                }
+            }
+        )*
+    };
 }
 
-// When encoding JsValue references, encode the underlying ID
-impl BinaryEncode for &JsValue {
+ref_encode_via_clone!(
+    bool, u8, u16, u32, u64, i8, i16, i32, i64, f32, f64, usize, isize, String,
+);
+
+macro_rules! slice_encode_via_copy {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl BinaryEncode for &[$ty] {
+                fn encode(self, encoder: &mut EncodedData) {
+                    encoder.push_u32(self.len() as u32);
+                    for val in self {
+                        (*val).encode(encoder);
+                    }
+                }
+            }
+
+            impl BinaryEncode for &mut [$ty] {
+                fn encode(self, encoder: &mut EncodedData) {
+                    encoder.push_u32(self.len() as u32);
+                    for val in self {
+                        (*val).encode(encoder);
+                    }
+                }
+            }
+        )*
+    };
+}
+
+slice_encode_via_copy!(
+    bool, u8, u16, u32, u64, i8, i16, i32, i64, f32, f64, usize, isize
+);
+
+impl<T: crate::convert::JsGeneric> BinaryEncode for &T {
     fn encode(self, encoder: &mut EncodedData) {
-        encoder.push_u64(self.id());
+        encoder.push_u64(self.as_ref().id());
     }
 }
 
@@ -666,7 +709,7 @@ impl<F: ?Sized> BinaryEncode for CallbackKey<F> {
 }
 
 // Blanket impl: All Closures encode as HeapRef since they're JS heap references
-impl<T: ?Sized> EncodeTypeDef for crate::Closure<T> {
+impl<T: ?Sized> EncodeTypeDef for crate::ScopedClosure<'_, T> {
     fn encode_type_def(buf: &mut Vec<u8>) {
         JsValue::encode_type_def(buf);
     }
@@ -715,7 +758,7 @@ macro_rules! impl_fnmut_stub {
         }
 
         // Implement WasmClosure trait for dyn FnMut variants
-        impl<R, $($arg,)*> crate::WasmClosure<fn($($arg),*) -> R> for dyn FnMut($($arg),*) -> R
+        impl<R, $($arg,)*> crate::WryWasmClosure<fn($($arg),*) -> R> for dyn FnMut($($arg),*) -> R
             where
             $($arg: BinaryDecode + EncodeTypeDef + 'static, )*
             R: BinaryEncode + EncodeTypeDef + 'static,
@@ -735,9 +778,18 @@ macro_rules! impl_fnmut_stub {
             }
         }
 
+        impl<R, $($arg,)*> crate::WasmClosure for dyn FnMut($($arg),*) -> R
+            where
+            $($arg: 'static, )*
+            R: 'static,
+        {
+            type Static = dyn FnMut($($arg),*) -> R;
+            type AsMut = dyn FnMut($($arg),*) -> R;
+        }
+
         // Implement WasmClosure trait for dyn Fn variants (immutable closures)
         // These CAN be called reentrantly since Fn only needs &self
-        impl<R, $($arg,)*> crate::WasmClosure<fn($($arg),*) -> R> for dyn Fn($($arg),*) -> R
+        impl<R, $($arg,)*> crate::WryWasmClosure<fn($($arg),*) -> R> for dyn Fn($($arg),*) -> R
             where
             $($arg: BinaryDecode + EncodeTypeDef + 'static, )*
             R: BinaryEncode + EncodeTypeDef + 'static,
@@ -755,6 +807,15 @@ macro_rules! impl_fnmut_stub {
                     }
                 )
             }
+        }
+
+        impl<R, $($arg,)*> crate::WasmClosure for dyn Fn($($arg),*) -> R
+            where
+            $($arg: 'static, )*
+            R: 'static,
+        {
+            type Static = dyn Fn($($arg),*) -> R;
+            type AsMut = dyn FnMut($($arg),*) -> R;
         }
 
         // IntoClosure for F: FnMut -> Closure<dyn FnMut>
@@ -1025,6 +1086,7 @@ impl_fnmut_stub!(A1, A2, A3, A4);
 impl_fnmut_stub!(A1, A2, A3, A4, A5);
 impl_fnmut_stub!(A1, A2, A3, A4, A5, A6);
 impl_fnmut_stub!(A1, A2, A3, A4, A5, A6, A7);
+impl_fnmut_stub!(A1, A2, A3, A4, A5, A6, A7, A8);
 
 /// Marker type for closures that borrow the first argument.
 pub struct BorrowedFirstArg;
@@ -1060,7 +1122,7 @@ macro_rules! impl_fnmut_stub_ref {
         }
 
         // WasmClosure for dyn FnMut(&First, ...) -> R
-        impl<R, $first, $($rest,)*> crate::WasmClosure<(BorrowedFirstArg, fn(&$first, $($rest),*) -> R)> for dyn FnMut(&$first, $($rest),*) -> R
+        impl<R, $first, $($rest,)*> crate::WryWasmClosure<(BorrowedFirstArg, fn(&$first, $($rest),*) -> R)> for dyn FnMut(&$first, $($rest),*) -> R
             where
             $first: RefFromBinaryDecode + EncodeTypeDef + 'static,
             $($rest: BinaryDecode + EncodeTypeDef + 'static,)*
@@ -1081,7 +1143,7 @@ macro_rules! impl_fnmut_stub_ref {
         }
 
         // WasmClosure for dyn Fn(&First, ...) -> R (supports reentrant calls)
-        impl<R, $first, $($rest,)*> crate::WasmClosure<(BorrowedFirstArg, fn(&$first, $($rest),*) -> R)> for dyn Fn(&$first, $($rest),*) -> R
+        impl<R, $first, $($rest,)*> crate::WryWasmClosure<(BorrowedFirstArg, fn(&$first, $($rest),*) -> R)> for dyn Fn(&$first, $($rest),*) -> R
             where
             $first: RefFromBinaryDecode + EncodeTypeDef + 'static,
             $($rest: BinaryDecode + EncodeTypeDef + 'static,)*
@@ -1152,6 +1214,7 @@ impl_fnmut_stub_ref!(A1, A2, A3, A4);
 impl_fnmut_stub_ref!(A1, A2, A3, A4, A5);
 impl_fnmut_stub_ref!(A1, A2, A3, A4, A5, A6);
 impl_fnmut_stub_ref!(A1, A2, A3, A4, A5, A6, A7);
+impl_fnmut_stub_ref!(A1, A2, A3, A4, A5, A6, A7, A8);
 
 /// Macro to implement WasmClosureFnOnce for FnOnce closures of various arities.
 /// This wraps an FnOnce in an FnMut that panics if called more than once.
@@ -1191,6 +1254,7 @@ impl_fn_once!(A1, A2, A3, A4);
 impl_fn_once!(A1, A2, A3, A4, A5);
 impl_fn_once!(A1, A2, A3, A4, A5, A6);
 impl_fn_once!(A1, A2, A3, A4, A5, A6, A7);
+impl_fn_once!(A1, A2, A3, A4, A5, A6, A7, A8);
 
 /// Macro to implement WasmClosureFnOnce for FnOnce closures that borrow the first argument.
 /// This uses RefFromBinaryDecode for the first arg and BinaryDecode for the rest.
@@ -1228,6 +1292,7 @@ impl_fn_once_ref!(A1, A2, A3, A4);
 impl_fn_once_ref!(A1, A2, A3, A4, A5);
 impl_fn_once_ref!(A1, A2, A3, A4, A5, A6);
 impl_fn_once_ref!(A1, A2, A3, A4, A5, A6, A7);
+impl_fn_once_ref!(A1, A2, A3, A4, A5, A6, A7, A8);
 
 impl<F: ?Sized> BinaryDecode for crate::Closure<F> {
     fn decode(decoder: &mut DecodedData) -> Result<Self, DecodeError> {
@@ -1254,14 +1319,21 @@ impl<F: ?Sized> BinaryDecode for crate::Closure<F> {
 
 impl<F: ?Sized> BinaryEncode for crate::Closure<F> {
     fn encode(self, encoder: &mut EncodedData) {
+        let rust_owned = self.rust_callback.is_some();
         let this = core::mem::ManuallyDrop::new(self);
+        if rust_owned {
+            encoder.mark_needs_flush();
+        }
         (&this.value).encode(encoder);
         crate::batch::queue_js_drop(this.value.id());
     }
 }
 
-impl<F: ?Sized> BinaryEncode for &crate::Closure<F> {
+impl<F: ?Sized> BinaryEncode for &crate::ScopedClosure<'_, F> {
     fn encode(self, encoder: &mut EncodedData) {
+        if self.rust_callback.is_some() {
+            encoder.mark_needs_flush();
+        }
         // Encode the JsValue
         (&self.value).encode(encoder);
     }
@@ -1341,24 +1413,24 @@ impl<T: BinaryDecode> BatchableResult for Vec<T> {}
 
 impl<T> BinaryEncode for &[T]
 where
-    for<'a> &'a T: BinaryEncode,
+    T: crate::convert::JsGeneric,
 {
     fn encode(self, encoder: &mut EncodedData) {
         encoder.push_u32(self.len() as u32);
         for val in self {
-            val.encode(encoder);
+            encoder.push_u64(val.as_ref().id());
         }
     }
 }
 
 impl<T> BinaryEncode for &mut [T]
 where
-    for<'a> &'a T: BinaryEncode,
+    T: crate::convert::JsGeneric,
 {
     fn encode(self, encoder: &mut EncodedData) {
         encoder.push_u32(self.len() as u32);
         for val in self {
-            val.encode(encoder);
+            encoder.push_u64(val.as_ref().id());
         }
     }
 }

@@ -76,6 +76,8 @@ pub struct ImportType {
     pub vis: Visibility,
     /// Rust type name
     pub rust_name: Ident,
+    /// Generic parameters on the imported Rust type
+    pub generics: syn::Generics,
     /// JavaScript name (may differ from rust_name)
     pub js_name: String,
     /// Parent types (from `extends` attributes)
@@ -88,6 +90,8 @@ pub struct ImportType {
     pub vendor_prefixes: Vec<Ident>,
     /// Custom is_type_of expression for type checking
     pub is_type_of: Option<syn::Expr>,
+    /// Whether automatic upcast impls should be suppressed
+    pub no_upcast: bool,
 }
 
 /// An imported JavaScript function
@@ -97,6 +101,8 @@ pub struct ImportFunction {
     pub vis: Visibility,
     /// Rust function name
     pub rust_name: Ident,
+    /// Generic parameters on the imported Rust function
+    pub generics: syn::Generics,
     /// JavaScript name (may differ from rust_name)
     pub js_name: String,
     /// The class this method belongs to (if any)
@@ -684,6 +690,12 @@ fn extract_wasm_bindgen_attrs(attrs: &[syn::Attribute]) -> syn::Result<BindgenAt
             if let Some(v) = parsed.is_type_of {
                 combined.is_type_of = Some(v);
             }
+            if let Some(span) = parsed.no_upcast {
+                combined.no_upcast = Some(span);
+            }
+            if let Some(span) = parsed.no_promising {
+                combined.no_promising = Some(span);
+            }
             combined.vendor_prefixes.extend(parsed.vendor_prefixes);
         }
     }
@@ -760,9 +772,9 @@ fn parse_foreign_fn(f: syn::ForeignItemFn, attrs: BindgenAttrs) -> syn::Result<I
             js_class.clone().unwrap_or_else(|| js_name.clone())
         };
         ImportFunctionKind::Constructor { class }
-    } else if let Some((_, ref ident)) = attrs.static_method_of {
+    } else if let Some((_, ref class)) = attrs.static_method_of {
         ImportFunctionKind::StaticMethod {
-            class: ident.to_string(),
+            class: class.clone(),
         }
     } else if attrs.is_getter() {
         let receiver = receiver.ok_or_else(|| {
@@ -822,6 +834,7 @@ fn parse_foreign_fn(f: syn::ForeignItemFn, attrs: BindgenAttrs) -> syn::Result<I
     Ok(ImportFunction {
         vis: f.vis,
         rust_name,
+        generics: f.sig.generics,
         js_name,
         js_class,
         js_namespace,
@@ -860,12 +873,14 @@ fn parse_foreign_type(t: syn::ForeignItemType, attrs: BindgenAttrs) -> syn::Resu
     Ok(ImportType {
         vis: t.vis,
         rust_name,
+        generics: t.generics,
         js_name,
         extends,
         typescript_type,
         derives,
         vendor_prefixes,
         is_type_of,
+        no_upcast: attrs.no_upcast.is_some(),
     })
 }
 

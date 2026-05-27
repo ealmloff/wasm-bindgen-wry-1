@@ -34,14 +34,10 @@ const CALL_EXPORT_FN_ID = 0xfffffffe;
 
 interface MessageHeader {
   requestId: number;
-  responseChannelId: number;
 }
 
 let nextJsRequestId = 1;
-const rustCallResponseChannels: number[] = [];
-
-const pendingTypeCacheAcks: Set<number> = new Set();
-const pendingHeapRefInstallAcks: Set<number> = new Set();
+const installedDeferredHeapRefRequests: Set<number> = new Set();
 
 function allocateJsRequestId(): number {
   const id = nextJsRequestId;
@@ -52,19 +48,13 @@ function allocateJsRequestId(): number {
   return id;
 }
 
-function currentResponseChannelId(): number {
-  return rustCallResponseChannels[rustCallResponseChannels.length - 1] ?? 0;
-}
-
 function pushMessageHeader(
   encoder: DataEncoder,
   msgType: MessageType,
-  requestId: number,
-  responseChannelId: number
+  requestId: number
 ): void {
   encoder.pushU8(msgType);
   encoder.pushU32(requestId);
-  encoder.pushU32(responseChannelId);
 }
 
 function takeMessageHeader(decoder: DataDecoder): {
@@ -76,31 +66,8 @@ function takeMessageHeader(decoder: DataDecoder): {
     msgType: rawMsgType,
     header: {
       requestId: decoder.takeU32(),
-      responseChannelId: decoder.takeU32(),
     },
   };
-}
-
-function prependJsToRustPrelude(encoder: DataEncoder): void {
-  const heapRefInstallAckIds = Array.from(pendingHeapRefInstallAcks);
-  pendingHeapRefInstallAcks.clear();
-
-  const typeCacheAckIds = Array.from(pendingTypeCacheAcks);
-  pendingTypeCacheAcks.clear();
-
-  const prelude: number[] = [
-    encoder.deferredHeapRefRequestId(),
-    encoder.deferredHeapRefCount(),
-    heapRefInstallAckIds.length,
-  ];
-  for (const id of heapRefInstallAckIds) {
-    prelude.push(id);
-  }
-  prelude.push(typeCacheAckIds.length);
-  for (const id of typeCacheAckIds) {
-    prelude.push(id);
-  }
-  encoder.insertU32s(2, prelude);
 }
 
 /**
@@ -191,7 +158,6 @@ function parseTypeInfo(decoder: DataDecoder): CachedTypeInfo {
 
     const cached: CachedTypeInfo = { paramTypes, returnType };
     typeCache.set(typeId, cached);
-    pendingTypeCacheAcks.add(typeId);
     return cached;
   } else {
     throw new Error(`Unknown type marker: ${typeMarker}`);
@@ -213,11 +179,14 @@ function installDeferredHeapRefFrames(decoder: DataDecoder): void {
     const requestId = decoder.takeU32();
     const ids = takeIdList(decoder);
     const dropAfterInstall = takeIdList(decoder);
-    window.jsHeap.resolveDeferredHeapRefs(requestId, ids);
+    const installed = window.jsHeap.resolveDeferredHeapRefs(requestId, ids);
+    if (!installed && !installedDeferredHeapRefRequests.has(requestId)) {
+      throw new Error(`Unknown deferred heap-ref request ID: ${requestId}`);
+    }
+    installedDeferredHeapRefRequests.add(requestId);
     for (const id of dropAfterInstall) {
       window.jsHeap.remove(id);
     }
-    pendingHeapRefInstallAcks.add(requestId);
   }
 }
 
@@ -260,13 +229,9 @@ function handleBinaryResponse(
     const reservedIds = takeIdList(decoder);
     window.jsHeap.pushReservationScope(reservedIds);
 
-    const encoder = new DataEncoder();
-    pushMessageHeader(
-      encoder,
-      MessageType.Respond,
-      header.requestId,
-      currentResponseChannelId()
-    );
+    const pendingHeapRefs = window.jsHeap.deferHeapRefs(header.requestId);
+    const encoder = new DataEncoder(pendingHeapRefs);
+    pushMessageHeader(encoder, MessageType.Respond, header.requestId);
 
     // Push a single borrow frame for this entire Evaluate message
     // This frame persists across all operations and nested calls
@@ -316,12 +281,11 @@ function handleBinaryResponse(
     // Pop the reservation scope
     window.jsHeap.popReservationScope();
 
-    prependJsToRustPrelude(encoder);
-
     const nextResponse = sync_request_binary(
       `/__wbg__/handler`,
       encoder.finalize()
     );
+    window.jsHeap.releaseEmptyDeferredHeapRefs(pendingHeapRefs);
     return handleBinaryResponse(nextResponse, expectedRespondRequestId);
   }
 
@@ -339,8 +303,6 @@ export {
   MessageType,
   DROP_NATIVE_REF_FN_ID,
   CALL_EXPORT_FN_ID,
-  prependJsToRustPrelude,
   allocateJsRequestId,
   pushMessageHeader,
-  rustCallResponseChannels,
 };

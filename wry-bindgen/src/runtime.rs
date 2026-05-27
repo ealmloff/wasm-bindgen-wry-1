@@ -16,7 +16,7 @@ use crate::BinaryDecode;
 use crate::batch::with_runtime;
 use crate::function::{CALL_EXPORT_FN_ID, DROP_NATIVE_REF_FN_ID, RustCallback};
 use crate::ipc::MessageType;
-use crate::ipc::{DecodedData, DecodedVariant, IPCMessage};
+use crate::ipc::{DecodedData, DecodedVariant, InboundIPCMessage, OutboundIPCMessage};
 use crate::object_store::ObjectHandle;
 
 /// Application-level events that can be sent through the event loop.
@@ -36,7 +36,7 @@ impl WryBindgenEvent {
     }
 
     /// Create a new IPC event.
-    pub(crate) fn ipc(id: u64, msg: IPCMessage) -> Self {
+    pub(crate) fn ipc(id: u64, msg: OutboundIPCMessage) -> Self {
         Self {
             id,
             event: AppEventVariant::Ipc(msg),
@@ -60,20 +60,20 @@ impl WryBindgenEvent {
 #[derive(Debug, Clone)]
 pub(crate) enum AppEventVariant {
     /// An IPC message from JavaScript
-    Ipc(IPCMessage),
+    Ipc(OutboundIPCMessage),
     /// The webview has finished loading
     WebviewLoaded,
 }
 
 #[derive(Clone)]
 pub(crate) struct IPCSenders {
-    eval_sender: Sender<IPCMessage>,
-    respond_sender: futures_channel::mpsc::UnboundedSender<IPCMessage>,
+    eval_sender: Sender<InboundIPCMessage>,
+    respond_sender: futures_channel::mpsc::UnboundedSender<InboundIPCMessage>,
 }
 
 impl IPCSenders {
-    pub(crate) fn start_send(&self, msg: IPCMessage) {
-        match msg.ty().unwrap() {
+    pub(crate) fn start_send(&self, msg: InboundIPCMessage) {
+        match msg.message.ty().unwrap() {
             MessageType::Evaluate => {
                 self.eval_sender
                     .try_send(msg)
@@ -89,13 +89,13 @@ impl IPCSenders {
 }
 
 struct IPCReceivers {
-    eval_receiver: Pin<Box<Receiver<IPCMessage>>>,
-    respond_receiver: futures_channel::mpsc::UnboundedReceiver<IPCMessage>,
-    buffered_responds: BTreeMap<u32, IPCMessage>,
+    eval_receiver: Pin<Box<Receiver<InboundIPCMessage>>>,
+    respond_receiver: futures_channel::mpsc::UnboundedReceiver<InboundIPCMessage>,
+    buffered_responds: BTreeMap<u32, InboundIPCMessage>,
 }
 
 impl IPCReceivers {
-    pub fn recv_blocking(&mut self) -> Option<IPCMessage> {
+    pub fn recv_blocking(&mut self) -> Option<InboundIPCMessage> {
         pollster::block_on(async {
             let Self {
                 eval_receiver,
@@ -115,15 +115,15 @@ impl IPCReceivers {
         })
     }
 
-    pub fn recv_blocking_for(&mut self, request_id: u32) -> Option<IPCMessage> {
+    pub fn recv_blocking_for(&mut self, request_id: u32) -> Option<InboundIPCMessage> {
         if let Some(msg) = self.buffered_responds.remove(&request_id) {
             return Some(msg);
         }
 
         loop {
             let msg = self.recv_blocking()?;
-            if msg.ty().ok()? == MessageType::Respond {
-                let response_id = msg.header().ok()?.request_id;
+            if msg.message.ty().ok()? == MessageType::Respond {
+                let response_id = msg.message.header().ok()?.request_id;
                 if response_id != request_id {
                     self.buffered_responds.insert(response_id, msg);
                     continue;
@@ -162,7 +162,7 @@ impl WryIPC {
     }
 
     /// Send a response back to JavaScript.
-    pub(crate) fn js_response(&self, id: u64, responder: IPCMessage) {
+    pub(crate) fn js_response(&self, id: u64, responder: OutboundIPCMessage) {
         (self.proxy)(WryBindgenEvent::ipc(id, responder));
     }
 }
@@ -178,16 +178,22 @@ pub(crate) fn progress_js_with<O>(
             .write()
             .recv_blocking_for(request_id)
     })?;
+    with_runtime(|runtime| {
+        runtime.apply_js_consumed_actions(response.js_consumed_actions.iter().copied())
+    });
 
-    let decoder = response.decoded().expect("Failed to decode response");
+    let decoder = response
+        .message
+        .decoded()
+        .expect("Failed to decode response");
     match decoder {
         DecodedVariant::Respond { header, mut data } => {
             debug_assert_eq!(header.request_id, request_id);
-            consume_js_to_rust_prelude(&mut data);
+            consume_js_to_rust_prelude(&mut data, Some(header.request_id));
             Some(with_respond(data))
         }
         DecodedVariant::Evaluate { header, mut data } => {
-            consume_js_to_rust_prelude(&mut data);
+            consume_js_to_rust_prelude(&mut data, Some(header.request_id));
             with_runtime(|runtime| runtime.push_inbound_js_request(header.request_id));
             handle_rust_callback(&mut data);
             with_runtime(|runtime| runtime.pop_inbound_js_request(header.request_id));
@@ -200,11 +206,17 @@ pub async fn handle_callbacks() {
     let receiver = with_runtime(|runtime| runtime.ipc().receivers.read().eval_receiver.clone());
 
     while let Ok(response) = receiver.recv().await {
-        let decoder = response.decoded().expect("Failed to decode response");
+        with_runtime(|runtime| {
+            runtime.apply_js_consumed_actions(response.js_consumed_actions.iter().copied())
+        });
+        let decoder = response
+            .message
+            .decoded()
+            .expect("Failed to decode response");
         match decoder {
             DecodedVariant::Respond { .. } => unreachable!(),
             DecodedVariant::Evaluate { header, mut data } => {
-                consume_js_to_rust_prelude(&mut data);
+                consume_js_to_rust_prelude(&mut data, Some(header.request_id));
                 with_runtime(|runtime| runtime.push_inbound_js_request(header.request_id));
                 handle_rust_callback(&mut data);
                 with_runtime(|runtime| runtime.pop_inbound_js_request(header.request_id));
@@ -213,42 +225,10 @@ pub async fn handle_callbacks() {
     }
 }
 
-fn consume_js_to_rust_prelude(data: &mut DecodedData) {
-    let heap_ref_request_id = data
-        .take_u32()
-        .expect("Failed to read deferred heap-ref request ID");
-    let heap_ref_count = data
-        .take_u32()
-        .expect("Failed to read deferred heap-ref count");
-    let deferred_heap_ref_ids = match (heap_ref_request_id, heap_ref_count) {
-        (_, 0) => alloc::vec::Vec::new(),
-        (0, _) => panic!("Deferred heap refs require a non-zero request ID"),
-        (request_id, count) => {
-            with_runtime(|runtime| runtime.get_next_inbound_js_heap_ids(request_id, count))
-        }
-    };
-    data.set_deferred_heap_ref_ids(deferred_heap_ref_ids);
-
-    let install_ack_count = data
-        .take_u32()
-        .expect("Failed to read heap-ref install ack count");
-    let mut install_ack_ids = alloc::vec::Vec::with_capacity(install_ack_count as usize);
-    for _ in 0..install_ack_count {
-        install_ack_ids.push(
-            data.take_u32()
-                .expect("Failed to read heap-ref install ack ID"),
-        );
+fn consume_js_to_rust_prelude(data: &mut DecodedData, deferred_heap_ref_request_id: Option<u32>) {
+    if let Some(request_id) = deferred_heap_ref_request_id {
+        data.set_deferred_heap_ref_request_id(request_id);
     }
-    with_runtime(|runtime| runtime.ack_pending_install_ids(install_ack_ids));
-
-    let ack_count = data
-        .take_u32()
-        .expect("Failed to read type-cache ack count");
-    let mut acked_ids = alloc::vec::Vec::with_capacity(ack_count as usize);
-    for _ in 0..ack_count {
-        acked_ids.push(data.take_u32().expect("Failed to read type-cache ack ID"));
-    }
-    with_runtime(|runtime| runtime.ack_type_ids(acked_ids));
 }
 
 /// Handle a Rust callback invocation from JavaScript.
@@ -316,31 +296,26 @@ fn handle_rust_callback(data: &mut DecodedData) {
         }
         _ => todo!(),
     };
-    assert!(
-        data.deferred_heap_refs_complete(),
-        "JS deferred heap-ref prelude did not match decoded callback arguments"
-    );
     with_runtime(|runtime| runtime.ipc().js_response(runtime.webview_id(), response));
 }
 
 fn respond_encoder() -> crate::ipc::EncodedData {
     let mut encoder = crate::ipc::EncodedData::new();
     encoder.push_u8(MessageType::Respond as u8);
-    let response_channel_id = with_runtime(|runtime| runtime.current_response_channel_id());
+    let request_id = with_runtime(|runtime| runtime.current_js_request_id());
     assert_ne!(
-        response_channel_id, 0,
+        request_id, None,
         "Rust response created outside a JS-originated request"
     );
-    encoder.push_u32(response_channel_id);
-    encoder.push_u32(response_channel_id);
+    encoder.push_u32(request_id.expect("checked above"));
     encoder
 }
 
-fn finish_respond_message(encoder: crate::ipc::EncodedData) -> IPCMessage {
+fn finish_respond_message(encoder: crate::ipc::EncodedData) -> OutboundIPCMessage {
     with_runtime(|runtime| runtime.finish_respond_message(encoder))
 }
 
-fn new_respond_message(push_data: impl FnOnce(&mut crate::ipc::EncodedData)) -> IPCMessage {
+fn new_respond_message(push_data: impl FnOnce(&mut crate::ipc::EncodedData)) -> OutboundIPCMessage {
     let mut encoder = respond_encoder();
     push_data(&mut encoder);
     finish_respond_message(encoder)

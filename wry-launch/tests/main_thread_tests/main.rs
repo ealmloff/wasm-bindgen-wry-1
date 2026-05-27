@@ -128,6 +128,7 @@ async fn run_main_thread_tests() {
     test_with_js_context(callbacks::test_mut_dyn_fnmut).await;
     test_with_js_context(callbacks::test_batch_flushed_heap_ref_return_with_stack_callback).await;
     test_with_js_context(callbacks::test_js_callback_heap_ref_arg_with_pending_placeholders).await;
+    test_with_js_context(callbacks::test_js_callback_multiple_heap_ref_args_share_request_id).await;
     test_with_js_context(callbacks::test_mut_dyn_fn_many_arity).await;
     test_with_js_context(callbacks::test_mut_dyn_fnmut_many_arity).await;
 

@@ -163,23 +163,13 @@ impl HeapIds {
         id
     }
 
-    fn next_inbound_js_heap_ids(&mut self, request_id: u32, count: u32) -> Vec<u64> {
-        if count == 0 {
-            return Vec::new();
-        }
-
-        assert!(
-            !self.pending_install_ids.contains_key(&request_id),
-            "Attempted to allocate deferred heap-ref IDs twice for request {request_id}"
-        );
-
-        let mut ids = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            ids.push(self.slab.alloc());
-        }
-
-        self.pending_install_ids.insert(request_id, ids.clone());
-        ids
+    fn next_inbound_js_heap_id(&mut self, request_id: u32) -> u64 {
+        let id = self.slab.alloc();
+        self.pending_install_ids
+            .entry(request_id)
+            .or_default()
+            .push(id);
+        id
     }
 
     fn release_heap_id(&mut self, id: u64) -> Option<u64> {
@@ -363,8 +353,8 @@ impl IdAllocator {
         self.heap.next_placeholder_id()
     }
 
-    pub(crate) fn next_inbound_js_heap_ids(&mut self, request_id: u32, count: u32) -> Vec<u64> {
-        self.heap.next_inbound_js_heap_ids(request_id, count)
+    pub(crate) fn next_inbound_js_heap_id(&mut self, request_id: u32) -> u64 {
+        self.heap.next_inbound_js_heap_id(request_id)
     }
 
     /// Get the next borrow ID from the borrow stack (indices 1-127).
@@ -498,8 +488,7 @@ mod tests {
     #[test]
     fn pending_install_drop_recycles_only_after_ack() {
         let mut heap = HeapIds::new();
-        let ids = heap.next_inbound_js_heap_ids(7, 1);
-        let id = ids[0];
+        let id = heap.next_inbound_js_heap_id(7);
         assert_eq!(heap.release_heap_id(id), None);
 
         let next = heap.next_placeholder_id();
@@ -510,9 +499,12 @@ mod tests {
     }
 
     #[test]
-    fn inbound_heap_ids_are_allocated_as_complete_frames() {
+    fn inbound_heap_ids_are_allocated_lazily_into_one_frame() {
         let mut heap = HeapIds::new();
-        let ids = heap.next_inbound_js_heap_ids(7, 2);
+        let ids = [
+            heap.next_inbound_js_heap_id(7),
+            heap.next_inbound_js_heap_id(7),
+        ];
         assert_eq!(ids, [JSIDX_RESERVED, JSIDX_RESERVED + 1]);
 
         let batches = heap.pending_install_id_batches();

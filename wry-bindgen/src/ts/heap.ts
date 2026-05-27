@@ -8,20 +8,16 @@ const JSIDX_RESERVED = JSIDX_OFFSET + 4;
 
 // Object store implementation for JS heap types
 class DeferredHeapRefs {
-  private heap: JSHeap;
-  private requestId: number;
-  private values: unknown[];
-  private resolved: boolean;
+  declare private heap: JSHeap;
+  declare private requestId: number;
+  declare private values: unknown[];
+  declare private resolved: boolean;
 
   constructor(heap: JSHeap, requestId: number) {
     this.heap = heap;
     this.requestId = requestId;
     this.values = [];
     this.resolved = false;
-  }
-
-  id(): number {
-    return this.values.length === 0 ? 0 : this.requestId;
   }
 
   rawId(): number {
@@ -70,23 +66,20 @@ class DeferredHeapRefs {
 }
 
 class JSHeap {
-  private slots: Map<number, unknown>;
-  private freeIds: Set<number>;
-  private heapObjectCount: number;
-  private maxId: number;
+  declare private slots: Map<number, unknown>;
+  declare private heapObjectCount: number;
   // Borrow stack uses indices 1-127, growing downward from 127 to 1
-  private borrowStackPointer: number;
+  declare private borrowStackPointer: number;
   // Frame stack for nested operations - saves borrow stack pointers
-  private borrowFrameStack: number[];
+  declare private borrowFrameStack: number[];
   // Stack of reservation scopes: each scope tracks exact IDs reserved by Rust
-  private reservationStack: { ids: number[]; nextIndex: number }[];
-  private deferredHeapRefRequestId: number;
-  private deferredHeapRefs: Map<number, DeferredHeapRefs>;
+  declare private reservationStack: { ids: number[]; nextIndex: number }[];
+  declare private deferredHeapRefs: Map<number, DeferredHeapRefs>;
 
   constructor() {
     // Slots 0-127 are for borrow stack (1-127 usable), slots 128-131
-    // are reserved for special values, and heap allocation starts at 132.
-    // A Map avoids sparse array slowdowns as Rust reserves high placeholder IDs.
+    // are reserved for special values.
+    // A Map avoids sparse array slowdowns as Rust assigns high heap IDs.
     this.slots = new Map();
 
     this.slots.set(JSIDX_NULL, null);
@@ -94,59 +87,41 @@ class JSHeap {
     this.slots.set(JSIDX_FALSE, false);
     this.slots.set(JSIDX_UNDEFINED, undefined);
 
-    this.freeIds = new Set();
     this.heapObjectCount = 0;
-    // Start allocating from JSIDX_RESERVED (132)
-    this.maxId = JSIDX_RESERVED;
     // Borrow stack pointer starts at 128 (just below reserved values)
     this.borrowStackPointer = JSIDX_OFFSET;
     // Frame stack starts empty
     this.borrowFrameStack = [];
     // Reservation stack starts empty
     this.reservationStack = [];
-    this.deferredHeapRefRequestId = 1;
     this.deferredHeapRefs = new Map();
   }
 
-  insert(value: unknown): number {
-    const freeId = this.freeIds.values().next();
-    let id: number;
-    if (freeId.done) {
-      id = this.maxId;
-      this.maxId++;
-    } else {
-      id = freeId.value;
-      this.freeIds.delete(id);
-    }
-    this.slots.set(id, value);
-    this.heapObjectCount++;
-    return id;
-  }
-
   insertAt(id: number, value: unknown): void {
+    if (id < JSIDX_RESERVED) {
+      throw new Error(`Cannot install heap ref into special slot ${id}`);
+    }
     if (id >= JSIDX_RESERVED && !this.slots.has(id)) {
       this.heapObjectCount++;
     }
-    this.freeIds.delete(id);
     this.slots.set(id, value);
-    this.maxId = Math.max(this.maxId, id + 1);
   }
 
-  deferHeapRefs(): DeferredHeapRefs {
-    const requestId = this.deferredHeapRefRequestId++;
+  deferHeapRefs(requestId: number): DeferredHeapRefs {
     const refs = new DeferredHeapRefs(this, requestId);
     this.deferredHeapRefs.set(requestId, refs);
     return refs;
   }
 
-  resolveDeferredHeapRefs(requestId: number, ids: number[]): void {
+  resolveDeferredHeapRefs(requestId: number, ids: number[]): boolean {
     const refs = this.deferredHeapRefs.get(requestId);
     if (!refs) {
-      return;
+      return false;
     }
 
     refs.resolve(ids);
     this.deferredHeapRefs.delete(requestId);
+    return true;
   }
 
   releaseEmptyDeferredHeapRefs(refs: DeferredHeapRefs): void {
@@ -160,13 +135,22 @@ class JSHeap {
   pushReservationScope(ids: number[]): void {
     this.reservationStack.push({ ids, nextIndex: 0 });
     for (const id of ids) {
-      this.freeIds.delete(id);
-      this.maxId = Math.max(this.maxId, id + 1);
+      if (id < JSIDX_RESERVED) {
+        throw new Error(`Cannot reserve special heap slot ${id}`);
+      }
+      if (this.slots.has(id)) {
+        throw new Error(`Reserved heap slot ${id} is already occupied`);
+      }
     }
   }
 
   popReservationScope(): void {
-    this.reservationStack.pop();
+    const scope = this.reservationStack.pop();
+    if (scope && scope.nextIndex !== scope.ids.length) {
+      throw new Error(
+        `Only filled ${scope.nextIndex} of ${scope.ids.length} reserved heap slots`
+      );
+    }
   }
 
   // Fill the next reserved slot in the current scope
@@ -197,7 +181,6 @@ class JSHeap {
     const value = this.slots.get(id);
 
     this.slots.delete(id);
-    this.freeIds.add(id);
     this.heapObjectCount--;
     return value;
   }

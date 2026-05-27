@@ -112,7 +112,7 @@ class StringType implements TypeClass {
  * Type class for string enum values with u32 encoding and lookup arrays
  */
 class StringEnumType implements TypeClass {
-  private lookupArray: string[];
+  declare private lookupArray: string[];
 
   constructor(lookupArray: string[]) {
     this.lookupArray = lookupArray;
@@ -135,8 +135,8 @@ class StringEnumType implements TypeClass {
  * Type class for Rust callbacks with encoding/decoding methods
  */
 class CallbackType implements TypeClass {
-  private paramTypes: TypeClass[];
-  private returnType: TypeClass;
+  declare private paramTypes: TypeClass[];
+  declare private returnType: TypeClass;
 
   constructor(paramTypes: TypeClass[], returnType: TypeClass) {
     this.paramTypes = paramTypes;
@@ -178,7 +178,7 @@ type NumberType = "u8" | "u16" | "u32" | "u64" | "u128" | "i8" | "i16" | "i32" |
  * Type class for numeric values (u8, u16, u32, u64, i8, i16, i32, i64, usize, isize, f32, f64) with encoding/decoding methods
  */
 class NumericType implements TypeClass {
-  private size: NumberType;
+  declare private size: NumberType;
 
   constructor(size: NumberType) {
     this.size = size;
@@ -275,7 +275,7 @@ class NumericType implements TypeClass {
 }
 
 class OptionType implements TypeClass {
-  private wrappedType: TypeClass;
+  declare private wrappedType: TypeClass;
 
   constructor(wrappedType: TypeClass) {
     this.wrappedType = wrappedType;
@@ -304,8 +304,8 @@ type Ok = { value: any };
 type Err = { error: any };
 
 class ResultType implements TypeClass {
-  private okType: TypeClass;
-  private errType: TypeClass;
+  declare private okType: TypeClass;
+  declare private errType: TypeClass;
 
   constructor(okType: TypeClass, errType: TypeClass) {
     this.okType = okType;
@@ -341,7 +341,7 @@ class ResultType implements TypeClass {
  * Type class for array/Vec values with encoding/decoding methods
  */
 class ArrayType implements TypeClass {
-  private elementType: TypeClass;
+  declare private elementType: TypeClass;
 
   constructor(elementType: TypeClass) {
     this.elementType = elementType;

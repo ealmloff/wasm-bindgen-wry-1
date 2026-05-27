@@ -12,7 +12,7 @@ use std::boxed::Box;
 use crate::encode::{BatchableResult, BinaryDecode};
 use crate::id_allocator::{IdAllocator, PendingInstallIds};
 use crate::ipc::DecodedData;
-use crate::ipc::{EncodedData, IPCMessage, MessageType};
+use crate::ipc::{EncodedData, JsConsumedAction, MessageType, OutboundIPCMessage};
 use crate::lazy::ThreadLocalKey;
 use crate::object_store::ObjectHandle;
 use crate::runtime::WryIPC;
@@ -55,7 +55,7 @@ pub struct Runtime {
 impl Runtime {
     pub(crate) fn new(ipc: WryIPC, webview_id: u64) -> Self {
         let mut id_allocator = IdAllocator::new();
-        let encoder = Self::new_encoder_for_evaluate(&mut id_allocator, 0);
+        let encoder = Self::new_encoder_for_evaluate(&mut id_allocator);
         Self {
             encoder,
             id_allocator,
@@ -73,14 +73,10 @@ impl Runtime {
         }
     }
 
-    fn new_encoder_for_evaluate(
-        id_allocator: &mut IdAllocator,
-        response_channel_id: u32,
-    ) -> EncodedData {
+    fn new_encoder_for_evaluate(id_allocator: &mut IdAllocator) -> EncodedData {
         let mut encoder = EncodedData::new();
         encoder.push_u8(MessageType::Evaluate as u8);
         encoder.push_u32(id_allocator.next_rust_request_id());
-        encoder.push_u32(response_channel_id);
         encoder
     }
 
@@ -94,10 +90,9 @@ impl Runtime {
         self.id_allocator.next_placeholder_id()
     }
 
-    /// Allocate IDs for all JS objects sent in one deferred heap-ref frame.
-    pub fn get_next_inbound_js_heap_ids(&mut self, request_id: u32, count: u32) -> Vec<u64> {
-        self.id_allocator
-            .next_inbound_js_heap_ids(request_id, count)
+    /// Allocate the next ID for a JS object sent without encoding an ID.
+    pub fn get_next_inbound_js_heap_id(&mut self, request_id: u32) -> u64 {
+        self.id_allocator.next_inbound_js_heap_id(request_id)
     }
 
     pub(crate) fn push_inbound_js_request(&mut self, request_id: u32) {
@@ -115,8 +110,8 @@ impl Runtime {
         );
     }
 
-    pub(crate) fn current_response_channel_id(&self) -> u32 {
-        self.inbound_js_request_stack.last().copied().unwrap_or(0)
+    pub(crate) fn current_js_request_id(&self) -> Option<u32> {
+        self.inbound_js_request_stack.last().copied()
     }
 
     /// Get the next borrow ID from the borrow stack (indices 1-127).
@@ -161,27 +156,37 @@ impl Runtime {
 
     /// Take the message data and reset the batch for reuse.
     /// Includes ID installation and placeholder reservation metadata at the start of the message.
-    pub(crate) fn take_message(&mut self) -> IPCMessage {
+    pub(crate) fn take_message(&mut self) -> OutboundIPCMessage {
         let install_ids = self.pending_install_id_batches();
         let reserved_ids = self.take_reserved_placeholder_ids();
         let mut encoder = self.take_encoder();
-        set_response_channel_id(&mut encoder, self.current_response_channel_id());
         prepend_rust_to_js_evaluate_prelude(&mut encoder, &install_ids, &reserved_ids);
-        IPCMessage::new(encoder.to_bytes())
+        let actions = take_js_consumed_actions(&mut encoder, &install_ids);
+        OutboundIPCMessage::new(
+            crate::ipc::IPCMessage::new(encoder.to_bytes()),
+            self.current_js_request_id(),
+            actions,
+        )
     }
 
     /// Add Rust-to-JS response metadata and turn the encoder into a response message.
-    pub(crate) fn finish_respond_message(&mut self, mut encoder: EncodedData) -> IPCMessage {
+    pub(crate) fn finish_respond_message(
+        &mut self,
+        mut encoder: EncodedData,
+    ) -> OutboundIPCMessage {
         let install_ids = self.pending_install_id_batches();
-        set_response_channel_id(&mut encoder, self.current_response_channel_id());
         prepend_rust_to_js_respond_prelude(&mut encoder, &install_ids);
-        IPCMessage::new(encoder.to_bytes())
+        let actions = take_js_consumed_actions(&mut encoder, &install_ids);
+        OutboundIPCMessage::new(
+            crate::ipc::IPCMessage::new(encoder.to_bytes()),
+            self.current_js_request_id(),
+            actions,
+        )
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        // 12 bytes for offsets, 1 byte for message type, and two u32 header
-        // words.
-        self.encoder.byte_len() <= 21
+        // 12 bytes for offsets, 1 byte for message type, and one u32 header word.
+        self.encoder.byte_len() <= 17
     }
 
     pub(crate) fn push_ids_to_free(&mut self) {
@@ -246,12 +251,9 @@ impl Runtime {
 
     pub(crate) fn take_encoder(&mut self) -> EncodedData {
         if self.is_empty() {
-            let response_channel_id = self.current_response_channel_id();
-            self.encoder =
-                Self::new_encoder_for_evaluate(&mut self.id_allocator, response_channel_id);
+            self.encoder = Self::new_encoder_for_evaluate(&mut self.id_allocator);
         }
-        let response_channel_id = self.current_response_channel_id();
-        let next = Self::new_encoder_for_evaluate(&mut self.id_allocator, response_channel_id);
+        let next = Self::new_encoder_for_evaluate(&mut self.id_allocator);
         core::mem::replace(&mut self.encoder, next)
     }
 
@@ -259,9 +261,13 @@ impl Runtime {
         // Manually extend to avoid adding an extra message type byte or message
         // header.
         self.encoder.u8_buf.extend_from_slice(&other.u8_buf[1..]);
-        self.encoder.u32_buf.extend_from_slice(&other.u32_buf[2..]);
+        self.encoder.u32_buf.extend_from_slice(&other.u32_buf[1..]);
         self.encoder.u16_buf.extend_from_slice(&other.u16_buf);
         self.encoder.str_buf.extend_from_slice(&other.str_buf);
+        self.encoder
+            .js_consumed_actions
+            .extend_from_slice(&other.js_consumed_actions);
+        self.encoder.needs_flush |= other.needs_flush;
     }
 
     /// Get or create a type ID for the given type definition bytes.
@@ -274,6 +280,22 @@ impl Runtime {
     pub(crate) fn ack_type_ids(&mut self, ids: impl IntoIterator<Item = u32>) {
         for id in ids {
             self.type_cache.ack_type_id(id);
+        }
+    }
+
+    pub(crate) fn apply_js_consumed_actions(
+        &mut self,
+        actions: impl IntoIterator<Item = JsConsumedAction>,
+    ) {
+        for action in actions {
+            match action {
+                JsConsumedAction::HeapRefsInstalled { request_id } => {
+                    self.ack_pending_install_ids([request_id]);
+                }
+                JsConsumedAction::TypeDefinitionParsed { type_id } => {
+                    self.ack_type_ids([type_id]);
+                }
+            }
         }
     }
 
@@ -369,10 +391,6 @@ fn push_id_list(buf: &mut Vec<u32>, ids: &[u64]) {
     }
 }
 
-fn set_response_channel_id(encoder: &mut EncodedData, id: u32) {
-    encoder.u32_buf[1] = id;
-}
-
 fn push_install_batches(buf: &mut Vec<u32>, batches: &[PendingInstallIds]) {
     buf.push(batches.len() as u32);
     for batch in batches {
@@ -388,7 +406,7 @@ fn prepend_rust_to_js_respond_prelude(
 ) {
     let mut prelude = Vec::new();
     push_install_batches(&mut prelude, install_ids);
-    encoder.insert_u32s(2, &prelude);
+    encoder.insert_u32s(1, &prelude);
 }
 
 fn prepend_rust_to_js_evaluate_prelude(
@@ -399,7 +417,21 @@ fn prepend_rust_to_js_evaluate_prelude(
     let mut prelude = Vec::new();
     push_install_batches(&mut prelude, install_ids);
     push_id_list(&mut prelude, reserved_ids);
-    encoder.insert_u32s(2, &prelude);
+    encoder.insert_u32s(1, &prelude);
+}
+
+fn take_js_consumed_actions(
+    encoder: &mut EncodedData,
+    install_ids: &[PendingInstallIds],
+) -> Vec<JsConsumedAction> {
+    let mut actions: Vec<_> = install_ids
+        .iter()
+        .map(|batch| JsConsumedAction::HeapRefsInstalled {
+            request_id: batch.request_id,
+        })
+        .collect();
+    actions.extend(encoder.take_js_consumed_actions());
+    actions
 }
 
 thread_local! {
@@ -642,6 +674,7 @@ pub(crate) fn flush_and_then<R>(mut then: impl for<'a> FnMut(DecodedData<'a>) ->
 
     let batch_msg = with_runtime(|state| state.take_message());
     let request_id = batch_msg
+        .message
         .header()
         .expect("Failed to decode batch message header")
         .request_id;

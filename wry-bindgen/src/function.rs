@@ -15,6 +15,7 @@ use crate::batch::{force_flush, run_js_sync, with_runtime};
 use crate::encode::{BatchableResult, BinaryEncode, EncodeTypeDef, TYPE_CACHED, TYPE_FULL};
 use crate::ipc::DecodedData;
 use crate::ipc::EncodedData;
+use crate::ipc::JsConsumedAction;
 
 /// Reserved function ID for dropping native Rust refs when JS objects are GC'd.
 /// JS sends this when a FinalizationRegistry callback fires for a RustFunction.
@@ -42,6 +43,7 @@ fn encode_function_types(encoder: &mut EncodedData, encode_types: impl FnOnce(&m
             // First time - send full type def + ID
             encoder.push_u8(TYPE_FULL);
             encoder.push_u32(id);
+            encoder.push_js_consumed_action(JsConsumedAction::TypeDefinitionParsed { type_id: id });
 
             // Push the type definition bytes
             for byte in type_buf {
@@ -93,9 +95,9 @@ macro_rules! impl_js_function_call {
         impl<$($T: EncodeTypeDef,)+ R: BatchableResult + EncodeTypeDef>
             JSFunction<fn($($T),+) -> R>
         {
-            pub fn call<$($P),+>(&self, $($arg: $T),+) -> R
+            pub fn call(&self, $($arg: $T),+) -> R
             where
-                $($T: BinaryEncode<$P>,)+
+                $($T: BinaryEncode,)+
             {
                 run_js_sync::<R>(self.id, |encoder| {
                     encode_function_types(encoder, |buf| {

@@ -4,6 +4,7 @@
 //! and inventory-based function registration.
 
 use std::{
+    collections::{HashMap, HashSet},
     hash::{BuildHasher, RandomState},
     sync::atomic::AtomicU32,
 };
@@ -76,10 +77,15 @@ pub fn generate(program: &Program) -> syn::Result<TokenStream> {
     }
 
     // Collect type names being defined in this block
-    let type_names: std::collections::HashSet<String> = program
+    let type_names: HashSet<String> = program
         .types
         .iter()
         .map(|t| t.rust_name.to_string())
+        .collect();
+    let type_generics: HashMap<String, syn::Generics> = program
+        .types
+        .iter()
+        .map(|t| (t.rust_name.to_string(), t.generics.clone()))
         .collect();
 
     // Collect vendor_prefixes for each type
@@ -104,6 +110,7 @@ pub fn generate(program: &Program) -> syn::Result<TokenStream> {
         tokens.extend(generate_function(
             func,
             &type_names,
+            &type_generics,
             &vendor_prefixes,
             krate,
             &prefix,
@@ -137,60 +144,93 @@ pub fn generate(program: &Program) -> syn::Result<TokenStream> {
 fn generate_type(ty: &ImportType, krate: &TokenStream) -> syn::Result<TokenStream> {
     let vis = &ty.vis;
     let rust_name = &ty.rust_name;
+    let generics = &ty.generics;
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    let mut into_js_generics = add_static_bounds(generics);
+    let (_, into_js_ty_generics, _) = into_js_generics.split_for_impl();
+    let self_ty: syn::Type = syn::parse_quote!(#rust_name #into_js_ty_generics);
+    into_js_generics
+        .make_where_clause()
+        .predicates
+        .push(syn::parse_quote!(#self_ty: #krate::JsGeneric));
+    let (into_js_impl_generics, into_js_ty_generics, into_js_where_clause) =
+        into_js_generics.split_for_impl();
     let derives = &ty.derives;
+    let span = rust_name.span();
+    let storage_ty = if let Some(first_parent) = ty.extends.first() {
+        first_parent.to_token_stream()
+    } else {
+        quote_spanned! {span=> #krate::JsValue }
+    };
+    let type_params: Vec<_> = generics.type_params().map(|param| &param.ident).collect();
+    let generic_field = if type_params.is_empty() {
+        quote! {}
+    } else {
+        quote_spanned! {span=>
+            pub generics: ::core::marker::PhantomData<fn() -> (#(#type_params,)*)>,
+        }
+    };
+    let generic_init = if type_params.is_empty() {
+        quote! {}
+    } else {
+        quote_spanned! {span=>
+            generics: ::core::marker::PhantomData,
+        }
+    };
+    let from_jsvalue_obj = if ty.extends.is_empty() {
+        quote_spanned! {span=> val }
+    } else {
+        quote_spanned! {span=> <#storage_ty as #krate::JsCast>::unchecked_from_js(val) }
+    };
 
     // Generate the struct definition using JsValue from the configured crate
     // repr(transparent) ensures the same memory layout
     // Apply user-provided attributes (like #[derive(Debug, PartialEq, Eq)])
     // Use named struct with `obj` field to match wasm-bindgen's generated types
-    let span = rust_name.span();
     let struct_def = quote_spanned! {span=>
         #(#derives)*
         #[repr(transparent)]
-        #vis struct #rust_name {
-            pub obj: #krate::JsValue,
+        #vis struct #rust_name #generics #where_clause {
+            pub obj: #storage_ty,
+            #generic_field
         }
     };
 
     // Generate AsRef<JsValue> implementation
     let as_ref_impl = quote_spanned! {span=>
-        impl ::core::convert::AsRef<#krate::JsValue> for #rust_name {
+        impl #impl_generics ::core::convert::AsRef<#krate::JsValue> for #rust_name #ty_generics #where_clause {
             fn as_ref(&self) -> &#krate::JsValue {
-                &self.obj
+                ::core::convert::AsRef::as_ref(&self.obj)
             }
         }
     };
 
     // Generate From<Type> for JsValue and From<JsValue> for Type
     let into_jsvalue = quote_spanned! {span=>
-        impl ::core::convert::From<#rust_name> for #krate::JsValue {
-            fn from(val: #rust_name) -> Self {
-                val.obj
+        impl #impl_generics ::core::convert::From<#rust_name #ty_generics> for #krate::JsValue #where_clause {
+            fn from(val: #rust_name #ty_generics) -> Self {
+                ::core::convert::Into::into(val.obj)
             }
         }
 
-        impl ::core::convert::From<&#rust_name> for #krate::JsValue {
-            fn from(val: &#rust_name) -> Self {
-                ::core::clone::Clone::clone(&val.obj)
+        impl #impl_generics ::core::convert::From<&#rust_name #ty_generics> for #krate::JsValue #where_clause {
+            fn from(val: &#rust_name #ty_generics) -> Self {
+                ::core::clone::Clone::clone(::core::convert::AsRef::<#krate::JsValue>::as_ref(val))
             }
         }
 
-        impl ::core::convert::From<#krate::JsValue> for #rust_name {
+        impl #impl_generics ::core::convert::From<#krate::JsValue> for #rust_name #ty_generics #where_clause {
             fn from(val: #krate::JsValue) -> Self {
-                Self { obj: val }
+                Self { obj: #from_jsvalue_obj, #generic_init }
             }
         }
     };
 
     // Generate Deref to the first parent or JsValue if no parents
     let deref_impls = {
-        let deref_to = if let Some(first_parent) = ty.extends.first() {
-            first_parent.to_token_stream()
-        } else {
-            quote_spanned! {span=> #krate::JsValue }
-        };
+        let deref_to = &storage_ty;
         quote_spanned! {span=>
-            impl ::core::ops::Deref for #rust_name {
+            impl #impl_generics ::core::ops::Deref for #rust_name #ty_generics #where_clause {
                 type Target = #deref_to;
                 fn deref(&self) -> &#deref_to {
                     <Self as ::core::convert::AsRef<#deref_to>>::as_ref(self)
@@ -202,31 +242,46 @@ fn generate_type(ty: &ImportType, krate: &TokenStream) -> syn::Result<TokenStrea
     // Generate From and AsRef impls for parent types
     let mut from_parents = TokenStream::new();
     from_parents.extend(quote_spanned! {span=>
-        impl ::core::convert::AsRef<#rust_name> for #rust_name {
+        impl #impl_generics ::core::convert::AsRef<#rust_name #ty_generics> for #rust_name #ty_generics #where_clause {
             #[inline]
-            fn as_ref(&self) -> &#rust_name {
+            fn as_ref(&self) -> &#rust_name #ty_generics {
                 self
             }
         }
     });
-    for parent in &ty.extends {
+    for (index, parent) in ty.extends.iter().enumerate() {
+        let parent_from_owned = if index == 0 {
+            quote_spanned! {span=> val.obj }
+        } else {
+            quote_spanned! {span=> <#parent as #krate::JsCast>::unchecked_from_js(::core::convert::Into::into(val.obj)) }
+        };
+        let parent_from_ref = if index == 0 {
+            quote_spanned! {span=> ::core::clone::Clone::clone(&val.obj) }
+        } else {
+            quote_spanned! {span=> <#parent as #krate::JsCast>::unchecked_from_js(::core::convert::Into::into(val)) }
+        };
+        let parent_ref = if index == 0 {
+            quote_spanned! {span=> &self.obj }
+        } else {
+            quote_spanned! {span=> <#parent as #krate::JsCast>::unchecked_from_js_ref(::core::convert::AsRef::<#krate::JsValue>::as_ref(self)) }
+        };
         from_parents.extend(quote_spanned! {span=>
-            impl ::core::convert::From<#rust_name> for #parent {
-                fn from(val: #rust_name) -> #parent {
-                    #parent { obj: val.obj }
+            impl #impl_generics ::core::convert::From<#rust_name #ty_generics> for #parent #where_clause {
+                fn from(val: #rust_name #ty_generics) -> #parent {
+                    #parent_from_owned
                 }
             }
 
-            impl ::core::convert::From<&#rust_name> for #parent {
-                fn from(val: &#rust_name) -> #parent {
-                    #parent { obj: ::core::clone::Clone::clone(&val.obj) }
+            impl #impl_generics ::core::convert::From<&#rust_name #ty_generics> for #parent #where_clause {
+                fn from(val: &#rust_name #ty_generics) -> #parent {
+                    #parent_from_ref
                 }
             }
 
-            impl ::core::convert::AsRef<#parent> for #rust_name {
+            impl #impl_generics ::core::convert::AsRef<#parent> for #rust_name #ty_generics #where_clause {
                 #[inline]
                 fn as_ref(&self) -> &#parent {
-                    <#parent as #krate::JsCast>::unchecked_from_js_ref(::core::convert::AsRef::as_ref(self))
+                    #parent_ref
                 }
             }
         });
@@ -235,7 +290,7 @@ fn generate_type(ty: &ImportType, krate: &TokenStream) -> syn::Result<TokenStrea
     // Generate EncodeTypeDef implementation
     // All JS types use HeapRef since they're references to JS heap objects
     let encode_type_def_impl = quote_spanned! {span=>
-        impl #krate::EncodeTypeDef for #rust_name {
+        impl #impl_generics #krate::EncodeTypeDef for #rust_name #ty_generics #where_clause {
             fn encode_type_def(buf: &mut #krate::alloc::vec::Vec<u8>) {
                 <#krate::JsValue as #krate::EncodeTypeDef>::encode_type_def(buf);
             }
@@ -244,30 +299,24 @@ fn generate_type(ty: &ImportType, krate: &TokenStream) -> syn::Result<TokenStrea
 
     // Generate BinaryEncode implementation
     let binary_encode_impl = quote_spanned! {span=>
-        impl #krate::BinaryEncode for #rust_name {
+        impl #impl_generics #krate::BinaryEncode for #rust_name #ty_generics #where_clause {
             fn encode(self, encoder: &mut #krate::EncodedData) {
                 self.obj.encode(encoder);
-            }
-        }
-
-        impl #krate::BinaryEncode for &#rust_name {
-            fn encode(self, encoder: &mut #krate::EncodedData) {
-                (&self.obj).encode(encoder);
             }
         }
     };
 
     // Generate BinaryDecode implementation
     let binary_decode_impl = quote_spanned! {span=>
-        impl #krate::BinaryDecode for #rust_name {
+        impl #impl_generics #krate::BinaryDecode for #rust_name #ty_generics #where_clause {
             fn decode(decoder: &mut #krate::DecodedData) -> ::core::result::Result<Self, #krate::DecodeError> {
-                ::core::result::Result::map(#krate::JsValue::decode(decoder), |v| Self { obj: v })
+                ::core::result::Result::map(#krate::JsValue::decode(decoder), ::core::convert::Into::into)
             }
 
             fn decode_inbound(decoder: &mut #krate::DecodedData) -> ::core::result::Result<Self, #krate::DecodeError> {
                 ::core::result::Result::map(
                     <#krate::JsValue as #krate::BinaryDecode>::decode_inbound(decoder),
-                    |v| Self { obj: v },
+                    ::core::convert::Into::into,
                 )
             }
         }
@@ -275,9 +324,9 @@ fn generate_type(ty: &ImportType, krate: &TokenStream) -> syn::Result<TokenStrea
 
     // Generate BatchableResult implementation
     let batchable_impl = quote_spanned! {span=>
-        impl #krate::BatchableResult for #rust_name {
+        impl #impl_generics #krate::BatchableResult for #rust_name #ty_generics #where_clause {
             fn try_placeholder(batch: &mut #krate::batch::Runtime) -> ::core::option::Option<Self> {
-                ::core::option::Option::Some(Self { obj: #krate::BatchableResult::try_placeholder(batch)? })
+                ::core::option::Option::Some(::core::convert::Into::into(<#krate::JsValue as #krate::BatchableResult>::try_placeholder(batch)?))
             }
         }
     };
@@ -325,7 +374,7 @@ fn generate_type(ty: &ImportType, krate: &TokenStream) -> syn::Result<TokenStrea
     });
 
     let jscast_impl = quote_spanned! {span=>
-        impl #krate::JsCast for #rust_name {
+        impl #impl_generics #krate::JsCast for #rust_name #ty_generics #where_clause {
             fn instanceof(__val: &#krate::JsValue) -> bool {
                 #krate::__wry_call_js_function!(#instanceof_js_code, fn(&#krate::JsValue) -> bool, (__val))
             }
@@ -333,7 +382,7 @@ fn generate_type(ty: &ImportType, krate: &TokenStream) -> syn::Result<TokenStrea
             #is_type_of_impl
 
             fn unchecked_from_js(val: #krate::JsValue) -> Self {
-                Self { obj: val }
+                ::core::convert::Into::into(val)
             }
 
             fn unchecked_from_js_ref(val: &#krate::JsValue) -> &Self {
@@ -342,6 +391,125 @@ fn generate_type(ty: &ImportType, krate: &TokenStream) -> syn::Result<TokenStrea
             }
         }
     };
+
+    let generic_trait_impls = quote_spanned! {span=>
+        unsafe impl #impl_generics #krate::__rt::marker::ErasableGeneric for #rust_name #ty_generics #where_clause {
+            type Repr = #krate::JsValue;
+        }
+
+        impl #into_js_impl_generics #krate::IntoJsGeneric for #rust_name #into_js_ty_generics #into_js_where_clause {
+            type JsCanon = Self;
+
+            #[inline]
+            fn to_js(self) -> Self::JsCanon {
+                self
+            }
+        }
+
+        impl #impl_generics #krate::convert::IntoWasmAbi for #rust_name #ty_generics #where_clause {
+            type Abi = <#krate::JsValue as #krate::convert::IntoWasmAbi>::Abi;
+
+            #[inline]
+            fn into_abi(self) -> Self::Abi {
+                <#krate::JsValue as #krate::convert::IntoWasmAbi>::into_abi(::core::convert::Into::into(self))
+            }
+        }
+
+        impl #impl_generics #krate::convert::FromWasmAbi for #rust_name #ty_generics #where_clause {
+            type Abi = <#krate::JsValue as #krate::convert::FromWasmAbi>::Abi;
+
+            #[inline]
+            unsafe fn from_abi(js: Self::Abi) -> Self {
+                let value = unsafe { <#krate::JsValue as #krate::convert::FromWasmAbi>::from_abi(js) };
+                <Self as #krate::JsCast>::unchecked_from_js(value)
+            }
+        }
+    };
+
+    let mut upcast_impls = TokenStream::new();
+    if !ty.no_upcast {
+        upcast_impls.extend(quote_spanned! {span=>
+            impl #impl_generics #krate::convert::UpcastFrom<#rust_name #ty_generics> for #krate::JsValue #where_clause {}
+            impl #impl_generics #krate::convert::UpcastFrom<#rust_name #ty_generics> for #krate::sys::JsOption<#krate::JsValue> #where_clause {}
+        });
+
+        let class_type_params: Vec<_> = generics.type_params().collect();
+        if class_type_params.is_empty() {
+            upcast_impls.extend(quote_spanned! {span=>
+                impl #impl_generics #krate::convert::UpcastFrom<#rust_name #ty_generics> for #rust_name #ty_generics #where_clause {}
+                impl #impl_generics #krate::convert::UpcastFrom<#rust_name #ty_generics> for #krate::sys::JsOption<#rust_name #ty_generics> #where_clause {}
+            });
+        } else {
+            let mut target_generics = generics.clone();
+            let target_param_names: Vec<_> = class_type_params
+                .iter()
+                .enumerate()
+                .map(|(index, param)| {
+                    let target_name = format_ident!("__WryUpcastTarget{}", index);
+                    let bounds = &param.bounds;
+                    if bounds.is_empty() {
+                        target_generics.params.push(syn::parse_quote!(#target_name));
+                    } else {
+                        target_generics
+                            .params
+                            .push(syn::parse_quote!(#target_name: #bounds));
+                    }
+                    target_name
+                })
+                .collect();
+            let mut target_where_clause =
+                generics
+                    .where_clause
+                    .clone()
+                    .unwrap_or_else(|| syn::WhereClause {
+                        where_token: Default::default(),
+                        predicates: Default::default(),
+                    });
+            for (param, target_name) in class_type_params.iter().zip(&target_param_names) {
+                let param_name = &param.ident;
+                target_where_clause.predicates.push(syn::parse_quote!(
+                    #target_name: #krate::convert::UpcastFrom<#param_name>
+                ));
+            }
+            let (target_impl_generics, _, _) = target_generics.split_for_impl();
+            let mut target_args = Vec::new();
+            let mut next_type_param = 0usize;
+            for param in &generics.params {
+                match param {
+                    syn::GenericParam::Lifetime(param) => {
+                        let lifetime = &param.lifetime;
+                        target_args.push(quote! { #lifetime });
+                    }
+                    syn::GenericParam::Type(_) => {
+                        let target_name = &target_param_names[next_type_param];
+                        next_type_param += 1;
+                        target_args.push(quote! { #target_name });
+                    }
+                    syn::GenericParam::Const(param) => {
+                        let ident = &param.ident;
+                        target_args.push(quote! { #ident });
+                    }
+                }
+            }
+            let target_ty_generics = if target_args.is_empty() {
+                quote! {}
+            } else {
+                quote! { <#(#target_args),*> }
+            };
+
+            upcast_impls.extend(quote_spanned! {span=>
+                impl #target_impl_generics #krate::convert::UpcastFrom<#rust_name #ty_generics> for #rust_name #target_ty_generics #target_where_clause {}
+                impl #target_impl_generics #krate::convert::UpcastFrom<#rust_name #ty_generics> for #krate::sys::JsOption<#rust_name #target_ty_generics> #target_where_clause {}
+            });
+        }
+
+        for parent in &ty.extends {
+            upcast_impls.extend(quote_spanned! {span=>
+                impl #impl_generics #krate::convert::UpcastFrom<#rust_name #ty_generics> for #parent #where_clause {}
+                impl #impl_generics #krate::convert::UpcastFrom<#rust_name #ty_generics> for #krate::sys::JsOption<#parent> #where_clause {}
+            });
+        }
+    }
 
     Ok(quote_spanned! {span=>
         #struct_def
@@ -354,13 +522,16 @@ fn generate_type(ty: &ImportType, krate: &TokenStream) -> syn::Result<TokenStrea
         #binary_decode_impl
         #batchable_impl
         #jscast_impl
+        #generic_trait_impls
+        #upcast_impls
     })
 }
 
 /// Generate code for an imported function
 fn generate_function(
     func: &ImportFunction,
-    type_names: &std::collections::HashSet<String>,
+    type_names: &HashSet<String>,
+    type_generics: &HashMap<String, syn::Generics>,
     vendor_prefixes: &std::collections::HashMap<String, Vec<String>>,
     krate: &TokenStream,
     prefix: &str,
@@ -368,6 +539,8 @@ fn generate_function(
     let vis = &func.vis;
     let rust_name = &func.rust_name;
     let span = rust_name.span();
+    let call_generics = add_js_call_bounds(func, krate, true);
+    let (fn_generics, _, fn_where_clause) = call_generics.split_for_impl();
 
     // Generate argument lists
     let args = generate_args(func, krate)?;
@@ -386,7 +559,7 @@ fn generate_function(
     if func.is_async {
         let js_code = generate_js_code(func, vendor_prefixes, prefix, true);
         let js_code_str = js_code.to_arrow_function();
-        return generate_async_function(func, krate, &js_code_str, &args);
+        return generate_async_function(func, type_generics, krate, &js_code_str, &args);
     }
 
     // For non-async functions, generate a simple closure that returns a constant string
@@ -411,12 +584,16 @@ fn generate_function(
                 && ns.len() == 1
                 && type_names.contains(&ns[0])
             {
-                let class_ident = format_ident!("{}", &ns[0]);
+                let (impl_type, impl_generics, mut method_generics) =
+                    class_impl_parts(func, &ns[0], type_generics);
+                add_js_call_bounds_to_generics(&mut method_generics, func, krate, true);
+                let (impl_generics, _, impl_where_clause) = impl_generics.split_for_impl();
+                let (method_generics, _, method_where_clause) = method_generics.split_for_impl();
                 return Ok(quote_spanned! {span=>
-                    impl #class_ident {
+                    impl #impl_generics #impl_type #impl_where_clause {
                         #allows
                         #rust_attrs
-                        #vis fn #rust_name(#fn_params) -> #ret_type {
+                        #vis fn #rust_name #method_generics (#fn_params) -> #ret_type #method_where_clause {
                             #func_body
                         }
                     }
@@ -425,7 +602,7 @@ fn generate_function(
             Ok(quote_spanned! {span=>
                 #allows
                 #rust_attrs
-                #vis fn #rust_name(#fn_params) -> #ret_type {
+                #vis fn #rust_name #fn_generics (#fn_params) -> #ret_type #fn_where_clause {
                     #func_body
                 }
             })
@@ -437,7 +614,12 @@ fn generate_function(
         | ImportFunctionKind::IndexingSetter { receiver }
         | ImportFunctionKind::IndexingDeleter { receiver } => {
             // Extract the type name from the receiver
-            let receiver_type = extract_type_name(receiver)?;
+            let receiver_type = receiver_impl_type(receiver)?;
+            let (impl_generics, mut method_generics) =
+                split_method_generics(&func.generics, receiver);
+            add_js_call_bounds_to_generics(&mut method_generics, func, krate, true);
+            let (impl_generics, _, impl_where_clause) = impl_generics.split_for_impl();
+            let (method_generics, _, method_where_clause) = method_generics.split_for_impl();
 
             // Build method signature with optional additional args
             let method_args = if fn_params.is_empty() {
@@ -447,35 +629,43 @@ fn generate_function(
             };
 
             Ok(quote_spanned! {span=>
-                impl #receiver_type {
+                impl #impl_generics #receiver_type #impl_where_clause {
                     #allows
                     #rust_attrs
-                    #vis fn #rust_name(#method_args) -> #ret_type {
+                    #vis fn #rust_name #method_generics (#method_args) -> #ret_type #method_where_clause {
                         #func_body
                     }
                 }
             })
         }
         ImportFunctionKind::Constructor { class } => {
-            let class_ident = format_ident!("{}", class);
+            let (impl_type, impl_generics, mut method_generics) =
+                class_impl_parts(func, class, type_generics);
+            add_js_call_bounds_to_generics(&mut method_generics, func, krate, true);
+            let (impl_generics, _, impl_where_clause) = impl_generics.split_for_impl();
+            let (method_generics, _, method_where_clause) = method_generics.split_for_impl();
             // Use the actual return type (may be Result<T, JsValue> for catch constructors)
             Ok(quote_spanned! {span=>
-                impl #class_ident {
+                impl #impl_generics #impl_type #impl_where_clause {
                     #allows
                     #rust_attrs
-                    #vis fn #rust_name(#fn_params) -> #ret_type {
+                    #vis fn #rust_name #method_generics (#fn_params) -> #ret_type #method_where_clause {
                         #func_body
                     }
                 }
             })
         }
         ImportFunctionKind::StaticMethod { class } => {
-            let class_ident = format_ident!("{}", class);
+            let (impl_type, impl_generics, mut method_generics) =
+                class_impl_parts(func, class, type_generics);
+            add_js_call_bounds_to_generics(&mut method_generics, func, krate, true);
+            let (impl_generics, _, impl_where_clause) = impl_generics.split_for_impl();
+            let (method_generics, _, method_where_clause) = method_generics.split_for_impl();
             Ok(quote_spanned! {span=>
-                impl #class_ident {
+                impl #impl_generics #impl_type #impl_where_clause {
                     #allows
                     #rust_attrs
-                    #vis fn #rust_name(#fn_params) -> #ret_type {
+                    #vis fn #rust_name #method_generics (#fn_params) -> #ret_type #method_where_clause {
                         #func_body
                     }
                 }
@@ -484,10 +674,68 @@ fn generate_function(
     }
 }
 
+fn class_impl_parts(
+    func: &ImportFunction,
+    class: &str,
+    type_generics: &HashMap<String, syn::Generics>,
+) -> (syn::Type, syn::Generics, syn::Generics) {
+    if type_generics
+        .get(class)
+        .is_some_and(|generics| !generics.params.is_empty())
+        && let Some(class_type) = class_return_type(func, class)
+    {
+        let (impl_generics, method_generics) = split_method_generics(&func.generics, &class_type);
+        return (class_type, impl_generics, method_generics);
+    }
+
+    let class_ident = format_ident!("{}", class);
+    (
+        syn::parse_quote!(#class_ident),
+        syn::Generics::default(),
+        func.generics.clone(),
+    )
+}
+
+fn class_return_type(func: &ImportFunction, class: &str) -> Option<syn::Type> {
+    let ret = func
+        .ret
+        .as_ref()
+        .and_then(|ret| extract_result_ok_type(ret).or_else(|| Some(ret.clone())))?;
+    let syn::Type::Path(path) = &ret else {
+        return None;
+    };
+    if path.qself.is_some() {
+        return None;
+    }
+    let segment = path.path.segments.last()?;
+    if segment.ident != class {
+        return None;
+    }
+    if !matches!(
+        segment.arguments,
+        syn::PathArguments::AngleBracketed(ref args) if !args.args.is_empty()
+    ) {
+        return None;
+    }
+
+    let known_type_params: HashSet<String> = func
+        .generics
+        .type_params()
+        .map(|param| param.ident.to_string())
+        .collect();
+    let mut found = HashSet::new();
+    if !collect_constraining_type_params(&ret, &known_type_params, &mut found) || found.is_empty() {
+        return None;
+    }
+
+    Some(ret)
+}
+
 /// Generate code for an async imported function
 /// Uses wasm_bindgen_futures::JsFuture to convert Promise to Future
 fn generate_async_function(
     func: &ImportFunction,
+    type_generics: &HashMap<String, syn::Generics>,
     krate: &TokenStream,
     js_code_str: &str,
     args: &GeneratedArgs,
@@ -496,6 +744,8 @@ fn generate_async_function(
     let rust_name = &func.rust_name;
     let span = rust_name.span();
     let rust_attrs = &func.rust_attrs;
+    let call_generics = add_js_call_bounds(func, krate, false);
+    let (fn_generics, _, fn_where_clause) = call_generics.split_for_impl();
 
     let fn_params = &args.fn_params;
     let fn_types = &args.fn_types;
@@ -567,7 +817,7 @@ fn generate_async_function(
         ImportFunctionKind::Normal => Ok(quote_spanned! {span=>
             #allows
             #(#rust_attrs)*
-            #vis async fn #rust_name(#fn_params) #ret_clause {
+            #vis async fn #rust_name #fn_generics (#fn_params) #ret_clause #fn_where_clause {
                 #async_body #ret_handling
             }
         }),
@@ -578,7 +828,12 @@ fn generate_async_function(
         | ImportFunctionKind::IndexingSetter { receiver }
         | ImportFunctionKind::IndexingDeleter { receiver } => {
             // Extract the type name from the receiver
-            let receiver_type = extract_type_name(receiver)?;
+            let receiver_type = receiver_impl_type(receiver)?;
+            let (impl_generics, mut method_generics) =
+                split_method_generics(&func.generics, receiver);
+            add_js_call_bounds_to_generics(&mut method_generics, func, krate, false);
+            let (impl_generics, _, impl_where_clause) = impl_generics.split_for_impl();
+            let (method_generics, _, method_where_clause) = method_generics.split_for_impl();
 
             // Build method signature with optional additional args
             let method_args = if fn_params.is_empty() {
@@ -588,34 +843,42 @@ fn generate_async_function(
             };
 
             Ok(quote_spanned! {span=>
-                impl #receiver_type {
+                impl #impl_generics #receiver_type #impl_where_clause {
                     #allows
                     #(#rust_attrs)*
-                    #vis async fn #rust_name(#method_args) #ret_clause {
+                    #vis async fn #rust_name #method_generics (#method_args) #ret_clause #method_where_clause {
                         #async_body #ret_handling
                     }
                 }
             })
         }
         ImportFunctionKind::Constructor { class } => {
-            let class_ident = format_ident!("{}", class);
+            let (impl_type, impl_generics, mut method_generics) =
+                class_impl_parts(func, class, type_generics);
+            add_js_call_bounds_to_generics(&mut method_generics, func, krate, false);
+            let (impl_generics, _, impl_where_clause) = impl_generics.split_for_impl();
+            let (method_generics, _, method_where_clause) = method_generics.split_for_impl();
             Ok(quote_spanned! {span=>
-                impl #class_ident {
+                impl #impl_generics #impl_type #impl_where_clause {
                     #allows
                     #(#rust_attrs)*
-                    #vis async fn #rust_name(#fn_params) #ret_clause {
+                    #vis async fn #rust_name #method_generics (#fn_params) #ret_clause #method_where_clause {
                         #async_body #ret_handling
                     }
                 }
             })
         }
         ImportFunctionKind::StaticMethod { class } => {
-            let class_ident = format_ident!("{}", class);
+            let (impl_type, impl_generics, mut method_generics) =
+                class_impl_parts(func, class, type_generics);
+            add_js_call_bounds_to_generics(&mut method_generics, func, krate, false);
+            let (impl_generics, _, impl_where_clause) = impl_generics.split_for_impl();
+            let (method_generics, _, method_where_clause) = method_generics.split_for_impl();
             Ok(quote_spanned! {span=>
-                impl #class_ident {
+                impl #impl_generics #impl_type #impl_where_clause {
                     #allows
                     #(#rust_attrs)*
-                    #vis async fn #rust_name(#fn_params) #ret_clause {
+                    #vis async fn #rust_name #method_generics (#fn_params) #ret_clause #method_where_clause {
                         #async_body #ret_handling
                     }
                 }
@@ -675,30 +938,34 @@ fn generate_js_code(
             // Use a{index} naming to avoid conflicts with JS reserved words
             let args: Vec<_> = (0..func.arguments.len()).map(|i| format!("a{i}")).collect();
             let args_str = args.join(", ");
-            (
-                format!("({args_str})"),
-                format!("{prefix}{js_name}({args_str})"),
-            )
+            let callee = if prefix.is_empty() {
+                js_name.to_string()
+            } else {
+                let object = prefix.trim_end_matches('.');
+                js_property_access(object, js_name)
+            };
+            (format!("({args_str})"), format!("{callee}({args_str})"))
         }
         ImportFunctionKind::Method { .. } => {
             // Use a{index} naming to avoid conflicts with JS reserved words
             let args: Vec<_> = (0..func.arguments.len()).map(|i| format!("a{i}")).collect();
             let args_str = args.join(", ");
+            let method = js_property_access("obj", js_name);
             if args.is_empty() {
-                ("(obj)".to_string(), format!("obj.{js_name}()"))
+                ("(obj)".to_string(), format!("{method}()"))
             } else {
                 (
                     format!("(obj, {args_str})"),
-                    format!("obj.{js_name}({args_str})"),
+                    format!("{method}({args_str})"),
                 )
             }
         }
         ImportFunctionKind::Getter { property, .. } => {
-            ("(obj)".to_string(), format!("obj.{property}"))
+            ("(obj)".to_string(), js_property_access("obj", property))
         }
         ImportFunctionKind::Setter { property, .. } => (
             "(obj, value)".to_string(),
-            format!("obj.{property} = value"),
+            format!("{} = value", js_property_access("obj", property)),
         ),
         ImportFunctionKind::IndexingGetter { .. } => {
             // obj[index] - takes one argument (the index)
@@ -740,10 +1007,9 @@ fn generate_js_code(
             // Use a{index} naming to avoid conflicts with JS reserved words
             let args: Vec<_> = (0..func.arguments.len()).map(|i| format!("a{i}")).collect();
             let args_str = args.join(", ");
-            (
-                format!("({args_str})"),
-                format!("{prefix}{class}.{js_name}({args_str})"),
-            )
+            let class_object = format!("{prefix}{class}");
+            let method = js_property_access(&class_object, js_name);
+            (format!("({args_str})"), format!("{method}({args_str})"))
         }
     };
 
@@ -756,6 +1022,33 @@ fn generate_js_code(
     };
 
     JsCode { params, body }
+}
+
+fn js_property_access(object: &str, property: &str) -> String {
+    format!("{object}[{}]", js_string_literal(property))
+}
+
+fn js_string_literal(value: &str) -> String {
+    let mut literal = String::with_capacity(value.len() + 2);
+    literal.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => literal.push_str("\\\""),
+            '\\' => literal.push_str("\\\\"),
+            '\n' => literal.push_str("\\n"),
+            '\r' => literal.push_str("\\r"),
+            '\t' => literal.push_str("\\t"),
+            '\u{08}' => literal.push_str("\\b"),
+            '\u{0c}' => literal.push_str("\\f"),
+            ch if ch < ' ' => {
+                use core::fmt::Write;
+                write!(&mut literal, "\\u{:04x}", ch as u32).unwrap();
+            }
+            ch => literal.push(ch),
+        }
+    }
+    literal.push('"');
+    literal
 }
 
 /// Wrap JavaScript body in try-catch block for error handling
@@ -846,15 +1139,424 @@ fn generate_args(func: &ImportFunction, krate: &TokenStream) -> syn::Result<Gene
     })
 }
 
-/// Extract the type name from a syn::Type (handles &Type and Type)
-fn extract_type_name(ty: &syn::Type) -> syn::Result<&syn::Ident> {
+fn receiver_impl_type(ty: &syn::Type) -> syn::Result<syn::Type> {
     match ty {
-        syn::Type::Reference(r) => extract_type_name(&r.elem),
-        syn::Type::Path(p) => p
-            .path
-            .get_ident()
-            .ok_or_else(|| syn::Error::new_spanned(ty, "expected simple type name")),
+        syn::Type::Reference(r) => receiver_impl_type(&r.elem),
+        syn::Type::Path(_) => Ok(ty.clone()),
         _ => Err(syn::Error::new_spanned(ty, "unsupported receiver type")),
+    }
+}
+
+fn add_static_bounds(generics: &syn::Generics) -> syn::Generics {
+    let mut generics = generics.clone();
+    for param in generics.type_params_mut() {
+        param.bounds.push(syn::parse_quote!('static));
+    }
+    generics
+}
+
+fn add_js_call_bounds(
+    func: &ImportFunction,
+    krate: &TokenStream,
+    include_ret: bool,
+) -> syn::Generics {
+    let mut generics = func.generics.clone();
+    add_js_call_bounds_to_generics(&mut generics, func, krate, include_ret);
+    generics
+}
+
+fn add_js_call_bounds_to_generics(
+    generics: &mut syn::Generics,
+    func: &ImportFunction,
+    krate: &TokenStream,
+    include_ret: bool,
+) {
+    let known_type_params: std::collections::HashSet<String> = func
+        .generics
+        .type_params()
+        .map(|param| param.ident.to_string())
+        .collect();
+
+    for arg in &func.arguments {
+        if type_uses_type_params(&arg.ty, &known_type_params) {
+            push_arg_type_bounds(generics, &arg.ty, krate);
+        }
+    }
+
+    if include_ret
+        && let Some(ret) = &func.ret
+        && type_uses_type_params(ret, &known_type_params)
+    {
+        push_type_bound(
+            generics,
+            ret,
+            &[
+                quote! { #krate::EncodeTypeDef },
+                quote! { #krate::BatchableResult },
+            ],
+        );
+    }
+}
+
+fn type_uses_type_params(ty: &syn::Type, known: &std::collections::HashSet<String>) -> bool {
+    let mut found = std::collections::HashSet::new();
+    collect_type_params(ty, known, &mut found);
+    !found.is_empty()
+}
+
+fn push_arg_type_bounds(generics: &mut syn::Generics, ty: &syn::Type, krate: &TokenStream) {
+    match ty {
+        syn::Type::Reference(reference) => match &*reference.elem {
+            syn::Type::Slice(slice) => {
+                push_type_bound(
+                    generics,
+                    &slice.elem,
+                    &[
+                        quote! { #krate::EncodeTypeDef },
+                        quote! { #krate::JsGeneric },
+                    ],
+                );
+            }
+            syn::Type::Path(path) if path_is_scoped_closure(path) => {}
+            syn::Type::Path(path) if path.path.segments.len() == 1 => {
+                let elem = &reference.elem;
+                push_type_bound(generics, elem, &[quote! { #krate::EncodeTypeDef }]);
+                push_reference_binary_encode_bound(generics, reference, krate);
+            }
+            _ => {
+                push_type_bound(
+                    generics,
+                    ty,
+                    &[
+                        quote! { #krate::EncodeTypeDef },
+                        quote! { #krate::BinaryEncode },
+                    ],
+                );
+            }
+        },
+        _ => {
+            push_type_bound(
+                generics,
+                ty,
+                &[
+                    quote! { #krate::EncodeTypeDef },
+                    quote! { #krate::BinaryEncode },
+                ],
+            );
+        }
+    }
+}
+
+fn path_is_scoped_closure(path: &syn::TypePath) -> bool {
+    path.path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "ScopedClosure" || segment.ident == "Closure")
+}
+
+fn push_reference_binary_encode_bound(
+    generics: &mut syn::Generics,
+    reference: &syn::TypeReference,
+    krate: &TokenStream,
+) {
+    let elem = &reference.elem;
+    let predicate = if let Some(lifetime) = &reference.lifetime {
+        let mutability = &reference.mutability;
+        syn::parse_quote! {
+            &#lifetime #mutability #elem: #krate::BinaryEncode
+        }
+    } else {
+        let mutability = &reference.mutability;
+        syn::parse_quote! {
+            for<'__wry_bindgen> &'__wry_bindgen #mutability #elem: #krate::BinaryEncode
+        }
+    };
+    generics.make_where_clause().predicates.push(predicate);
+}
+
+fn push_type_bound(generics: &mut syn::Generics, ty: &syn::Type, bounds: &[TokenStream]) {
+    let bounds = quote! { #(#bounds)+* };
+    let predicate = match ty {
+        syn::Type::Reference(reference) if reference.lifetime.is_none() => {
+            let mutability = &reference.mutability;
+            let elem = &reference.elem;
+            syn::parse_quote! {
+                for<'__wry_bindgen> &'__wry_bindgen #mutability #elem: #bounds
+            }
+        }
+        _ => syn::parse_quote! {
+            #ty: #bounds
+        },
+    };
+    generics.make_where_clause().predicates.push(predicate);
+}
+
+fn split_method_generics(
+    generics: &syn::Generics,
+    receiver: &syn::Type,
+) -> (syn::Generics, syn::Generics) {
+    let known_type_params: std::collections::HashSet<String> = generics
+        .type_params()
+        .map(|param| param.ident.to_string())
+        .collect();
+    let mut receiver_type_params = std::collections::HashSet::new();
+    collect_type_params(receiver, &known_type_params, &mut receiver_type_params);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for param in generics.type_params() {
+            if receiver_type_params.contains(&param.ident.to_string()) {
+                let before = receiver_type_params.len();
+                collect_type_params_from_bounds(
+                    &param.bounds,
+                    &known_type_params,
+                    &mut receiver_type_params,
+                );
+                if let Some(default) = &param.default {
+                    collect_type_params(default, &known_type_params, &mut receiver_type_params);
+                }
+                changed |= receiver_type_params.len() != before;
+            }
+        }
+    }
+
+    let mut impl_generics = generics.clone();
+    impl_generics.params = generics
+        .params
+        .iter()
+        .filter(|param| match param {
+            syn::GenericParam::Type(param) => {
+                receiver_type_params.contains(&param.ident.to_string())
+            }
+            syn::GenericParam::Lifetime(_) | syn::GenericParam::Const(_) => false,
+        })
+        .cloned()
+        .collect();
+    impl_generics.where_clause = None;
+
+    let mut method_generics = generics.clone();
+    method_generics.params = generics
+        .params
+        .iter()
+        .filter(|param| match param {
+            syn::GenericParam::Type(param) => {
+                !receiver_type_params.contains(&param.ident.to_string())
+            }
+            syn::GenericParam::Lifetime(_) | syn::GenericParam::Const(_) => true,
+        })
+        .cloned()
+        .collect();
+
+    (impl_generics, method_generics)
+}
+
+fn collect_type_params(
+    ty: &syn::Type,
+    known: &std::collections::HashSet<String>,
+    found: &mut std::collections::HashSet<String>,
+) {
+    match ty {
+        syn::Type::Reference(reference) => collect_type_params(&reference.elem, known, found),
+        syn::Type::Path(path) => {
+            if let Some(qself) = &path.qself {
+                collect_type_params(&qself.ty, known, found);
+            }
+            for segment in &path.path.segments {
+                let ident = segment.ident.to_string();
+                if known.contains(&ident) {
+                    found.insert(ident);
+                }
+                if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                    for arg in &args.args {
+                        match arg {
+                            syn::GenericArgument::Type(ty) => collect_type_params(ty, known, found),
+                            syn::GenericArgument::AssocType(assoc) => {
+                                collect_type_params(&assoc.ty, known, found);
+                            }
+                            _ => {}
+                        }
+                    }
+                } else if let syn::PathArguments::Parenthesized(args) = &segment.arguments {
+                    for input in &args.inputs {
+                        collect_type_params(input, known, found);
+                    }
+                    if let syn::ReturnType::Type(_, output) = &args.output {
+                        collect_type_params(output, known, found);
+                    }
+                }
+            }
+        }
+        syn::Type::TraitObject(trait_object) => {
+            for bound in &trait_object.bounds {
+                collect_type_params_from_bound(bound, known, found);
+            }
+        }
+        syn::Type::BareFn(function) => {
+            for input in &function.inputs {
+                collect_type_params(&input.ty, known, found);
+            }
+            if let syn::ReturnType::Type(_, output) = &function.output {
+                collect_type_params(output, known, found);
+            }
+        }
+        syn::Type::Tuple(tuple) => {
+            for elem in &tuple.elems {
+                collect_type_params(elem, known, found);
+            }
+        }
+        syn::Type::Paren(paren) => collect_type_params(&paren.elem, known, found),
+        syn::Type::Group(group) => collect_type_params(&group.elem, known, found),
+        syn::Type::Slice(slice) => collect_type_params(&slice.elem, known, found),
+        syn::Type::Array(array) => collect_type_params(&array.elem, known, found),
+        syn::Type::Ptr(ptr) => collect_type_params(&ptr.elem, known, found),
+        _ => {}
+    }
+}
+
+fn collect_constraining_type_params(
+    ty: &syn::Type,
+    known: &HashSet<String>,
+    found: &mut HashSet<String>,
+) -> bool {
+    match ty {
+        syn::Type::Reference(reference) => {
+            collect_constraining_type_params(&reference.elem, known, found)
+        }
+        syn::Type::Path(path) => {
+            if path.qself.is_some() {
+                let mut qself_params = HashSet::new();
+                collect_type_params(ty, known, &mut qself_params);
+                return qself_params.is_empty();
+            }
+
+            if path.path.segments.len() == 1 {
+                let segment = &path.path.segments[0];
+                let ident = segment.ident.to_string();
+                if known.contains(&ident) && segment.arguments.is_empty() {
+                    found.insert(ident);
+                    return true;
+                }
+            } else if path
+                .path
+                .segments
+                .first()
+                .is_some_and(|segment| known.contains(&segment.ident.to_string()))
+            {
+                return false;
+            }
+
+            for segment in &path.path.segments {
+                match &segment.arguments {
+                    syn::PathArguments::AngleBracketed(args) => {
+                        for arg in &args.args {
+                            match arg {
+                                syn::GenericArgument::Type(ty) => {
+                                    if !collect_constraining_type_params(ty, known, found) {
+                                        return false;
+                                    }
+                                }
+                                syn::GenericArgument::AssocType(assoc) => {
+                                    let mut assoc_params = HashSet::new();
+                                    collect_type_params(&assoc.ty, known, &mut assoc_params);
+                                    if !assoc_params.is_empty() {
+                                        return false;
+                                    }
+                                }
+                                syn::GenericArgument::Constraint(constraint) => {
+                                    let mut constraint_params = HashSet::new();
+                                    collect_type_params_from_bounds(
+                                        &constraint.bounds,
+                                        known,
+                                        &mut constraint_params,
+                                    );
+                                    if !constraint_params.is_empty() {
+                                        return false;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    syn::PathArguments::Parenthesized(args) => {
+                        let mut arg_params = HashSet::new();
+                        for input in &args.inputs {
+                            collect_type_params(input, known, &mut arg_params);
+                        }
+                        if let syn::ReturnType::Type(_, output) = &args.output {
+                            collect_type_params(output, known, &mut arg_params);
+                        }
+                        if !arg_params.is_empty() {
+                            return false;
+                        }
+                    }
+                    syn::PathArguments::None => {}
+                }
+            }
+            true
+        }
+        syn::Type::Tuple(tuple) => tuple
+            .elems
+            .iter()
+            .all(|elem| collect_constraining_type_params(elem, known, found)),
+        syn::Type::Paren(paren) => collect_constraining_type_params(&paren.elem, known, found),
+        syn::Type::Group(group) => collect_constraining_type_params(&group.elem, known, found),
+        syn::Type::Slice(slice) => collect_constraining_type_params(&slice.elem, known, found),
+        syn::Type::Array(array) => collect_constraining_type_params(&array.elem, known, found),
+        syn::Type::Ptr(ptr) => collect_constraining_type_params(&ptr.elem, known, found),
+        syn::Type::TraitObject(_) | syn::Type::BareFn(_) => {
+            let mut params = HashSet::new();
+            collect_type_params(ty, known, &mut params);
+            params.is_empty()
+        }
+        _ => true,
+    }
+}
+
+fn collect_type_params_from_bounds(
+    bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
+    known: &std::collections::HashSet<String>,
+    found: &mut std::collections::HashSet<String>,
+) {
+    for bound in bounds {
+        collect_type_params_from_bound(bound, known, found);
+    }
+}
+
+fn collect_type_params_from_bound(
+    bound: &syn::TypeParamBound,
+    known: &std::collections::HashSet<String>,
+    found: &mut std::collections::HashSet<String>,
+) {
+    if let syn::TypeParamBound::Trait(bound) = bound {
+        for segment in &bound.path.segments {
+            match &segment.arguments {
+                syn::PathArguments::AngleBracketed(args) => {
+                    for arg in &args.args {
+                        match arg {
+                            syn::GenericArgument::Type(ty) => {
+                                collect_type_params(ty, known, found);
+                            }
+                            syn::GenericArgument::AssocType(assoc) => {
+                                collect_type_params(&assoc.ty, known, found);
+                            }
+                            syn::GenericArgument::Constraint(constraint) => {
+                                collect_type_params_from_bounds(&constraint.bounds, known, found);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                syn::PathArguments::Parenthesized(args) => {
+                    for input in &args.inputs {
+                        collect_type_params(input, known, found);
+                    }
+                    if let syn::ReturnType::Type(_, output) = &args.output {
+                        collect_type_params(output, known, found);
+                    }
+                }
+                syn::PathArguments::None => {}
+            }
+        }
     }
 }
 

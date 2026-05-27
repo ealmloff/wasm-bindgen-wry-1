@@ -43,7 +43,7 @@ export function as_f64(x: any): number | null {
 export function debug_string(x: any): string {
   try {
     return x.toString();
-  } catch {
+  } catch (_error) {
     return "[unrepresentable]";
   }
 }
@@ -57,7 +57,7 @@ export function js_checked_div(a: any, b: any): any {
   }
 }
 export function js_pow(a: any, b: any): any {
-  return a ** b;
+  return Math.pow(a, b);
 }
 export function js_add(a: any, b: any): any {
   return a + b;
@@ -141,16 +141,15 @@ export function drop_heap_ref(heapId: number): void {
 }
 
 function disposeRustFunction(value: unknown): void {
-  const rustFunction = (
-    value as
-      | {
-          __wryRustFunction?: {
-            disposeFromRust?: () => void;
-          };
-        }
-      | undefined
-  )?.__wryRustFunction;
-  if (typeof rustFunction?.disposeFromRust === "function") {
+  const maybeWrapped = value as
+    | {
+        __wryRustFunction?: {
+          disposeFromRust?: () => void;
+        };
+      }
+    | undefined;
+  const rustFunction = maybeWrapped && maybeWrapped.__wryRustFunction;
+  if (rustFunction && typeof rustFunction.disposeFromRust === "function") {
     rustFunction.disposeFromRust();
   }
 }
