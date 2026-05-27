@@ -46,9 +46,38 @@ pub mod closure {
         // careful: must be Box<T> not just T because unsized PhantomData
         // seems to have weird interaction with Pin<>
         pub(crate) _phantom: core::marker::PhantomData<(&'a (), crate::alloc::boxed::Box<T>)>,
-        pub(crate) rust_callback: Option<crate::object_store::ObjectHandle>,
-        pub(crate) drop_rust_callback_on_drop: bool,
+        pub(crate) callback: CallbackOwnership,
         pub(crate) value: crate::JsValue,
+    }
+
+    /// Who is responsible for disposing the JS-side `RustFunction` wrapper that
+    /// backs a `ScopedClosure`. Encoding a Rust-owned callback to JS detaches it
+    /// (JS or a self-disposing once-cell takes over); destructors only dispose
+    /// in the `Owned` state.
+    #[derive(Clone, Copy)]
+    pub(crate) enum CallbackOwnership {
+        /// No Rust callback backing this closure (e.g., wrapping a raw JS function).
+        None,
+        /// Rust owns the callback; `ScopedClosure::drop` disposes it.
+        Owned(crate::object_store::ObjectHandle),
+        /// Ownership has been handed off. No dispose on drop, but encoders still
+        /// flush so JS receives the callable before the call that needs it.
+        Detached,
+    }
+
+    impl CallbackOwnership {
+        /// Encoding this closure to JS requires an immediate flush so the JS
+        /// side has the callable ready.
+        pub(crate) fn needs_flush(&self) -> bool {
+            !matches!(self, Self::None)
+        }
+
+        /// Transition `Owned` → `Detached`. No-op for `None` / `Detached`.
+        pub(crate) fn detach(&mut self) {
+            if matches!(self, Self::Owned(_)) {
+                *self = Self::Detached;
+            }
+        }
     }
 
     /// Owned closure handle. This follows upstream wasm-bindgen's alias direction.
@@ -493,8 +522,7 @@ impl<T: ?Sized> ScopedClosure<'static, T> {
             crate::__rt::wbg_cast::<CallbackKey<FnPtr>, crate::JsValue>(CallbackKey::new(key));
         Self {
             _phantom: core::marker::PhantomData,
-            rust_callback: Some(key),
-            drop_rust_callback_on_drop: true,
+            callback: crate::closure::CallbackOwnership::Owned(key),
             value,
         }
     }
@@ -511,8 +539,7 @@ impl<T: ?Sized> ScopedClosure<'static, T> {
             crate::__rt::wbg_cast::<CallbackKey<FnPtr>, crate::JsValue>(CallbackKey::new(key));
         Self {
             _phantom: core::marker::PhantomData,
-            rust_callback: Some(key),
-            drop_rust_callback_on_drop: true,
+            callback: crate::closure::CallbackOwnership::Owned(key),
             value,
         }
     }
@@ -539,10 +566,11 @@ impl<T: ?Sized> ScopedClosure<'static, T> {
         let value = crate::__rt::wbg_cast::<CallbackKey<FnPtr>, crate::JsValue>(
             CallbackKey::new_with_policy(key, crate::encode::CallbackPolicy::JsOwnedOnce),
         );
+        // Once-cells dispose themselves after the first call; the closure
+        // never disposes from Rust-side drop, but encoders still need to flush.
         Self {
             _phantom: core::marker::PhantomData,
-            rust_callback: Some(key),
-            drop_rust_callback_on_drop: false,
+            callback: crate::closure::CallbackOwnership::Detached,
             value,
         }
     }
@@ -560,10 +588,11 @@ where
 
 impl<T: ?Sized> Drop for ScopedClosure<'_, T> {
     fn drop(&mut self) {
-        if self.drop_rust_callback_on_drop && self.rust_callback.take().is_some() {
-            crate::batch::queue_js_dispose_and_drop_rust_function(self.value.id());
-            self.value.idx = crate::value::JSIDX_UNDEFINED;
+        if let crate::closure::CallbackOwnership::Owned(_) = self.callback {
+            crate::batch::queue_js_dispose_rust_function(self.value.id());
         }
+        // JsValue::drop runs after this (via field drop glue) and queues
+        // the heap-ref release.
     }
 }
 
@@ -754,7 +783,7 @@ where
         F: WasmClosureFnOnce<T, A, R> + MaybeUnwindSafe,
     {
         let mut closure = <F as WasmClosureFnOnce<T, A, R>>::into_closure(fn_once);
-        closure.drop_rust_callback_on_drop = false;
+        closure.callback.detach();
         closure
     }
 
@@ -763,7 +792,7 @@ where
         F: WasmClosureFnOnceAbort<T, A, R>,
     {
         let mut closure = <F as WasmClosureFnOnceAbort<T, A, R>>::into_closure(fn_once);
-        closure.drop_rust_callback_on_drop = false;
+        closure.callback.detach();
         closure
     }
 

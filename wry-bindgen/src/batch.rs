@@ -499,12 +499,13 @@ pub(crate) fn queue_js_drop(id: u64) {
     }
 }
 
-/// Queue a JS drop for a RustFunction heap ID, disposing the exact JS callable
-/// removed from the heap before the ID can be reused.
-pub(crate) fn queue_js_dispose_and_drop_rust_function(id: u64) {
+/// Mark the RustFunction wrapper at this heap ID as disposed. The heap-ref
+/// release is the responsibility of the caller — typically `JsValue::drop`
+/// running immediately after this via field-drop glue on `ScopedClosure`.
+pub(crate) fn queue_js_dispose_rust_function(id: u64) {
     debug_assert!(
         id >= JSIDX_RESERVED,
-        "Attempted to drop reserved JS heap ID {id}"
+        "Attempted to dispose reserved JS heap ID {id}"
     );
 
     let runtime_already_dropped = match RUNTIME.try_with(|state| {
@@ -520,20 +521,7 @@ pub(crate) fn queue_js_dispose_and_drop_rust_function(id: u64) {
         return;
     }
 
-    let id = match RUNTIME.try_with(|state| {
-        state.try_borrow_mut().ok().and_then(|mut runtime_stack| {
-            runtime_stack
-                .last_mut()
-                .map(|runtime| runtime.release_heap_id(id))
-        })
-    }) {
-        Ok(Some(id)) => id,
-        Ok(None) | Err(_) => return,
-    };
-    if let Some(id) = id {
-        crate::js_helpers::js_dispose_and_drop_rust_function(id);
-        recycle_heap_id_after_js_drop(id);
-    }
+    crate::js_helpers::js_dispose_rust_function(id);
 }
 
 fn recycle_heap_id_after_js_drop(id: u64) {

@@ -595,8 +595,7 @@ impl<F: ?Sized> BatchableResult for Closure<F> {
     fn try_placeholder(batch: &mut Runtime) -> Option<Self> {
         Some(Closure {
             _phantom: PhantomData,
-            rust_callback: None,
-            drop_rust_callback_on_drop: false,
+            callback: crate::closure::CallbackOwnership::None,
             value: JsValue::try_placeholder(batch)?,
         })
     }
@@ -923,8 +922,7 @@ macro_rules! impl_fnmut_stub {
                 );
                 crate::ScopedClosure {
                     _phantom: PhantomData,
-                    rust_callback: Some(handle),
-                    drop_rust_callback_on_drop: true,
+                    callback: crate::closure::CallbackOwnership::Owned(handle),
                     value,
                 }
             }
@@ -958,8 +956,7 @@ macro_rules! impl_fnmut_stub {
                 );
                 crate::ScopedClosure {
                     _phantom: PhantomData,
-                    rust_callback: Some(handle),
-                    drop_rust_callback_on_drop: true,
+                    callback: crate::closure::CallbackOwnership::Owned(handle),
                     value,
                 }
             }
@@ -994,8 +991,7 @@ macro_rules! impl_fnmut_stub {
                 );
                 crate::ScopedClosure {
                     _phantom: PhantomData,
-                    rust_callback: Some(handle),
-                    drop_rust_callback_on_drop: true,
+                    callback: crate::closure::CallbackOwnership::Owned(handle),
                     value,
                 }
             }
@@ -1029,8 +1025,7 @@ macro_rules! impl_fnmut_stub {
                 );
                 crate::ScopedClosure {
                     _phantom: PhantomData,
-                    rust_callback: Some(handle),
-                    drop_rust_callback_on_drop: true,
+                    callback: crate::closure::CallbackOwnership::Owned(handle),
                     value,
                 }
             }
@@ -1582,28 +1577,27 @@ impl<F: ?Sized> BinaryDecode for crate::Closure<F> {
         let value = <crate::JsValue as BinaryDecode>::decode(decoder)?;
         Ok(Self {
             _phantom: PhantomData,
-            rust_callback: None,
-            drop_rust_callback_on_drop: false,
+            callback: crate::closure::CallbackOwnership::None,
             value,
         })
     }
 }
 
 impl<F: ?Sized> BinaryEncode for crate::Closure<F> {
-    fn encode(self, encoder: &mut EncodedData) {
-        let rust_owned = self.rust_callback.is_some();
-        let this = core::mem::ManuallyDrop::new(self);
-        if rust_owned {
+    fn encode(mut self, encoder: &mut EncodedData) {
+        if self.callback.needs_flush() {
             encoder.mark_needs_flush();
         }
-        (&this.value).encode(encoder);
-        crate::batch::queue_js_drop(this.value.id());
+        // Hand the closure off to JS: ScopedClosure::drop must not dispose.
+        // JsValue::drop still queues the heap-ref release.
+        self.callback.detach();
+        (&self.value).encode(encoder);
     }
 }
 
 impl<F: ?Sized> BinaryEncode for &crate::ScopedClosure<'_, F> {
     fn encode(self, encoder: &mut EncodedData) {
-        if self.rust_callback.is_some() {
+        if self.callback.needs_flush() {
             encoder.mark_needs_flush();
         }
         // Encode the JsValue

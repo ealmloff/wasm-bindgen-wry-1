@@ -175,8 +175,8 @@ function disposeRustFunction(value: unknown): void {
   }
 }
 
-export function dispose_and_drop_rust_function(heapId: number): void {
-  const value = window.jsHeap.remove(heapId);
+export function dispose_rust_function(heapId: number): void {
+  const value = window.jsHeap.get(heapId);
   disposeRustFunction(value);
 }
 
