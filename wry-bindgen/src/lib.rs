@@ -335,7 +335,9 @@ impl convert::TryFromJsValue for bool {
 impl convert::TryFromJsValue for char {
     fn try_from_js_value_ref(value: &JsValue) -> Option<Self> {
         let s = value.as_string()?;
-        if s.len() == 1 { s.chars().next() } else { None }
+        let mut chars = s.chars();
+        let c = chars.next()?;
+        if chars.next().is_none() { Some(c) } else { None }
     }
 }
 
