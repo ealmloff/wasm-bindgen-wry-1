@@ -460,7 +460,7 @@ impl<T: EncodeTypeDef> EncodeTypeDef for &T {
 
 impl BinaryEncode for &str {
     fn encode(self, encoder: &mut EncodedData) {
-        encoder.push_str(self);
+        encode_str(self, encoder);
     }
 }
 
@@ -472,7 +472,7 @@ impl EncodeTypeDef for String {
 
 impl BinaryEncode for String {
     fn encode(self, encoder: &mut EncodedData) {
-        encoder.push_str(&self);
+        encode_str(&self, encoder);
     }
 }
 
@@ -480,6 +480,17 @@ impl BinaryDecode for String {
     fn decode(decoder: &mut DecodedData) -> Result<Self, DecodeError> {
         Ok(decoder.take_str()?.to_string())
     }
+}
+
+fn encode_str(value: &str, encoder: &mut EncodedData) {
+    #[cfg(feature = "enable-interning")]
+    if let Some(id) = crate::intern::unsafe_get_str(value) {
+        encoder.push_u32(crate::ipc::CACHED_STRING_SENTINEL);
+        encoder.push_u64(id);
+        return;
+    }
+
+    encoder.push_str(value);
 }
 
 impl<T: EncodeTypeDef> EncodeTypeDef for Option<T> {
@@ -1753,3 +1764,28 @@ impl BinaryDecode for Clamped<Vec<u8>> {
 }
 
 impl BatchableResult for Clamped<Vec<u8>> {}
+
+#[cfg(all(test, feature = "enable-interning"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interned_strings_encode_as_cached_heap_refs() {
+        crate::intern::insert_for_test("cached", 0x0000_0001_0000_0002);
+
+        let mut cached = EncodedData::new();
+        "cached".encode(&mut cached);
+        assert_eq!(
+            cached.u32_buf,
+            vec![crate::ipc::CACHED_STRING_SENTINEL, 2, 1]
+        );
+        assert!(cached.str_buf.is_empty());
+
+        let mut inline = EncodedData::new();
+        "uncached".encode(&mut inline);
+        assert_eq!(inline.u32_buf, vec![8]);
+        assert_eq!(inline.str_buf, b"uncached".to_vec());
+
+        crate::intern::unintern("cached");
+    }
+}

@@ -9,7 +9,7 @@ repository = "https://github.com/DioxusLabs/wasm-bindgen-wry"
 [features]
 default = ["std"]
 std = []
-enable-interning = []
+enable-interning = ["wry-bindgen/enable-interning"]
 msrv = []
 
 [dependencies]

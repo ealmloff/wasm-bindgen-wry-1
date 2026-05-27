@@ -50,6 +50,23 @@ pub(crate) fn test_convert_traits_are_marker_bounds() {
     assert_error::<JsError>();
 }
 
+pub(crate) fn test_interned_string_roundtrip() {
+    #[wasm_bindgen(inline_js = r#"
+        export function api_echo_string(value) {
+            return value;
+        }
+    "#)]
+    extern "C" {
+        fn api_echo_string(value: &str) -> String;
+    }
+
+    let interned = wasm_bindgen::intern("cached string");
+    assert_eq!(api_echo_string(interned), "cached string");
+
+    wasm_bindgen::unintern("cached string");
+    assert_eq!(api_echo_string("cached string"), "cached string");
+}
+
 pub(crate) fn test_jsvalue_abi_ref_preserves_heap_ref() {
     #[wasm_bindgen(inline_js = r#"
         export function api_abi_object(label) {

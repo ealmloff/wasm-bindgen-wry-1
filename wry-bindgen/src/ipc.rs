@@ -12,6 +12,8 @@ use alloc::vec::Vec;
 use base64::Engine;
 use core::fmt;
 
+pub(crate) const CACHED_STRING_SENTINEL: u32 = u32::MAX;
+
 /// Error type for decoding binary IPC messages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
@@ -503,7 +505,12 @@ impl EncodedData {
 
     /// Push a string to the buffer.
     pub(crate) fn push_str(&mut self, value: &str) {
-        self.push_u32(value.len() as u32);
+        let len = u32::try_from(value.len()).expect("string length exceeds u32::MAX");
+        assert_ne!(
+            len, CACHED_STRING_SENTINEL,
+            "string length conflicts with cached string sentinel"
+        );
+        self.push_u32(len);
         self.str_buf.extend_from_slice(value.as_bytes());
     }
 

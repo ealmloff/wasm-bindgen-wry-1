@@ -283,7 +283,7 @@ fn handle_rust_callback(data: &mut DecodedData) {
                 }
             }
         }
-        _ => todo!(),
+        _ => panic!("Unknown Rust callback function ID: {fn_id}"),
     };
     with_runtime(|runtime| runtime.ipc().js_response(runtime.webview_id(), response));
 }
