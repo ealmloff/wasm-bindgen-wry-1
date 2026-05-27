@@ -6,7 +6,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::cell::{Ref, RefCell, RefMut};
+use core::cell::RefCell;
 use std::boxed::Box;
 
 use crate::encode::{BatchableResult, BinaryDecode};
@@ -34,7 +34,7 @@ pub struct Runtime {
     type_cache: TypeCache,
     /// Stack of JS-originated IPC requests currently executing Rust code.
     inbound_js_request_stack: Vec<u32>,
-    /// Exported Rust structs stored by handle
+    /// Exported Rust structs and callbacks stored by handle.
     objects: BTreeMap<u32, Box<dyn Any>>,
     /// Rust-owned object handles to drop after the current encoded JS call
     /// has finished executing.
@@ -290,7 +290,7 @@ impl Runtime {
     /// Insert an exported object and return its handle.
     pub(crate) fn insert_object<T: 'static>(&mut self, obj: T) -> u32 {
         let handle = self.id_allocator.next_object_handle();
-        self.objects.insert(handle, Box::new(RefCell::new(obj)));
+        self.objects.insert(handle, Box::new(obj));
         handle
     }
 
@@ -318,26 +318,28 @@ impl Runtime {
         self.thread_locals.contains_key(&key)
     }
 
-    /// Get a reference to an exported object.
-    pub(crate) fn get_object<T: 'static>(&self, handle: u32) -> Ref<'_, T> {
+    pub(crate) fn get_object<T: 'static>(&self, handle: u32) -> &T {
         let boxed = self.objects.get(&handle).expect("invalid handle");
-        let cell = boxed.downcast_ref::<RefCell<T>>().expect("type mismatch");
-        cell.borrow()
+        boxed.downcast_ref::<T>().expect("type mismatch")
     }
 
-    /// Get a mutable reference to an exported object.
-    pub(crate) fn get_object_mut<T: 'static>(&self, handle: u32) -> RefMut<'_, T> {
-        let boxed = self.objects.get(&handle).expect("invalid handle");
-        let cell = boxed.downcast_ref::<RefCell<T>>().expect("type mismatch");
-        cell.borrow_mut()
+    pub(crate) fn take_object<T: 'static>(&mut self, handle: u32) -> T {
+        let boxed = self.objects.remove(&handle).expect("invalid handle");
+        *boxed.downcast::<T>().expect("type mismatch")
+    }
+
+    pub(crate) fn reinsert_object<T: 'static>(&mut self, handle: u32, obj: T) {
+        assert!(
+            self.objects.insert(handle, Box::new(obj)).is_none(),
+            "object handle {handle} was reinserted while occupied"
+        );
     }
 
     /// Remove an exported object and return it.
     pub(crate) fn remove_object<T: 'static>(&mut self, handle: u32) -> T {
         let boxed = self.objects.remove(&handle).expect("invalid handle");
         self.id_allocator.release_object_handle(handle);
-        let cell = boxed.downcast::<RefCell<T>>().expect("type mismatch");
-        cell.into_inner()
+        *boxed.downcast::<T>().expect("type mismatch")
     }
 
     pub(crate) fn remove_object_untyped(&mut self, handle: u32) -> Option<Box<dyn Any>> {

@@ -59,7 +59,7 @@ pub mod closure {
         /// No Rust callback backing this closure (e.g., wrapping a raw JS function).
         None,
         /// Rust owns the callback; `ScopedClosure::drop` disposes it.
-        Owned(crate::object_store::ObjectHandle),
+        Owned,
         /// Ownership has been handed off. No dispose on drop, but encoders still
         /// flush so JS receives the callable before the call that needs it.
         Detached,
@@ -74,7 +74,7 @@ pub mod closure {
 
         /// Transition `Owned` → `Detached`. No-op for `None` / `Detached`.
         pub(crate) fn detach(&mut self) {
-            if matches!(self, Self::Owned(_)) {
+            if matches!(self, Self::Owned) {
                 *self = Self::Detached;
             }
         }
@@ -337,7 +337,11 @@ impl convert::TryFromJsValue for char {
         let s = value.as_string()?;
         let mut chars = s.chars();
         let c = chars.next()?;
-        if chars.next().is_none() { Some(c) } else { None }
+        if chars.next().is_none() {
+            Some(c)
+        } else {
+            None
+        }
     }
 }
 
@@ -524,7 +528,7 @@ impl<T: ?Sized> ScopedClosure<'static, T> {
             crate::__rt::wbg_cast::<CallbackKey<FnPtr>, crate::JsValue>(CallbackKey::new(key));
         Self {
             _phantom: core::marker::PhantomData,
-            callback: crate::closure::CallbackOwnership::Owned(key),
+            callback: crate::closure::CallbackOwnership::Owned,
             value,
         }
     }
@@ -541,7 +545,7 @@ impl<T: ?Sized> ScopedClosure<'static, T> {
             crate::__rt::wbg_cast::<CallbackKey<FnPtr>, crate::JsValue>(CallbackKey::new(key));
         Self {
             _phantom: core::marker::PhantomData,
-            callback: crate::closure::CallbackOwnership::Owned(key),
+            callback: crate::closure::CallbackOwnership::Owned,
             value,
         }
     }
@@ -587,7 +591,7 @@ where
 
 impl<T: ?Sized> Drop for ScopedClosure<'_, T> {
     fn drop(&mut self) {
-        if let crate::closure::CallbackOwnership::Owned(_) = self.callback {
+        if let crate::closure::CallbackOwnership::Owned = self.callback {
             crate::batch::queue_js_dispose_rust_function(self.value.id());
         }
         // JsValue::drop runs after this (via field drop glue) and queues

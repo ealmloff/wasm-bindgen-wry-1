@@ -196,6 +196,7 @@ fn build_tests() -> Vec<TestCase> {
         roundtrip::test_roundtrip,
         callbacks::test_call_callback,
         callbacks::test_dropped_closure_disposes_js_callable,
+        callbacks::test_exported_method_drop_closure_disposes_js_callable,
         callbacks::test_mut_dyn_fn,
         callbacks::test_mut_dyn_fnmut,
         callbacks::test_batch_flushed_heap_ref_return_with_stack_callback,

@@ -1,6 +1,10 @@
 use futures_util::{StreamExt, stream::futures_unordered};
 use std::cell::Cell;
-use wasm_bindgen::{Closure, batch::batch, wasm_bindgen};
+use wasm_bindgen::{
+    Closure,
+    batch::{batch, force_flush},
+    wasm_bindgen,
+};
 use wry_launch::JsValue;
 
 pub(crate) fn test_call_callback() {
@@ -83,6 +87,74 @@ pub(crate) fn test_dropped_closure_disposes_js_callable() {
     );
 
     clear_callback_for_drop_test();
+}
+
+#[wasm_bindgen(inline_js = r#"
+    let storedRuntimeBorrowedDropCallback = null;
+
+    export function store_callback_for_runtime_borrowed_drop_test(cb) {
+        storedRuntimeBorrowedDropCallback = cb;
+    }
+
+    export function drop_callback_from_exported_method(fixture) {
+        fixture.dropCallback();
+    }
+
+    export function runtime_borrowed_dropped_callback_throws() {
+        try {
+            storedRuntimeBorrowedDropCallback(1);
+            return false;
+        } catch (error) {
+            return String(error && error.message ? error.message : error)
+                .includes("already been dropped");
+        }
+    }
+
+    export function clear_runtime_borrowed_drop_callback() {
+        storedRuntimeBorrowedDropCallback = null;
+    }
+"#)]
+extern "C" {
+    fn store_callback_for_runtime_borrowed_drop_test(cb: &Closure<dyn FnMut(u32)>);
+    fn drop_callback_from_exported_method(fixture: &JsValue);
+    fn runtime_borrowed_dropped_callback_throws() -> bool;
+    fn clear_runtime_borrowed_drop_callback();
+}
+
+#[wasm_bindgen]
+pub struct RuntimeBorrowedDropFixture {
+    callback: Option<Closure<dyn FnMut(u32)>>,
+}
+
+#[wasm_bindgen]
+impl RuntimeBorrowedDropFixture {
+    #[wasm_bindgen(constructor)]
+    pub fn new(_tag: u32) -> Self {
+        let callback = Closure::new(|_| {});
+        store_callback_for_runtime_borrowed_drop_test(&callback);
+        Self {
+            callback: Some(callback),
+        }
+    }
+
+    #[wasm_bindgen(js_name = dropCallback)]
+    pub fn drop_callback(&mut self) {
+        drop(self.callback.take());
+    }
+}
+
+pub(crate) fn test_exported_method_drop_closure_disposes_js_callable() {
+    let fixture = JsValue::from(RuntimeBorrowedDropFixture::new(0));
+
+    drop_callback_from_exported_method(&fixture);
+    force_flush();
+
+    assert!(
+        runtime_borrowed_dropped_callback_throws(),
+        "closure dropped inside exported method should dispose the JS callable"
+    );
+
+    clear_runtime_borrowed_drop_callback();
 }
 
 pub(crate) async fn test_join_many_callbacks_async() {

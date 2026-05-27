@@ -933,7 +933,7 @@ macro_rules! impl_fnmut_stub {
                 );
                 crate::ScopedClosure {
                     _phantom: PhantomData,
-                    callback: crate::closure::CallbackOwnership::Owned(handle),
+                    callback: crate::closure::CallbackOwnership::Owned,
                     value,
                 }
             }
@@ -967,7 +967,7 @@ macro_rules! impl_fnmut_stub {
                 );
                 crate::ScopedClosure {
                     _phantom: PhantomData,
-                    callback: crate::closure::CallbackOwnership::Owned(handle),
+                    callback: crate::closure::CallbackOwnership::Owned,
                     value,
                 }
             }
@@ -1002,7 +1002,7 @@ macro_rules! impl_fnmut_stub {
                 );
                 crate::ScopedClosure {
                     _phantom: PhantomData,
-                    callback: crate::closure::CallbackOwnership::Owned(handle),
+                    callback: crate::closure::CallbackOwnership::Owned,
                     value,
                 }
             }
@@ -1036,7 +1036,7 @@ macro_rules! impl_fnmut_stub {
                 );
                 crate::ScopedClosure {
                     _phantom: PhantomData,
-                    callback: crate::closure::CallbackOwnership::Owned(handle),
+                    callback: crate::closure::CallbackOwnership::Owned,
                     value,
                 }
             }
