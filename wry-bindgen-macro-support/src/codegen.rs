@@ -427,24 +427,6 @@ fn generate_type(ty: &ImportType, krate: &TokenStream) -> syn::Result<TokenStrea
             }
         }
 
-        impl #impl_generics #krate::convert::IntoWasmAbi for #rust_name #ty_generics #where_clause {
-            type Abi = <#krate::JsValue as #krate::convert::IntoWasmAbi>::Abi;
-
-            #[inline]
-            fn into_abi(self) -> Self::Abi {
-                <#krate::JsValue as #krate::convert::IntoWasmAbi>::into_abi(::core::convert::Into::into(self))
-            }
-        }
-
-        impl #impl_generics #krate::convert::FromWasmAbi for #rust_name #ty_generics #where_clause {
-            type Abi = <#krate::JsValue as #krate::convert::FromWasmAbi>::Abi;
-
-            #[inline]
-            unsafe fn from_abi(js: Self::Abi) -> Self {
-                let value = unsafe { <#krate::JsValue as #krate::convert::FromWasmAbi>::from_abi(js) };
-                <Self as #krate::JsCast>::unchecked_from_js(value)
-            }
-        }
     };
 
     let mut upcast_impls = TokenStream::new();

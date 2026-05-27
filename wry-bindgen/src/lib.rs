@@ -388,7 +388,7 @@ impl convert::TryFromJsValue for i128 {
 
 impl convert::TryFromJsValue for u128 {
     fn try_from_js_value_ref(v: &JsValue) -> Option<u128> {
-        crate::js_helpers::js_bigint_get_as_i64(v).map(|value| value as u128)
+        crate::js_helpers::js_bigint_to_string(v)?.parse().ok()
     }
 }
 
@@ -816,7 +816,7 @@ pub struct JsStatic<T: 'static> {
 
 #[cfg(feature = "std")]
 #[allow(deprecated)]
-impl<T: crate::convert::FromWasmAbi + 'static> Deref for JsStatic<T> {
+impl<T: 'static> Deref for JsStatic<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -902,16 +902,6 @@ impl From<JsError> for JsValue {
     }
 }
 
-#[cfg(feature = "std")]
-impl<E> From<E> for JsError
-where
-    E: std::error::Error,
-{
-    fn from(error: E) -> Self {
-        JsError::new(&error.to_string())
-    }
-}
-
 impl From<JsValue> for JsError {
     fn from(value: JsValue) -> Self {
         JsError { value }
@@ -941,6 +931,9 @@ impl core::fmt::Display for JsError {
         write!(f, "JsError")
     }
 }
+
+#[cfg(feature = "std")]
+impl std::error::Error for JsError {}
 
 impl JsCast for JsError {
     fn instanceof(val: &JsValue) -> bool {
@@ -993,22 +986,6 @@ impl IntoJsGeneric for JsError {
     }
 }
 
-impl convert::IntoWasmAbi for JsError {
-    type Abi = <JsValue as convert::IntoWasmAbi>::Abi;
-
-    fn into_abi(self) -> Self::Abi {
-        self.value.into_abi()
-    }
-}
-
-impl convert::FromWasmAbi for JsError {
-    type Abi = <JsValue as convert::FromWasmAbi>::Abi;
-
-    unsafe fn from_abi(js: Self::Abi) -> Self {
-        unsafe { <JsValue as convert::FromWasmAbi>::from_abi(js) }.into()
-    }
-}
-
 impl convert::UpcastFrom<JsError> for JsError {}
 impl convert::UpcastFrom<JsError> for JsValue {}
 
@@ -1017,9 +994,8 @@ pub mod sys {
 
     use crate::{
         BinaryDecode, BinaryEncode, DecodeError, DecodedData, EncodeTypeDef, EncodedData,
-        ErasableGeneric, IntoJsGeneric, JsCast, JsError, JsGeneric, JsValue,
-        batch::Runtime,
-        convert::{FromWasmAbi, IntoWasmAbi, UpcastFrom},
+        ErasableGeneric, IntoJsGeneric, JsCast, JsError, JsGeneric, JsValue, batch::Runtime,
+        convert::UpcastFrom,
     };
 
     /// Marker trait for values that are either a resolution value or a promise-like value.
@@ -1128,22 +1104,6 @@ pub mod sys {
 
                 fn to_js(self) -> Self {
                     self
-                }
-            }
-
-            impl IntoWasmAbi for $name {
-                type Abi = <JsValue as IntoWasmAbi>::Abi;
-
-                fn into_abi(self) -> Self::Abi {
-                    self.obj.into_abi()
-                }
-            }
-
-            impl FromWasmAbi for $name {
-                type Abi = <JsValue as FromWasmAbi>::Abi;
-
-                unsafe fn from_abi(js: Self::Abi) -> Self {
-                    unsafe { <JsValue as FromWasmAbi>::from_abi(js) }.into()
                 }
             }
 
@@ -1349,22 +1309,6 @@ pub mod sys {
 
         fn to_js(self) -> Self {
             self
-        }
-    }
-
-    impl<T> IntoWasmAbi for JsOption<T> {
-        type Abi = <JsValue as IntoWasmAbi>::Abi;
-
-        fn into_abi(self) -> Self::Abi {
-            self.obj.into_abi()
-        }
-    }
-
-    impl<T> FromWasmAbi for JsOption<T> {
-        type Abi = <JsValue as FromWasmAbi>::Abi;
-
-        unsafe fn from_abi(js: Self::Abi) -> Self {
-            unsafe { <JsValue as FromWasmAbi>::from_abi(js) }.into()
         }
     }
 

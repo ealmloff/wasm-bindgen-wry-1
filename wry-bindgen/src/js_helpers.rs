@@ -59,6 +59,9 @@ extern "C" {
     #[wasm_bindgen(js_name = "bigint_get_as_i64")]
     pub(crate) fn js_bigint_get_as_i64(x: &JsValue) -> Option<i64>;
 
+    #[wasm_bindgen(js_name = "bigint_to_string")]
+    pub(crate) fn js_bigint_to_string(x: &JsValue) -> Option<String>;
+
     #[wasm_bindgen(js_name = "reflect_get")]
     pub(crate) fn js_reflect_get(target: &JsValue, key: &JsValue) -> JsValue;
 

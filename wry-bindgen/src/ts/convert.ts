@@ -49,6 +49,9 @@ export function symbol_new(description: string | null): symbol {
 export function bigint_get_as_i64(x: any): number | null {
   return typeof x === "bigint" ? Number(BigInt.asIntN(64, x)) : null;
 }
+export function bigint_to_string(x: any): string | null {
+  return typeof x === "bigint" ? x.toString() : null;
+}
 export function reflect_get(target: any, key: any): any {
   return Reflect.get(target, key);
 }
