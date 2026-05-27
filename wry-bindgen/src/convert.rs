@@ -21,6 +21,11 @@ pub trait IntoWasmAbi {
     fn into_abi(self) -> Self::Abi;
 }
 
+/// Indicates that this type can be sent to JS as `Option<Self>`.
+pub trait OptionIntoWasmAbi: IntoWasmAbi {
+    fn none() -> Self::Abi;
+}
+
 /// Trait for converting from a WebAssembly ABI representation to a Rust type.
 ///
 /// # Safety
@@ -34,6 +39,137 @@ pub trait FromWasmAbi: BinaryDecode + EncodeTypeDef {
     /// # Safety
     /// The caller must ensure the ABI value is valid.
     unsafe fn from_abi(js: Self::Abi) -> Self;
+}
+
+/// Indicates that this type can be received from JS as `Option<Self>`.
+pub trait OptionFromWasmAbi: FromWasmAbi {
+    fn is_none(abi: &Self::Abi) -> bool;
+}
+
+/// Marker for types that map to primitive Wasm ABI values.
+///
+/// # Safety
+///
+/// Implementors must be plain scalar ABI values that can be safely defaulted
+/// and copied across the generated Wasm boundary without additional resource
+/// management.
+pub unsafe trait WasmPrimitive: Default {}
+
+unsafe impl WasmPrimitive for u32 {}
+unsafe impl WasmPrimitive for i32 {}
+unsafe impl WasmPrimitive for u64 {}
+unsafe impl WasmPrimitive for i64 {}
+unsafe impl WasmPrimitive for f32 {}
+unsafe impl WasmPrimitive for f64 {}
+unsafe impl WasmPrimitive for () {}
+
+/// A type that can be split into up to four primitive ABI values.
+pub trait WasmAbi {
+    type Prim1: WasmPrimitive;
+    type Prim2: WasmPrimitive;
+    type Prim3: WasmPrimitive;
+    type Prim4: WasmPrimitive;
+
+    fn split(self) -> (Self::Prim1, Self::Prim2, Self::Prim3, Self::Prim4);
+
+    fn join(prim1: Self::Prim1, prim2: Self::Prim2, prim3: Self::Prim3, prim4: Self::Prim4)
+    -> Self;
+}
+
+impl<T: WasmPrimitive> WasmAbi for T {
+    type Prim1 = T;
+    type Prim2 = ();
+    type Prim3 = ();
+    type Prim4 = ();
+
+    #[inline]
+    fn split(self) -> (Self, (), (), ()) {
+        (self, (), (), ())
+    }
+
+    #[inline]
+    fn join(prim: Self, _: (), _: (), _: ()) -> Self {
+        prim
+    }
+}
+
+impl WasmAbi for i128 {
+    type Prim1 = u64;
+    type Prim2 = u64;
+    type Prim3 = ();
+    type Prim4 = ();
+
+    #[inline]
+    fn split(self) -> (u64, u64, (), ()) {
+        let low = self as u64;
+        let high = (self >> 64) as u64;
+        (low, high, (), ())
+    }
+
+    #[inline]
+    fn join(low: u64, high: u64, _: (), _: ()) -> Self {
+        (((high as u128) << 64) | low as u128) as i128
+    }
+}
+
+impl WasmAbi for u128 {
+    type Prim1 = u64;
+    type Prim2 = u64;
+    type Prim3 = ();
+    type Prim4 = ();
+
+    #[inline]
+    fn split(self) -> (u64, u64, (), ()) {
+        let low = self as u64;
+        let high = (self >> 64) as u64;
+        (low, high, (), ())
+    }
+
+    #[inline]
+    fn join(low: u64, high: u64, _: (), _: ()) -> Self {
+        ((high as u128) << 64) | low as u128
+    }
+}
+
+impl<T: WasmAbi<Prim4 = ()>> WasmAbi for Option<T> {
+    type Prim1 = u32;
+    type Prim2 = T::Prim1;
+    type Prim3 = T::Prim2;
+    type Prim4 = T::Prim3;
+
+    #[inline]
+    fn split(self) -> (u32, T::Prim1, T::Prim2, T::Prim3) {
+        match self {
+            None => (
+                0,
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            ),
+            Some(value) => {
+                let (prim1, prim2, prim3, ()) = value.split();
+                (1, prim1, prim2, prim3)
+            }
+        }
+    }
+
+    #[inline]
+    fn join(is_some: u32, prim1: T::Prim1, prim2: T::Prim2, prim3: T::Prim3) -> Self {
+        if is_some == 0 {
+            None
+        } else {
+            Some(T::join(prim1, prim2, prim3, ()))
+        }
+    }
+}
+
+/// Converts a `JsValue` into a Rust type by checking at runtime.
+pub trait TryFromJsValue: Sized {
+    fn try_from_js_value(value: JsValue) -> Result<Self, JsValue> {
+        Self::try_from_js_value_ref(&value).ok_or(value)
+    }
+
+    fn try_from_js_value_ref(value: &JsValue) -> Option<Self>;
 }
 
 // JsValue uses u32 as its ABI type for wasm-bindgen compatibility
@@ -53,6 +189,20 @@ impl FromWasmAbi for JsValue {
 
     unsafe fn from_abi(js: Self::Abi) -> Self {
         JsValue::from_id(js as u64)
+    }
+}
+
+impl OptionIntoWasmAbi for JsValue {
+    #[inline]
+    fn none() -> u32 {
+        crate::value::JSIDX_UNDEFINED as u32
+    }
+}
+
+impl OptionFromWasmAbi for JsValue {
+    #[inline]
+    fn is_none(js: &u32) -> bool {
+        unsafe { Self::from_abi(*js) }.is_undefined()
     }
 }
 
@@ -93,20 +243,236 @@ impl IntoWasmAbi for &JsValue {
     }
 }
 
-// Implement for Option<JsValue>
-impl IntoWasmAbi for Option<JsValue> {
+impl OptionIntoWasmAbi for &JsValue {
+    #[inline]
+    fn none() -> u32 {
+        crate::value::JSIDX_UNDEFINED as u32
+    }
+}
+
+const U32_ABI_OPTION_SENTINEL: u32 = 0x00FF_FFFF;
+
+macro_rules! impl_abi_same {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl IntoWasmAbi for $ty {
+                type Abi = $ty;
+
+                #[inline]
+                fn into_abi(self) -> Self::Abi {
+                    self
+                }
+            }
+
+            impl FromWasmAbi for $ty {
+                type Abi = $ty;
+
+                #[inline]
+                unsafe fn from_abi(js: Self::Abi) -> Self {
+                    js
+                }
+            }
+        )*
+    };
+}
+
+impl_abi_same!(u64, i64, u128, i128, f32, f64);
+
+macro_rules! impl_abi_u32 {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl IntoWasmAbi for $ty {
+                type Abi = u32;
+
+                #[inline]
+                fn into_abi(self) -> Self::Abi {
+                    self as u32
+                }
+            }
+
+            impl FromWasmAbi for $ty {
+                type Abi = u32;
+
+                #[inline]
+                unsafe fn from_abi(js: Self::Abi) -> Self {
+                    js as $ty
+                }
+            }
+
+            impl OptionIntoWasmAbi for $ty {
+                #[inline]
+                fn none() -> u32 {
+                    U32_ABI_OPTION_SENTINEL
+                }
+            }
+
+            impl OptionFromWasmAbi for $ty {
+                #[inline]
+                fn is_none(js: &u32) -> bool {
+                    *js == U32_ABI_OPTION_SENTINEL
+                }
+            }
+        )*
+    };
+}
+
+impl_abi_u32!(i8, u8, i16, u16);
+
+impl IntoWasmAbi for u32 {
     type Abi = u32;
 
+    #[inline]
+    fn into_abi(self) -> Self::Abi {
+        self
+    }
+}
+
+impl FromWasmAbi for u32 {
+    type Abi = u32;
+
+    #[inline]
+    unsafe fn from_abi(js: Self::Abi) -> Self {
+        js
+    }
+}
+
+impl IntoWasmAbi for i32 {
+    type Abi = u32;
+
+    #[inline]
+    fn into_abi(self) -> Self::Abi {
+        self as u32
+    }
+}
+
+impl FromWasmAbi for i32 {
+    type Abi = u32;
+
+    #[inline]
+    unsafe fn from_abi(js: Self::Abi) -> Self {
+        js as i32
+    }
+}
+
+impl IntoWasmAbi for bool {
+    type Abi = u32;
+
+    #[inline]
+    fn into_abi(self) -> Self::Abi {
+        self as u32
+    }
+}
+
+impl FromWasmAbi for bool {
+    type Abi = u32;
+
+    #[inline]
+    unsafe fn from_abi(js: Self::Abi) -> Self {
+        js != 0
+    }
+}
+
+impl IntoWasmAbi for char {
+    type Abi = u32;
+
+    #[inline]
+    fn into_abi(self) -> Self::Abi {
+        self as u32
+    }
+}
+
+impl FromWasmAbi for char {
+    type Abi = u32;
+
+    #[inline]
+    unsafe fn from_abi(js: Self::Abi) -> Self {
+        char::from_u32(js).unwrap_or('\0')
+    }
+}
+
+impl OptionIntoWasmAbi for bool {
+    #[inline]
+    fn none() -> u32 {
+        U32_ABI_OPTION_SENTINEL
+    }
+}
+
+impl OptionFromWasmAbi for bool {
+    #[inline]
+    fn is_none(js: &u32) -> bool {
+        *js == U32_ABI_OPTION_SENTINEL
+    }
+}
+
+impl OptionIntoWasmAbi for char {
+    #[inline]
+    fn none() -> u32 {
+        U32_ABI_OPTION_SENTINEL
+    }
+}
+
+impl OptionFromWasmAbi for char {
+    #[inline]
+    fn is_none(js: &u32) -> bool {
+        *js == U32_ABI_OPTION_SENTINEL
+    }
+}
+
+impl OptionIntoWasmAbi for u32 {
+    #[inline]
+    fn none() -> u32 {
+        U32_ABI_OPTION_SENTINEL
+    }
+}
+
+impl OptionFromWasmAbi for u32 {
+    #[inline]
+    fn is_none(js: &u32) -> bool {
+        *js == U32_ABI_OPTION_SENTINEL
+    }
+}
+
+impl OptionIntoWasmAbi for i32 {
+    #[inline]
+    fn none() -> u32 {
+        U32_ABI_OPTION_SENTINEL
+    }
+}
+
+impl OptionFromWasmAbi for i32 {
+    #[inline]
+    fn is_none(js: &u32) -> bool {
+        *js == U32_ABI_OPTION_SENTINEL
+    }
+}
+
+impl<T: OptionIntoWasmAbi> IntoWasmAbi for Option<T> {
+    type Abi = T::Abi;
+
+    #[inline]
     fn into_abi(self) -> Self::Abi {
         match self {
-            Some(val) => val.into_abi(),
-            None => 0, // Use 0 as sentinel for None
+            Some(value) => value.into_abi(),
+            None => T::none(),
         }
     }
 }
 
-use crate::JsCast;
+impl<T: OptionFromWasmAbi> FromWasmAbi for Option<T> {
+    type Abi = T::Abi;
+
+    #[inline]
+    unsafe fn from_abi(js: Self::Abi) -> Self {
+        if T::is_none(&js) {
+            None
+        } else {
+            Some(unsafe { T::from_abi(js) })
+        }
+    }
+}
+
 use crate::ipc::{DecodeError, DecodedData};
+use crate::{ErasableGeneric, JsCast};
 use core::marker::PhantomData;
 
 /// Marker for type-safe generic upcast relationships.
@@ -117,11 +483,8 @@ pub trait Upcast<T: ?Sized> {
     #[inline]
     fn upcast(&self) -> &T
     where
-        Self: crate::__rt::marker::ErasableGeneric,
-        T: Sized
-            + crate::__rt::marker::ErasableGeneric<
-                Repr = <Self as crate::__rt::marker::ErasableGeneric>::Repr,
-            >,
+        Self: ErasableGeneric,
+        T: Sized + ErasableGeneric<Repr = <Self as ErasableGeneric>::Repr>,
     {
         unsafe { &*(self as *const Self as *const T) }
     }
@@ -129,11 +492,8 @@ pub trait Upcast<T: ?Sized> {
     #[inline]
     fn upcast_into(self) -> T
     where
-        Self: Sized + crate::__rt::marker::ErasableGeneric,
-        T: Sized
-            + crate::__rt::marker::ErasableGeneric<
-                Repr = <Self as crate::__rt::marker::ErasableGeneric>::Repr,
-            >,
+        Self: Sized + ErasableGeneric,
+        T: Sized + ErasableGeneric<Repr = <Self as ErasableGeneric>::Repr>,
     {
         unsafe { core::mem::transmute_copy(&core::mem::ManuallyDrop::new(self)) }
     }

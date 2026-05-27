@@ -3,8 +3,9 @@
 //! This type represents a reference to a JavaScript value on the JS heap.
 //! API compatible with wasm-bindgen's JsValue.
 
-use alloc::string::String;
+use alloc::{boxed::Box, string::String, vec::Vec};
 use core::fmt;
+use core::ptr::NonNull;
 
 /// Offset for reserved JS value indices.
 /// Values below JSIDX_RESERVED are special constants that don't need drop/clone.
@@ -40,6 +41,9 @@ pub struct JsValue {
     #[doc(hidden)]
     pub idx: u64,
 }
+
+unsafe impl Send for JsValue {}
+unsafe impl Sync for JsValue {}
 
 impl JsValue {
     /// The `null` JS value constant.
@@ -127,6 +131,16 @@ impl JsValue {
     pub fn from_f64(n: f64) -> JsValue {
         n.into()
     }
+
+    /// Creates a JS value which is a bigint from a string representing a number.
+    pub fn bigint_from_str(s: &str) -> JsValue {
+        crate::js_helpers::js_bigint_from_str(s)
+    }
+
+    /// Creates a new JS symbol with the optional description specified.
+    pub fn symbol(description: Option<&str>) -> JsValue {
+        crate::js_helpers::js_symbol_new(description)
+    }
 }
 
 impl Clone for JsValue {
@@ -155,8 +169,8 @@ impl Drop for JsValue {
     }
 }
 
-impl PartialEq<&str> for JsValue {
-    fn eq(&self, other: &&str) -> bool {
+impl<'a> PartialEq<&'a str> for JsValue {
+    fn eq(&self, other: &&'a str) -> bool {
         match self.as_string() {
             Some(s) => &s == other,
             None => false,
@@ -200,8 +214,8 @@ impl PartialEq<JsValue> for String {
     }
 }
 
-impl PartialEq<&String> for JsValue {
-    fn eq(&self, other: &&String) -> bool {
+impl<'a> PartialEq<&'a String> for JsValue {
+    fn eq(&self, other: &&'a String) -> bool {
         match self.as_string() {
             Some(s) => &s == *other,
             None => false,
@@ -330,12 +344,12 @@ impl Default for JsValue {
 // Additional methods needed by js-sys for BigInt operations
 impl JsValue {
     /// Checked division.
-    pub fn checked_div(&self, rhs: &JsValue) -> JsValue {
+    pub fn checked_div(&self, rhs: &Self) -> Self {
         crate::js_helpers::js_checked_div(self, rhs)
     }
 
     /// Power operation.
-    pub fn pow(&self, rhs: &JsValue) -> JsValue {
+    pub fn pow(&self, rhs: &Self) -> Self {
         crate::js_helpers::js_pow(self, rhs)
     }
 
@@ -370,7 +384,7 @@ impl JsValue {
     }
 
     /// Unsigned right shift.
-    pub fn unsigned_shr(&self, rhs: &JsValue) -> u32 {
+    pub fn unsigned_shr(&self, rhs: &Self) -> u32 {
         crate::js_helpers::js_unsigned_shr(self, rhs)
     }
 
@@ -405,28 +419,28 @@ impl JsValue {
     }
 
     /// Less than comparison.
-    pub fn lt(&self, rhs: &JsValue) -> bool {
-        crate::js_helpers::js_lt(self, rhs)
+    pub fn lt(&self, other: &Self) -> bool {
+        crate::js_helpers::js_lt(self, other)
     }
 
     /// Less than or equal comparison.
-    pub fn le(&self, rhs: &JsValue) -> bool {
-        crate::js_helpers::js_le(self, rhs)
+    pub fn le(&self, other: &Self) -> bool {
+        crate::js_helpers::js_le(self, other)
     }
 
     /// Greater than comparison.
-    pub fn gt(&self, rhs: &JsValue) -> bool {
-        crate::js_helpers::js_gt(self, rhs)
+    pub fn gt(&self, other: &Self) -> bool {
+        crate::js_helpers::js_gt(self, other)
     }
 
     /// Greater than or equal comparison.
-    pub fn ge(&self, rhs: &JsValue) -> bool {
-        crate::js_helpers::js_ge(self, rhs)
+    pub fn ge(&self, other: &Self) -> bool {
+        crate::js_helpers::js_ge(self, other)
     }
 
     /// Loose equality (==).
-    pub fn loose_eq(&self, rhs: &JsValue) -> bool {
-        crate::js_helpers::js_loose_eq(self, rhs)
+    pub fn loose_eq(&self, other: &Self) -> bool {
+        crate::js_helpers::js_loose_eq(self, other)
     }
 
     /// Check if this value is a falsy value in JavaScript.
@@ -464,6 +478,11 @@ impl JsValue {
         crate::js_helpers::js_is_bigint(self)
     }
 
+    /// Check if this value is an Array.
+    pub fn is_array(&self) -> bool {
+        crate::js_helpers::js_is_array(self)
+    }
+
     /// Check if this value is undefined.
     pub fn is_undefined(&self) -> bool {
         if self.idx == JSIDX_UNDEFINED {
@@ -478,6 +497,14 @@ impl JsValue {
             return true;
         }
         crate::js_helpers::js_is_null(self)
+    }
+
+    /// Check if this value is null or undefined.
+    pub fn is_null_or_undefined(&self) -> bool {
+        if self.idx == JSIDX_NULL || self.idx == JSIDX_UNDEFINED {
+            return true;
+        }
+        crate::js_helpers::js_is_null_or_undefined(self)
     }
 
     /// Get the typeof this value as a string.
@@ -530,7 +557,7 @@ use core::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Rem, Shl, Shr, S
 
 impl Neg for &JsValue {
     type Output = JsValue;
-    fn neg(self) -> JsValue {
+    fn neg(self) -> Self::Output {
         JsValue::neg(self)
     }
 }
@@ -543,72 +570,72 @@ impl Not for &JsValue {
     }
 }
 
-impl BitAnd<&JsValue> for &JsValue {
+impl BitAnd for &JsValue {
     type Output = JsValue;
-    fn bitand(self, rhs: &JsValue) -> JsValue {
+    fn bitand(self, rhs: Self) -> Self::Output {
         JsValue::bit_and(self, rhs)
     }
 }
 
-impl BitOr<&JsValue> for &JsValue {
+impl BitOr for &JsValue {
     type Output = JsValue;
-    fn bitor(self, rhs: &JsValue) -> JsValue {
+    fn bitor(self, rhs: Self) -> Self::Output {
         JsValue::bit_or(self, rhs)
     }
 }
 
-impl BitXor<&JsValue> for &JsValue {
+impl BitXor for &JsValue {
     type Output = JsValue;
-    fn bitxor(self, rhs: &JsValue) -> JsValue {
+    fn bitxor(self, rhs: Self) -> Self::Output {
         JsValue::bit_xor(self, rhs)
     }
 }
 
-impl Shl<&JsValue> for &JsValue {
+impl Shl for &JsValue {
     type Output = JsValue;
-    fn shl(self, rhs: &JsValue) -> JsValue {
+    fn shl(self, rhs: Self) -> Self::Output {
         JsValue::shl(self, rhs)
     }
 }
 
-impl Shr<&JsValue> for &JsValue {
+impl Shr for &JsValue {
     type Output = JsValue;
-    fn shr(self, rhs: &JsValue) -> JsValue {
+    fn shr(self, rhs: Self) -> Self::Output {
         JsValue::shr(self, rhs)
     }
 }
 
-impl Add<&JsValue> for &JsValue {
+impl Add for &JsValue {
     type Output = JsValue;
-    fn add(self, rhs: &JsValue) -> JsValue {
+    fn add(self, rhs: Self) -> Self::Output {
         JsValue::add(self, rhs)
     }
 }
 
-impl Sub<&JsValue> for &JsValue {
+impl Sub for &JsValue {
     type Output = JsValue;
-    fn sub(self, rhs: &JsValue) -> JsValue {
+    fn sub(self, rhs: Self) -> Self::Output {
         JsValue::sub(self, rhs)
     }
 }
 
-impl Mul<&JsValue> for &JsValue {
+impl Mul for &JsValue {
     type Output = JsValue;
-    fn mul(self, rhs: &JsValue) -> JsValue {
+    fn mul(self, rhs: Self) -> Self::Output {
         JsValue::mul(self, rhs)
     }
 }
 
-impl Div<&JsValue> for &JsValue {
+impl Div for &JsValue {
     type Output = JsValue;
-    fn div(self, rhs: &JsValue) -> JsValue {
+    fn div(self, rhs: Self) -> Self::Output {
         JsValue::div(self, rhs)
     }
 }
 
-impl Rem<&JsValue> for &JsValue {
+impl Rem for &JsValue {
     type Output = JsValue;
-    fn rem(self, rhs: &JsValue) -> JsValue {
+    fn rem(self, rhs: Self) -> Self::Output {
         JsValue::rem(self, rhs)
     }
 }
@@ -668,7 +695,61 @@ impl_binary_op!(Shl, shl, shl);
 impl_binary_op!(Shr, shr, shr);
 
 impl From<bool> for JsValue {
-    fn from(val: bool) -> Self {
-        JsValue::from_bool(val)
+    fn from(s: bool) -> JsValue {
+        JsValue::from_bool(s)
+    }
+}
+
+impl<T> From<*mut T> for JsValue {
+    fn from(s: *mut T) -> JsValue {
+        JsValue::from(s as usize)
+    }
+}
+
+impl<T> From<*const T> for JsValue {
+    fn from(s: *const T) -> JsValue {
+        JsValue::from(s as usize)
+    }
+}
+
+impl<T> From<NonNull<T>> for JsValue {
+    fn from(s: NonNull<T>) -> JsValue {
+        JsValue::from(s.as_ptr() as usize)
+    }
+}
+
+impl<T> From<Vec<T>> for JsValue
+where
+    Vec<T>: crate::BinaryEncode + crate::EncodeTypeDef,
+{
+    fn from(vector: Vec<T>) -> Self {
+        crate::__rt::wbg_cast(vector)
+    }
+}
+
+impl<T> From<Box<[T]>> for JsValue
+where
+    Box<[T]>: crate::BinaryEncode + crate::EncodeTypeDef,
+{
+    fn from(vector: Box<[T]>) -> Self {
+        crate::__rt::wbg_cast(vector)
+    }
+}
+
+impl<T> From<crate::Clamped<Vec<T>>> for JsValue
+where
+    Vec<T>: crate::BinaryEncode + crate::EncodeTypeDef,
+{
+    fn from(vector: crate::Clamped<Vec<T>>) -> Self {
+        crate::__rt::wbg_cast(vector.0)
+    }
+}
+
+impl<T> From<crate::Clamped<Box<[T]>>> for JsValue
+where
+    Box<[T]>: crate::BinaryEncode + crate::EncodeTypeDef,
+{
+    fn from(vector: crate::Clamped<Box<[T]>>) -> Self {
+        crate::__rt::wbg_cast(vector.0)
     }
 }

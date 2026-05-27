@@ -83,8 +83,13 @@ filter_cosmetic() {
     '
 }
 
-normalize_wry_crate_name() {
-    perl -pe 's/\bwry_bindgen\b/wasm_bindgen/g'
+normalize_api() {
+    perl -pe '
+        s/\bwry_bindgen\b/wasm_bindgen/g;
+        s/\b(?:wasm_bindgen|crate)::__rt::marker::ErasableGeneric\b/ErasableGeneric/g;
+        s/\b(?:wasm_bindgen|crate)::__rt::(RefMut|Ref|WasmWord)\b/$1/g;
+        s/^pub unsafe trait wasm_bindgen::ErasableGeneric$/pub use wasm_bindgen::ErasableGeneric/;
+    '
 }
 
 generate_upstream_api() {
@@ -137,8 +142,8 @@ main() {
     echo "Generating wry-bindgen public API..."
     generate_wry_api "$wry_api"
 
-    filter_cosmetic <"$upstream_api" | sort -u >"$upstream_filtered"
-    normalize_wry_crate_name <"$wry_api" | filter_cosmetic | sort -u >"$wry_filtered"
+    normalize_api <"$upstream_api" | filter_cosmetic | sort -u >"$upstream_filtered"
+    normalize_api <"$wry_api" | filter_cosmetic | sort -u >"$wry_filtered"
 
     echo ""
     echo "APIs in wasm-bindgen but NOT in wry-bindgen:"

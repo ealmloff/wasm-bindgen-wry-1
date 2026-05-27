@@ -41,9 +41,6 @@ pub struct Runtime {
     /// Rust-owned object handles to drop after the current encoded JS call
     /// has finished executing.
     objects_to_free: Vec<Vec<u32>>,
-    /// Heap IDs whose JS drop operation was batched and can only be recycled
-    /// after the batch has actually executed in JS.
-    heap_ids_to_recycle_after_flush: Vec<u64>,
     /// The ipc layer used to communicate with the JS runtime
     ipc: WryIPC,
     /// The id of the webview this is associated with
@@ -66,7 +63,6 @@ impl Runtime {
             objects: BTreeMap::new(),
             removed_objects: BTreeMap::new(),
             objects_to_free: Vec::new(),
-            heap_ids_to_recycle_after_flush: Vec::new(),
             ipc,
             webview_id,
             thread_locals: BTreeMap::new(),
@@ -147,25 +143,25 @@ impl Runtime {
     }
 
     pub fn defer_heap_id_recycle_until_flush(&mut self, id: u64) {
-        self.heap_ids_to_recycle_after_flush.push(id);
-    }
-
-    pub fn take_heap_ids_to_recycle_after_flush(&mut self) -> Vec<u64> {
-        core::mem::take(&mut self.heap_ids_to_recycle_after_flush)
+        self.encoder.defer_heap_id_recycle_until_flush(id);
     }
 
     /// Take the message data and reset the batch for reuse.
     /// Includes ID installation and placeholder reservation metadata at the start of the message.
-    pub(crate) fn take_message(&mut self) -> OutboundIPCMessage {
+    pub(crate) fn take_message(&mut self) -> (OutboundIPCMessage, Vec<u64>) {
         let install_ids = self.pending_install_id_batches();
         let reserved_ids = self.take_reserved_placeholder_ids();
         let mut encoder = self.take_encoder();
+        let heap_ids_to_recycle_after_flush = encoder.take_heap_ids_to_recycle_after_flush();
         prepend_rust_to_js_evaluate_prelude(&mut encoder, &install_ids, &reserved_ids);
         let actions = take_js_consumed_actions(&mut encoder, &install_ids);
-        OutboundIPCMessage::new(
-            crate::ipc::IPCMessage::new(encoder.to_bytes()),
-            self.current_js_request_id(),
-            actions,
+        (
+            OutboundIPCMessage::new(
+                crate::ipc::IPCMessage::new(encoder.to_bytes()),
+                self.current_js_request_id(),
+                actions,
+            ),
+            heap_ids_to_recycle_after_flush,
         )
     }
 
@@ -267,6 +263,9 @@ impl Runtime {
         self.encoder
             .js_consumed_actions
             .extend_from_slice(&other.js_consumed_actions);
+        self.encoder
+            .heap_ids_to_recycle_after_flush
+            .extend_from_slice(&other.heap_ids_to_recycle_after_flush);
         self.encoder.needs_flush |= other.needs_flush;
     }
 
@@ -672,7 +671,7 @@ pub(crate) fn flush_and_return<R: BinaryDecode>() -> R {
 pub(crate) fn flush_and_then<R>(mut then: impl for<'a> FnMut(DecodedData<'a>) -> R) -> R {
     use crate::runtime::WryBindgenEvent;
 
-    let batch_msg = with_runtime(|state| state.take_message());
+    let (batch_msg, heap_ids_to_recycle_after_flush) = with_runtime(|state| state.take_message());
     let request_id = batch_msg
         .message
         .header()
@@ -683,16 +682,20 @@ pub(crate) fn flush_and_then<R>(mut then: impl for<'a> FnMut(DecodedData<'a>) ->
     with_runtime(|runtime| {
         (runtime.ipc().proxy)(WryBindgenEvent::ipc(runtime.webview_id(), batch_msg))
     });
+    let mut heap_ids_to_recycle_after_flush = Some(heap_ids_to_recycle_after_flush);
     loop {
         if let Some(result) = crate::runtime::progress_js_with(request_id, &mut then) {
-            recycle_heap_ids_after_flush();
+            recycle_heap_ids_after_flush(
+                heap_ids_to_recycle_after_flush
+                    .take()
+                    .expect("heap IDs should only be recycled once per flush"),
+            );
             return result;
         }
     }
 }
 
-fn recycle_heap_ids_after_flush() {
-    let ids = with_runtime(|state| state.take_heap_ids_to_recycle_after_flush());
+fn recycle_heap_ids_after_flush(ids: Vec<u64>) {
     for id in ids {
         with_runtime(|state| {
             state.recycle_heap_id_if_released(id);

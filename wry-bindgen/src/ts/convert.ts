@@ -4,6 +4,12 @@ export function is_undefined(x: any): boolean {
 export function is_null(x: any): boolean {
   return x === null;
 }
+export function is_null_or_undefined(x: any): boolean {
+  return x === null || x === undefined;
+}
+export function is_array(x: any): boolean {
+  return Array.isArray(x);
+}
 export function is_true(x: any): boolean {
   return x === true;
 }
@@ -33,6 +39,18 @@ export function is_symbol(x: any): boolean {
 }
 export function is_bigint(x: any): boolean {
   return typeof x === "bigint";
+}
+export function bigint_from_str(x: string): bigint {
+  return BigInt(x);
+}
+export function symbol_new(description: string | null): symbol {
+  return Symbol(description ?? undefined);
+}
+export function bigint_get_as_i64(x: any): number | null {
+  return typeof x === "bigint" ? Number(BigInt.asIntN(64, x)) : null;
+}
+export function reflect_get(target: any, key: any): any {
+  return Reflect.get(target, key);
 }
 export function as_string(x: any): string | null {
   return typeof x === "string" ? x : null;

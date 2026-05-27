@@ -15,7 +15,7 @@ use spin::RwLock;
 use crate::BinaryDecode;
 use crate::batch::with_runtime;
 use crate::function::{CALL_EXPORT_FN_ID, DROP_NATIVE_REF_FN_ID, RustCallback};
-use crate::ipc::MessageType;
+use crate::ipc::{DecodeContext, MessageType};
 use crate::ipc::{DecodedData, DecodedVariant, InboundIPCMessage, OutboundIPCMessage};
 use crate::object_store::ObjectHandle;
 
@@ -225,9 +225,9 @@ pub async fn handle_callbacks() {
     }
 }
 
-fn consume_js_to_rust_prelude(data: &mut DecodedData, deferred_heap_ref_request_id: Option<u32>) {
-    if let Some(request_id) = deferred_heap_ref_request_id {
-        data.set_deferred_heap_ref_request_id(request_id);
+fn consume_js_to_rust_prelude(data: &mut DecodedData, request_id: Option<u32>) {
+    if let Some(request_id) = request_id {
+        data.set_context(DecodeContext::DeferredHeapRefs { request_id });
     }
 }
 

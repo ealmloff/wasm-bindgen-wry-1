@@ -14,6 +14,12 @@ extern "C" {
     #[wasm_bindgen(js_name = "is_null")]
     pub(crate) fn js_is_null(x: &JsValue) -> bool;
 
+    #[wasm_bindgen(js_name = "is_null_or_undefined")]
+    pub(crate) fn js_is_null_or_undefined(x: &JsValue) -> bool;
+
+    #[wasm_bindgen(js_name = "is_array")]
+    pub(crate) fn js_is_array(x: &JsValue) -> bool;
+
     #[wasm_bindgen(js_name = "is_true")]
     pub(crate) fn js_is_true(x: &JsValue) -> bool;
 
@@ -43,6 +49,18 @@ extern "C" {
 
     #[wasm_bindgen(js_name = "is_bigint")]
     pub(crate) fn js_is_bigint(x: &JsValue) -> bool;
+
+    #[wasm_bindgen(js_name = "bigint_from_str")]
+    pub(crate) fn js_bigint_from_str(x: &str) -> JsValue;
+
+    #[wasm_bindgen(js_name = "symbol_new")]
+    pub(crate) fn js_symbol_new(description: Option<&str>) -> JsValue;
+
+    #[wasm_bindgen(js_name = "bigint_get_as_i64")]
+    pub(crate) fn js_bigint_get_as_i64(x: &JsValue) -> Option<i64>;
+
+    #[wasm_bindgen(js_name = "reflect_get")]
+    pub(crate) fn js_reflect_get(target: &JsValue, key: &JsValue) -> JsValue;
 
     /// Get the string value of a JsValue if it is a string, otherwise None.
     #[wasm_bindgen(js_name = "as_string")]

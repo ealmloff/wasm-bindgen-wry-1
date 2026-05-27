@@ -263,6 +263,16 @@ pub(crate) enum DecodedVariant<'a> {
     },
 }
 
+/// Context that changes how some values are decoded from a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecodeContext {
+    /// Values use their normal wire representation.
+    Normal,
+    /// JS sent heap references without IDs. Rust allocates IDs and later sends
+    /// install metadata back to JS for this request.
+    DeferredHeapRefs { request_id: u32 },
+}
+
 /// Decoded binary data with aligned buffer access.
 #[derive(Debug)]
 pub struct DecodedData<'a> {
@@ -270,7 +280,7 @@ pub struct DecodedData<'a> {
     u16_buf: &'a [u16],
     u32_buf: &'a [u32],
     str_buf: &'a [u8],
-    deferred_heap_ref_request_id: Option<u32>,
+    context: DecodeContext,
 }
 
 impl<'a> DecodedData<'a> {
@@ -315,22 +325,16 @@ impl<'a> DecodedData<'a> {
             u16_buf,
             u32_buf,
             str_buf,
-            deferred_heap_ref_request_id: None,
+            context: DecodeContext::Normal,
         })
     }
 
-    pub(crate) fn set_deferred_heap_ref_request_id(&mut self, request_id: u32) {
-        self.deferred_heap_ref_request_id = Some(request_id);
+    pub(crate) fn set_context(&mut self, context: DecodeContext) {
+        self.context = context;
     }
 
-    pub(crate) fn deferred_heap_ref_request_id(&self) -> Result<u32, DecodeError> {
-        self.deferred_heap_ref_request_id.ok_or_else(|| {
-            DecodeError::Custom("decoded deferred heap ref outside a JS request".to_string())
-        })
-    }
-
-    pub(crate) fn deferred_heap_ref_request_id_opt(&self) -> Option<u32> {
-        self.deferred_heap_ref_request_id
+    pub(crate) fn context(&self) -> DecodeContext {
+        self.context
     }
 
     /// Take a u8 from the buffer.
@@ -408,6 +412,7 @@ pub struct EncodedData {
     pub(crate) u32_buf: Vec<u32>,
     pub(crate) str_buf: Vec<u8>,
     pub(crate) js_consumed_actions: Vec<JsConsumedAction>,
+    pub(crate) heap_ids_to_recycle_after_flush: Vec<u64>,
     /// Flag indicating that this batch must be flushed before returning.
     /// Used for stack-allocated callbacks that need synchronous invocation.
     pub(crate) needs_flush: bool,
@@ -422,6 +427,7 @@ impl EncodedData {
             u32_buf: Vec::new(),
             str_buf: Vec::new(),
             js_consumed_actions: Vec::new(),
+            heap_ids_to_recycle_after_flush: Vec::new(),
             needs_flush: false,
         }
     }
@@ -440,6 +446,14 @@ impl EncodedData {
 
     pub(crate) fn take_js_consumed_actions(&mut self) -> Vec<JsConsumedAction> {
         core::mem::take(&mut self.js_consumed_actions)
+    }
+
+    pub(crate) fn defer_heap_id_recycle_until_flush(&mut self, id: u64) {
+        self.heap_ids_to_recycle_after_flush.push(id);
+    }
+
+    pub(crate) fn take_heap_ids_to_recycle_after_flush(&mut self) -> Vec<u64> {
+        core::mem::take(&mut self.heap_ids_to_recycle_after_flush)
     }
 
     /// Get the total byte length of the encoded data.
@@ -534,6 +548,9 @@ impl EncodedData {
         self.str_buf.extend_from_slice(&other.str_buf);
         self.js_consumed_actions
             .extend_from_slice(&other.js_consumed_actions);
+        self.heap_ids_to_recycle_after_flush
+            .extend_from_slice(&other.heap_ids_to_recycle_after_flush);
+        self.needs_flush |= other.needs_flush;
     }
 }
 
@@ -581,5 +598,30 @@ mod tests {
             encoder.take_js_consumed_actions(),
             vec![JsConsumedAction::TypeDefinitionParsed { type_id: 3 }]
         );
+    }
+
+    #[test]
+    fn deferred_recycle_ids_are_encoder_local() {
+        let mut queued = EncodedData::new();
+        queued.defer_heap_id_recycle_until_flush(10);
+
+        let mut unrelated = EncodedData::new();
+        unrelated.defer_heap_id_recycle_until_flush(20);
+
+        assert_eq!(unrelated.take_heap_ids_to_recycle_after_flush(), vec![20]);
+        assert_eq!(queued.take_heap_ids_to_recycle_after_flush(), vec![10]);
+    }
+
+    #[test]
+    fn deferred_recycle_ids_extend_with_encoder_data() {
+        let mut outer = EncodedData::new();
+        outer.defer_heap_id_recycle_until_flush(10);
+
+        let mut encoded_during_op = EncodedData::new();
+        encoded_during_op.defer_heap_id_recycle_until_flush(20);
+
+        outer.extend(&encoded_during_op);
+
+        assert_eq!(outer.take_heap_ids_to_recycle_after_flush(), vec![10, 20]);
     }
 }

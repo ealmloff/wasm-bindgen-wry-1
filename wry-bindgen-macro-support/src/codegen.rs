@@ -213,12 +213,6 @@ fn generate_type(ty: &ImportType, krate: &TokenStream) -> syn::Result<TokenStrea
             }
         }
 
-        impl #impl_generics ::core::convert::From<&#rust_name #ty_generics> for #krate::JsValue #where_clause {
-            fn from(val: &#rust_name #ty_generics) -> Self {
-                ::core::clone::Clone::clone(::core::convert::AsRef::<#krate::JsValue>::as_ref(val))
-            }
-        }
-
         impl #impl_generics ::core::convert::From<#krate::JsValue> for #rust_name #ty_generics #where_clause {
             fn from(val: #krate::JsValue) -> Self {
                 Self { obj: #from_jsvalue_obj, #generic_init }
@@ -311,13 +305,6 @@ fn generate_type(ty: &ImportType, krate: &TokenStream) -> syn::Result<TokenStrea
         impl #impl_generics #krate::BinaryDecode for #rust_name #ty_generics #where_clause {
             fn decode(decoder: &mut #krate::DecodedData) -> ::core::result::Result<Self, #krate::DecodeError> {
                 ::core::result::Result::map(#krate::JsValue::decode(decoder), ::core::convert::Into::into)
-            }
-
-            fn decode_inbound(decoder: &mut #krate::DecodedData) -> ::core::result::Result<Self, #krate::DecodeError> {
-                ::core::result::Result::map(
-                    <#krate::JsValue as #krate::BinaryDecode>::decode_inbound(decoder),
-                    ::core::convert::Into::into,
-                )
             }
         }
     };
@@ -1863,18 +1850,6 @@ fn generate_export_struct(s: &ExportStruct, krate: &TokenStream) -> syn::Result<
                 // Remove from object store and return owned value
                 Ok(#krate::object_store::remove_object::<#rust_name>(handle))
             }
-
-            fn decode_inbound(decoder: &mut #krate::DecodedData) -> ::core::result::Result<Self, #krate::DecodeError> {
-                // Decode the JsValue
-                let js = <#krate::JsValue as #krate::BinaryDecode>::decode_inbound(decoder)?;
-                // Extract handle from JS wrapper
-                let handle = #krate::extract_rust_handle(&js)
-                    .ok_or_else(|| #krate::DecodeError::Custom(
-                        #krate::alloc::string::String::from("expected Rust object wrapper")
-                    ))?;
-                // Remove from object store and return owned value
-                Ok(#krate::object_store::remove_object::<#rust_name>(handle))
-            }
         }
     };
 
@@ -1963,7 +1938,7 @@ fn generate_field_accessor(
                     #setter_name,
                     |decoder| {
                         let handle = <#krate::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
-                        let val = <#field_ty as #krate::BinaryDecode>::decode_inbound(decoder)?;
+                        let val = <#field_ty as #krate::BinaryDecode>::decode(decoder)?;
                         #krate::object_store::with_object_mut::<#struct_name, _>(handle, |obj| {
                             obj.#field_name = val;
                         });
@@ -2155,7 +2130,7 @@ fn generate_export_method(method: &ExportMethod, krate: &TokenStream) -> syn::Re
 
     let decode_args = quote_spanned! {span=>
         #(
-            let #arg_names = <#arg_types as #krate::BinaryDecode>::decode_inbound(decoder)?;
+            let #arg_names = <#arg_types as #krate::BinaryDecode>::decode(decoder)?;
         )*
     };
 
@@ -2264,7 +2239,7 @@ fn generate_export_method(method: &ExportMethod, krate: &TokenStream) -> syn::Re
 
             quote_spanned! {span=>
                 let handle = <#krate::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
-                let #arg_name = <#arg_ty as #krate::BinaryDecode>::decode_inbound(decoder)?;
+                let #arg_name = <#arg_ty as #krate::BinaryDecode>::decode(decoder)?;
                 #krate::object_store::with_object_mut::<#class, _>(handle, |obj| {
                     obj.#rust_name(#arg_name);
                 });

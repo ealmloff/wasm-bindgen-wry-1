@@ -3,13 +3,16 @@
 //! This trait provides methods for casting between JavaScript types,
 //! similar to wasm-bindgen's JsCast trait.
 
-use crate::JsValue;
+use crate::{JsValue, convert::TryFromJsValue};
 
 /// Trait for types that can be cast to and from JsValue.
 ///
 /// This is the wry-bindgen equivalent of wasm-bindgen's `JsCast` trait.
 /// It enables safe and unsafe casting between JavaScript types.
-pub trait JsCast: AsRef<JsValue> + Into<JsValue> + Sized {
+pub trait JsCast
+where
+    Self: AsRef<JsValue> + Into<JsValue>,
+{
     /// Check if a JsValue is an instance of this type.
     ///
     /// This performs a runtime instanceof check in JavaScript.
@@ -38,7 +41,10 @@ pub trait JsCast: AsRef<JsValue> + Into<JsValue> + Sized {
     /// `is_instance_of`, but if you want strictly the `instanceof` operator
     /// it's recommended to use that instead.
     #[inline]
-    fn has_type<T: JsCast>(&self) -> bool {
+    fn has_type<T>(&self) -> bool
+    where
+        T: JsCast,
+    {
         T::is_type_of(self.as_ref())
     }
 
@@ -60,9 +66,12 @@ pub trait JsCast: AsRef<JsValue> + Into<JsValue> + Sized {
     ///
     /// Returns `Ok(T)` if the value is an instance of T,
     /// otherwise returns `Err(self)` with the original value.
-    fn dyn_into<T: JsCast>(self) -> Result<T, Self> {
-        if T::is_type_of(self.as_ref()) {
-            Ok(T::unchecked_from_js(self.into()))
+    fn dyn_into<T>(self) -> Result<T, Self>
+    where
+        T: JsCast,
+    {
+        if self.has_type::<T>() {
+            Ok(self.unchecked_into())
         } else {
             Err(self)
         }
@@ -72,9 +81,12 @@ pub trait JsCast: AsRef<JsValue> + Into<JsValue> + Sized {
     ///
     /// Returns `Some(&T)` if the value is an instance of T,
     /// otherwise returns `None`.
-    fn dyn_ref<T: JsCast>(&self) -> Option<&T> {
-        if T::is_type_of(self.as_ref()) {
-            Some(T::unchecked_from_js_ref(self.as_ref()))
+    fn dyn_ref<T>(&self) -> Option<&T>
+    where
+        T: JsCast,
+    {
+        if self.has_type::<T>() {
+            Some(self.unchecked_ref())
         } else {
             None
         }
@@ -89,18 +101,39 @@ pub trait JsCast: AsRef<JsValue> + Into<JsValue> + Sized {
     /// across different realms (e.g. iframes). If you're not sure whether you
     /// specifically need only `instanceof` it's recommended to use `has_type`
     /// instead.
-    fn is_instance_of<T: JsCast>(&self) -> bool {
+    fn is_instance_of<T>(&self) -> bool
+    where
+        T: JsCast,
+    {
         T::instanceof(self.as_ref())
     }
 
     /// Unchecked cast to another type.
-    fn unchecked_into<T: JsCast>(self) -> T {
+    fn unchecked_into<T>(self) -> T
+    where
+        T: JsCast,
+    {
         T::unchecked_from_js(self.into())
     }
 
     /// Unchecked cast to a reference of another type.
-    fn unchecked_ref<T: JsCast>(&self) -> &T {
+    fn unchecked_ref<T>(&self) -> &T
+    where
+        T: JsCast,
+    {
         T::unchecked_from_js_ref(self.as_ref())
+    }
+}
+
+impl<T: JsCast> TryFromJsValue for T {
+    #[inline]
+    fn try_from_js_value(val: JsValue) -> Result<Self, JsValue> {
+        val.dyn_into()
+    }
+
+    #[inline]
+    fn try_from_js_value_ref(val: &JsValue) -> Option<Self> {
+        val.clone().dyn_into().ok()
     }
 }
 
