@@ -36,8 +36,6 @@ pub struct Runtime {
     inbound_js_request_stack: Vec<u32>,
     /// Exported Rust structs stored by handle
     objects: BTreeMap<u32, Box<dyn Any>>,
-    /// Recently removed object handles for diagnostics.
-    removed_objects: BTreeMap<u32, &'static str>,
     /// Rust-owned object handles to drop after the current encoded JS call
     /// has finished executing.
     objects_to_free: Vec<Vec<u32>>,
@@ -61,7 +59,6 @@ impl Runtime {
             inbound_js_request_stack: Vec::new(),
             // Object store starts empty
             objects: BTreeMap::new(),
-            removed_objects: BTreeMap::new(),
             objects_to_free: Vec::new(),
             ipc,
             webview_id,
@@ -192,17 +189,13 @@ impl Runtime {
         self.id_allocator.pop_and_release_ids()
     }
 
-    pub(crate) fn release_object_handle(
-        &mut self,
-        handle: ObjectHandle,
-        reason: &'static str,
-    ) -> Option<Box<dyn Any>> {
+    pub(crate) fn release_object_handle(&mut self, handle: ObjectHandle) -> Option<Box<dyn Any>> {
         match self.objects_to_free.last_mut() {
             Some(handles) => {
                 handles.push(handle.raw());
                 None
             }
-            None => self.remove_object_untyped_with_reason(handle.raw(), reason),
+            None => self.remove_object_untyped(handle.raw()),
         }
     }
 
@@ -327,13 +320,7 @@ impl Runtime {
 
     /// Get a reference to an exported object.
     pub(crate) fn get_object<T: 'static>(&self, handle: u32) -> Ref<'_, T> {
-        let boxed =
-            self.objects
-                .get(&handle)
-                .unwrap_or_else(|| match self.removed_objects.get(&handle) {
-                    Some(reason) => panic!("invalid handle {handle} (removed by {reason})"),
-                    None => panic!("invalid handle {handle}"),
-                });
+        let boxed = self.objects.get(&handle).expect("invalid handle");
         let cell = boxed.downcast_ref::<RefCell<T>>().expect("type mismatch");
         cell.borrow()
     }
@@ -349,20 +336,14 @@ impl Runtime {
     pub(crate) fn remove_object<T: 'static>(&mut self, handle: u32) -> T {
         let boxed = self.objects.remove(&handle).expect("invalid handle");
         self.id_allocator.release_object_handle(handle);
-        self.removed_objects.insert(handle, "typed remove_object");
         let cell = boxed.downcast::<RefCell<T>>().expect("type mismatch");
         cell.into_inner()
     }
 
-    pub(crate) fn remove_object_untyped_with_reason(
-        &mut self,
-        handle: u32,
-        reason: &'static str,
-    ) -> Option<Box<dyn Any>> {
+    pub(crate) fn remove_object_untyped(&mut self, handle: u32) -> Option<Box<dyn Any>> {
         let object = self.objects.remove(&handle);
         if object.is_some() {
             self.id_allocator.release_object_handle(handle);
-            self.removed_objects.insert(handle, reason);
         }
         object
     }
@@ -543,13 +524,13 @@ fn recycle_heap_id_after_js_drop(id: u64) {
 
 /// Drop a Rust-owned object now, or after the current encoded JS operation
 /// finishes if that object is being passed to JS.
-pub(crate) fn queue_rust_object_drop_with_reason(handle: ObjectHandle, reason: &'static str) {
+pub(crate) fn queue_rust_object_drop(handle: ObjectHandle) {
     let object = RUNTIME
         .try_with(|state| {
             state.try_borrow_mut().ok().and_then(|mut runtime_stack| {
                 runtime_stack
                     .last_mut()
-                    .and_then(|runtime| runtime.release_object_handle(handle, reason))
+                    .and_then(|runtime| runtime.release_object_handle(handle))
             })
         })
         .unwrap_or_default();
@@ -624,9 +605,7 @@ pub(crate) fn run_js_sync<R: BatchableResult>(
 
     let objects = with_runtime(|state| state.pop_and_release_objects());
     for handle in objects {
-        let object = with_runtime(|state| {
-            state.remove_object_untyped_with_reason(handle, "queued rust object drop")
-        });
+        let object = with_runtime(|state| state.remove_object_untyped(handle));
         drop(object);
     }
 

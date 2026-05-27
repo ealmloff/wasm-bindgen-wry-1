@@ -62,11 +62,7 @@ pub fn remove_object<T: 'static>(handle: ObjectHandle) -> T {
 }
 
 pub fn drop_object(handle: ObjectHandle) -> bool {
-    with_runtime(|state| {
-        state
-            .remove_object_untyped_with_reason(handle.0, "js finalizer")
-            .is_some()
-    })
+    with_runtime(|state| state.remove_object_untyped(handle.0).is_some())
 }
 
 /// Create a JavaScript wrapper object for an exported Rust struct.

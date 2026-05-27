@@ -1111,7 +1111,7 @@ macro_rules! impl_closure_ref_encode {
                 let key: CallbackKey<fn($($arg),*) -> R> =
                     CallbackKey::new_with_policy(handle, CallbackPolicy::RustOwned);
                 key.encode(encoder);
-                crate::batch::queue_rust_object_drop_with_reason(handle, "stack FnMut callback drop");
+                crate::batch::queue_rust_object_drop(handle);
             }
         }
 
@@ -1177,7 +1177,7 @@ macro_rules! impl_closure_ref_encode {
                 let key: CallbackKey<fn($($arg),*) -> R> =
                     CallbackKey::new_with_policy(handle, CallbackPolicy::RustOwned);
                 key.encode(encoder);
-                crate::batch::queue_rust_object_drop_with_reason(handle, "stack Fn callback drop");
+                crate::batch::queue_rust_object_drop(handle);
             }
         }
 
@@ -1244,7 +1244,7 @@ macro_rules! impl_closure_ref_encode {
                 let key: CallbackKey<fn($($arg),*) -> R> =
                     CallbackKey::new_with_policy(handle, CallbackPolicy::RustOwned);
                 key.encode(encoder);
-                crate::batch::queue_rust_object_drop_with_reason(handle, "stack mutable Fn callback drop");
+                crate::batch::queue_rust_object_drop(handle);
             }
         }
     };

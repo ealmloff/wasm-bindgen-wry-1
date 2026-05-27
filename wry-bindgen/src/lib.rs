@@ -558,10 +558,7 @@ impl<T: ?Sized> ScopedClosure<'static, T> {
         let key = insert_object(RustCallback::new_fn_mut(move |decoder, encoder| {
             encode_decode(decoder, encoder);
             if let Some(handle) = handle_for_callback.take() {
-                crate::batch::queue_rust_object_drop_with_reason(
-                    handle,
-                    "once callback after call",
-                );
+                crate::batch::queue_rust_object_drop(handle);
             }
         }));
         handle_cell.set(Some(key));
