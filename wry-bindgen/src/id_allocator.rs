@@ -164,12 +164,22 @@ impl HeapIds {
     }
 
     fn next_inbound_js_heap_id(&mut self, request_id: u32) -> u64 {
-        let id = self.next_heap_id();
-        self.pending_install_ids
-            .entry(request_id)
-            .or_default()
-            .push(id);
-        id
+        self.next_inbound_js_heap_ids(request_id, 1)[0]
+    }
+
+    fn next_inbound_js_heap_ids(&mut self, request_id: u32, count: u32) -> Vec<u64> {
+        let ids = self.pending_install_ids.entry(request_id).or_default();
+        assert!(
+            ids.is_empty(),
+            "Attempted to allocate deferred heap-ref IDs twice for request {request_id}"
+        );
+
+        ids.reserve(count as usize);
+        for _ in 0..count {
+            ids.push(self.slab.alloc());
+        }
+
+        ids.clone()
     }
 
     fn release_heap_id(&mut self, id: u64) -> Option<u64> {
@@ -358,6 +368,10 @@ impl IdAllocator {
         self.heap.next_inbound_js_heap_id(request_id)
     }
 
+    pub(crate) fn next_inbound_js_heap_ids(&mut self, request_id: u32, count: u32) -> Vec<u64> {
+        self.heap.next_inbound_js_heap_ids(request_id, count)
+    }
+
     /// Get the next borrow ID from the borrow stack (indices 1-127).
     ///
     /// The borrow stack grows downward from JSIDX_OFFSET (128) toward 1.
@@ -497,6 +511,18 @@ mod tests {
 
         heap.ack_pending_install_ids([7]);
         assert_eq!(heap.next_placeholder_id(), id);
+    }
+
+    #[test]
+    fn inbound_heap_ids_are_allocated_as_complete_frames() {
+        let mut heap = HeapIds::new();
+        let ids = heap.next_inbound_js_heap_ids(7, 2);
+        assert_eq!(ids, [JSIDX_RESERVED, JSIDX_RESERVED + 1]);
+
+        let batches = heap.pending_install_id_batches();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].request_id, 7);
+        assert_eq!(batches[0].ids, ids);
     }
 
     #[test]

@@ -569,12 +569,16 @@ impl BinaryDecode for JsValue {
     fn decode_inbound(decoder: &mut DecodedData) -> Result<Self, DecodeError> {
         // JS-originated heap refs are implicit on the wire. Rust assigns the ID
         // and sends it back for JS to install before it continues.
-        let request_id = decoder.take_deferred_heap_ref_request_id()?;
-        with_runtime(|runtime| {
-            Ok(JsValue::from_id(
-                runtime.get_next_inbound_js_heap_id(request_id),
-            ))
-        })
+        let deferred = decoder.take_deferred_heap_ref()?;
+        if !decoder.has_deferred_heap_ref_ids() {
+            let ids = with_runtime(|runtime| {
+                runtime.get_next_inbound_js_heap_ids(deferred.request_id, deferred.count)
+            });
+            decoder.set_deferred_heap_ref_ids(ids)?;
+        }
+        Ok(JsValue::from_id(
+            decoder.deferred_heap_ref_id(deferred.index)?,
+        ))
     }
 }
 

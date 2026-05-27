@@ -99,6 +99,12 @@ impl Runtime {
         self.id_allocator.next_inbound_js_heap_id(request_id)
     }
 
+    /// Allocate IDs for all JS objects sent in one deferred heap-ref frame.
+    pub fn get_next_inbound_js_heap_ids(&mut self, request_id: u32, count: u32) -> Vec<u64> {
+        self.id_allocator
+            .next_inbound_js_heap_ids(request_id, count)
+    }
+
     pub(crate) fn push_inbound_js_request(&mut self, request_id: u32) {
         self.inbound_js_request_stack.push(request_id);
     }
