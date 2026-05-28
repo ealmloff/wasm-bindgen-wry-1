@@ -66,25 +66,6 @@ impl BatchMode {
 #[derive(Clone, Copy, Default)]
 struct HarnessOptions {
     repeat_for: Option<Duration>,
-    repro_exported_struct_heap_ref: bool,
-    repro_js_error: bool,
-}
-
-#[wasm_bindgen(inline_js = r#"
-    export function throw_async_harness_error() {
-        setTimeout(() => {
-            throw new Error("intentional harness JS error");
-        }, 0);
-    }
-
-"#)]
-extern "C" {
-    fn throw_async_harness_error();
-}
-
-async fn repro_js_error_is_fatal() {
-    throw_async_harness_error();
-    std::future::pending::<()>().await;
 }
 
 // The futures returned by test bodies are !Send because they can hold
@@ -317,6 +298,7 @@ fn build_tests() -> Vec<TestCase> {
         catch_attribute::test_catch_with_arguments,
         catch_attribute::test_catch_method,
         structs::test_struct_bindings,
+        structs::test_exported_struct_arg_before_heap_ref_arg,
         export_call::test_js_calls_exported_usize_js_thunk,
         export_call::test_js_calls_exported_usize_js_thunk_batched,
         clamped::test_clamped_is_uint8clampedarray,
@@ -328,6 +310,8 @@ fn build_tests() -> Vec<TestCase> {
         clamped::test_clamped_mut_slice,
         borrow_stack::test_borrowed_ref_in_callback,
         borrow_stack::test_borrowed_ref_in_callback_with_return,
+        borrow_stack::test_cloned_borrowed_ref_survives_callback,
+        borrow_stack::test_wrapped_fn_event_ref_can_call_js_getter,
         borrow_stack::test_borrowed_ref_nested_frames,
         borrow_stack::test_borrowed_ref_deep_nesting,
         thread_local::test_thread_local,
@@ -368,23 +352,6 @@ fn build_tests() -> Vec<TestCase> {
     tests
 }
 
-fn build_repro_tests() -> Vec<TestCase> {
-    let mut tests: Vec<TestCase> = Vec::new();
-
-    sync_trials!(tests;
-        structs::test_exported_struct_arg_before_heap_ref_arg,
-    );
-
-    tests
-}
-
-fn build_js_error_repro_tests() -> Vec<TestCase> {
-    vec![async_test(
-        trial_name("harness", "repro_js_error_is_fatal", BatchMode::NonBatched),
-        BatchMode::NonBatched,
-        repro_js_error_is_fatal,
-    )]
-}
 
 fn extract_panic_message(payload: Box<dyn Any + Send>) -> Failed {
     let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
@@ -574,11 +541,7 @@ fn parse_harness_args() -> (HarnessOptions, Vec<String>) {
     }
 
     for arg in args {
-        if arg == "--wry-repro-exported-struct-heap-ref" {
-            options.repro_exported_struct_heap_ref = true;
-        } else if arg == "--wry-repro-js-error" {
-            options.repro_js_error = true;
-        } else if let Some(value) = arg.strip_prefix("--wry-repeat-for-secs=") {
+        if let Some(value) = arg.strip_prefix("--wry-repeat-for-secs=") {
             options.repeat_for = value.parse::<u64>().ok().map(Duration::from_secs);
         } else {
             libtest_args.push(arg);
@@ -595,22 +558,11 @@ fn parse_harness_args() -> (HarnessOptions, Vec<String>) {
     (options, libtest_args)
 }
 
-fn selected_tests(options: HarnessOptions) -> Vec<TestCase> {
-    if options.repro_js_error {
-        build_js_error_repro_tests()
-    } else if options.repro_exported_struct_heap_ref {
-        build_repro_tests()
-    } else {
-        build_tests()
-    }
-}
-
 async fn run_selected_tests(
     args: Arguments,
-    options: HarnessOptions,
     js_errors: &mut UnboundedReceiver<String>,
 ) -> bool {
-    run_tests(args, selected_tests(options), js_errors).await
+    run_tests(args, build_tests(), js_errors).await
 }
 
 fn main() -> ExitCode {
@@ -630,7 +582,7 @@ fn main() -> ExitCode {
                     start.elapsed()
                 );
 
-                if !run_selected_tests(args.clone(), options, &mut js_errors).await {
+                if !run_selected_tests(args.clone(), &mut js_errors).await {
                     break false;
                 }
 
@@ -643,7 +595,7 @@ fn main() -> ExitCode {
                 }
             }
         } else {
-            run_selected_tests(args, options, &mut js_errors).await
+            run_selected_tests(args, &mut js_errors).await
         };
 
         let _ = io::stdout().flush();

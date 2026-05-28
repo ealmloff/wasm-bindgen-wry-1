@@ -7,8 +7,9 @@ use alloc::{boxed::Box, string::String, vec::Vec};
 use core::fmt;
 use core::ptr::NonNull;
 
-/// Offset for reserved JS value indices.
-/// Values below JSIDX_RESERVED are special constants that don't need drop/clone.
+/// Top of the temporary borrow stack and start of special JS value indices.
+/// Values `1..JSIDX_OFFSET` are borrowed references that are only valid while
+/// the current JS borrow frame is alive.
 pub(crate) const JSIDX_OFFSET: u64 = 128;
 
 /// Index for the `undefined` JS value.
@@ -23,8 +24,14 @@ pub(crate) const JSIDX_TRUE: u64 = JSIDX_OFFSET + 2;
 /// Index for the `false` JS value.
 pub(crate) const JSIDX_FALSE: u64 = JSIDX_OFFSET + 3;
 
-/// First usable heap ID. IDs below this are reserved for special values.
+/// First usable owned heap ID. IDs in `JSIDX_OFFSET..JSIDX_RESERVED` are
+/// reserved for special JS constants.
 pub(crate) const JSIDX_RESERVED: u64 = JSIDX_OFFSET + 4;
+
+#[inline]
+fn is_special_value_id(id: u64) -> bool {
+    (JSIDX_OFFSET..JSIDX_RESERVED).contains(&id)
+}
 
 /// An opaque reference to a JavaScript heap object.
 ///
@@ -151,8 +158,9 @@ impl JsValue {
 impl Clone for JsValue {
     #[inline]
     fn clone(&self) -> JsValue {
-        // Reserved values don't need cloning - they're constants
-        if self.idx < JSIDX_RESERVED {
+        // Special constants don't need cloning. Borrow-stack IDs are below
+        // JSIDX_OFFSET and must be promoted to owned heap refs when cloned.
+        if is_special_value_id(self.idx) {
             return JsValue::_new(self.idx);
         }
 
@@ -164,7 +172,7 @@ impl Clone for JsValue {
 impl Drop for JsValue {
     #[inline]
     fn drop(&mut self) {
-        // Reserved values don't need dropping - they're constants
+        // Borrowed refs and special constants don't own JS heap slots.
         if self.idx < JSIDX_RESERVED {
             return;
         }
@@ -527,7 +535,7 @@ impl JsValue {
         match self.idx {
             JSIDX_TRUE => Some(true),
             JSIDX_FALSE => Some(false),
-            idx if idx < JSIDX_RESERVED => None,
+            JSIDX_UNDEFINED | JSIDX_NULL => None,
             _ => {
                 // For heap values, check via JS
                 if crate::js_helpers::js_is_true(self) {

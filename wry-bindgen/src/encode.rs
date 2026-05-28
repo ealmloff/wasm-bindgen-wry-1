@@ -1393,7 +1393,7 @@ macro_rules! impl_fnmut_stub_ref {
             #[allow(non_snake_case)]
             #[allow(unused)]
             fn into_closure(self) -> crate::Closure<dyn Fn(&$first, $($rest),*) -> R> {
-                crate::Closure::wrap_encode_decode::<fn($first, $($rest),*) -> R>(
+                crate::Closure::wrap_encode_decode::<fn(&$first, $($rest),*) -> R>(
                     move |decoder: &mut DecodedData, encoder: &mut EncodedData| {
                         let anchor = <$first as RefFromBinaryDecode>::ref_decode(decoder).unwrap();
                         $(let $rest = <$rest as BinaryDecode>::decode(decoder).unwrap();)*

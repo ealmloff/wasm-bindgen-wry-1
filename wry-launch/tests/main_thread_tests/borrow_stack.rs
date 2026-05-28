@@ -68,6 +68,89 @@ pub(crate) fn test_borrowed_ref_in_callback_with_return() {
     assert!(result, "Callback should receive valid borrowed ref");
 }
 
+/// Cloning a borrowed callback argument should promote it to an owned heap ref.
+pub(crate) fn test_cloned_borrowed_ref_survives_callback() {
+    use std::cell::RefCell;
+    use wasm_bindgen::Closure;
+
+    #[wasm_bindgen(inline_js = r#"
+        export function call_with_object(cb) { cb({ type: "borrowed-clone" }); }
+        export function call_with_bool(cb) { cb(true); }
+        export function get_type(obj) { return obj["type"]; }
+    "#)]
+    extern "C" {
+        fn call_with_object(cb: Closure<dyn FnMut(&JsValue)>);
+        fn call_with_bool(cb: Closure<dyn FnMut(&JsValue)>);
+        fn get_type(obj: &JsValue) -> String;
+    }
+
+    let cloned = Rc::new(RefCell::new(None));
+    let cloned_for_callback = cloned.clone();
+    let callback = Closure::new(move |value: &JsValue| {
+        cloned_for_callback.borrow_mut().replace(value.clone());
+    });
+
+    call_with_object(callback);
+    force_flush();
+
+    let cloned = cloned
+        .borrow_mut()
+        .take()
+        .expect("callback should capture a cloned value");
+    assert_eq!(get_type(&cloned), "borrowed-clone");
+
+    let saw_true = Rc::new(std::cell::Cell::new(false));
+    let saw_true_for_callback = saw_true.clone();
+    let callback = Closure::new(move |value: &JsValue| {
+        saw_true_for_callback.set(value.as_bool() == Some(true));
+    });
+
+    call_with_bool(callback);
+    force_flush();
+    assert!(saw_true.get(), "borrowed bool should decode through JS");
+}
+
+/// Dioxus installs event listeners with `Closure::wrap(Box::new(...))` as
+/// `Closure<dyn Fn(&web_sys::Event)>` and immediately calls Web APIs on the
+/// borrowed event.
+pub(crate) fn test_wrapped_fn_event_ref_can_call_js_getter() {
+    use std::cell::RefCell;
+    use wasm_bindgen::Closure;
+    use web_sys::Event;
+
+    #[wasm_bindgen(inline_js = r#"
+        export function call_with_event(cb) {
+            cb(new Event("borrowed-event"));
+        }
+    "#)]
+    extern "C" {
+        fn call_with_event(cb: Closure<dyn Fn(&Event)>);
+    }
+
+    let seen_type = Rc::new(RefCell::new(None));
+    let cloned_event = Rc::new(RefCell::new(None));
+
+    let seen_type_for_callback = seen_type.clone();
+    let cloned_event_for_callback = cloned_event.clone();
+    let callback: Closure<dyn Fn(&Event)> = Closure::wrap(Box::new(move |event: &Event| {
+        seen_type_for_callback.borrow_mut().replace(event.type_());
+        cloned_event_for_callback
+            .borrow_mut()
+            .replace(event.clone());
+    }));
+
+    call_with_event(callback);
+    force_flush();
+
+    assert_eq!(seen_type.borrow().as_deref(), Some("borrowed-event"));
+
+    let cloned_event = cloned_event
+        .borrow_mut()
+        .take()
+        .expect("callback should capture a cloned event");
+    assert_eq!(cloned_event.type_(), "borrowed-event");
+}
+
 /// Test nested borrow stack frames: when we call a JS function that passes a reference
 /// to a Rust closure which then calls another JS function with a reference,
 /// the outer reference should still be valid after the inner call returns.
