@@ -101,11 +101,20 @@ class RustFunction {
   }
 
   disposeFromRust(): void {
-    if (this.disposed && this.dropNativeWhenIdle) {
+    if (this.disposed) {
       return;
     }
 
     this.disposed = true;
+
+    if (this.dropAfterCall && this.activeCalls !== 0) {
+      if (this.finalizerToken) {
+        nativeRefRegistry.unregister(this.finalizerToken);
+        this.finalizerToken = null;
+      }
+      return;
+    }
+
     this.dropNativeWhenIdle = true;
     this.dropNativeRefIfIdle();
   }

@@ -51,9 +51,9 @@ pub mod closure {
     }
 
     /// Who is responsible for disposing the JS-side `RustFunction` wrapper that
-    /// backs a `ScopedClosure`. Encoding a Rust-owned callback to JS detaches it
-    /// (JS or a self-disposing once-cell takes over); destructors only dispose
-    /// in the `Owned` state.
+    /// backs a `ScopedClosure`. Encoding an owned `Closure` by value detaches it
+    /// because JavaScript takes ownership; borrowed encodes keep Rust ownership.
+    /// Destructors only dispose in the `Owned` state.
     #[derive(Clone, Copy)]
     pub(crate) enum CallbackOwnership {
         /// No Rust callback backing this closure (e.g., wrapping a raw JS function).
@@ -104,8 +104,15 @@ pub use closure::{Closure, ScopedClosure};
 /// This module provides the wbg_cast function used for type casting.
 pub mod __rt {
     use crate::{
-        __wry_submit_js_function, JsValue, LazyJsFunction,
+        __wry_submit_js_function, Closure, JsValue, LazyJsFunction,
         encode::{BatchableResult, BinaryEncode, EncodeTypeDef},
+    };
+    use alloc::rc::Rc;
+    use core::{
+        cell::RefCell,
+        future::Future,
+        pin::Pin,
+        task::{Context, Poll, Waker},
     };
 
     #[repr(transparent)]
@@ -191,6 +198,158 @@ pub mod __rt {
     {
         let func: LazyJsFunction<fn(From) -> To> = __wry_submit_js_function!("(a0) => a0");
         func.call(value)
+    }
+
+    pub type PromiseCallback = Closure<dyn FnMut(JsValue)>;
+    type PromiseThenWithReject = fn(&JsValue, &PromiseCallback, &PromiseCallback);
+
+    struct PromiseCallbacks {
+        _resolve: PromiseCallback,
+        _reject: PromiseCallback,
+    }
+
+    enum PromiseFutureState {
+        /// `then` has been called, but the Rust-to-JS attach call has not
+        /// returned yet. JS may still synchronously call back into Rust here.
+        Attaching,
+        /// The Promise is unresolved and the callback pair must stay alive.
+        Pending(PromiseCallbacks),
+        /// The Promise has settled and is waiting to be observed by `poll`.
+        Ready(Result<JsValue, JsValue>),
+        /// The future has completed or was dropped.
+        Consumed,
+    }
+
+    struct PromiseFutureInner {
+        state: PromiseFutureState,
+        task: Option<Waker>,
+    }
+
+    /// Future adapter for Promise values returned by generated async imports.
+    ///
+    /// Unlike upstream wasm, wry's Rust-to-JS call that installs `then`
+    /// callbacks crosses the event loop. A settled Promise can therefore call
+    /// back into Rust before the attaching Rust stack resumes, so this state
+    /// machine accepts completion before the callback pair has been stored.
+    pub struct PromiseFuture {
+        inner: Rc<RefCell<PromiseFutureInner>>,
+    }
+
+    fn finish_promise_future(
+        inner: &Rc<RefCell<PromiseFutureInner>>,
+        value: Result<JsValue, JsValue>,
+    ) {
+        let (task, callbacks_to_drop) = {
+            let mut inner = inner.borrow_mut();
+            let callbacks_to_drop =
+                match core::mem::replace(&mut inner.state, PromiseFutureState::Ready(value)) {
+                    PromiseFutureState::Attaching => None,
+                    PromiseFutureState::Pending(callbacks) => Some(callbacks),
+                    PromiseFutureState::Ready(existing) => {
+                        inner.state = PromiseFutureState::Ready(existing);
+                        return;
+                    }
+                    PromiseFutureState::Consumed => {
+                        inner.state = PromiseFutureState::Consumed;
+                        return;
+                    }
+                };
+            (inner.task.take(), callbacks_to_drop)
+        };
+        drop(callbacks_to_drop);
+
+        if let Some(task) = task {
+            task.wake();
+        }
+    }
+
+    fn promise_then_with_reject(
+        promise: &JsValue,
+        resolve: &PromiseCallback,
+        reject: &PromiseCallback,
+    ) {
+        let func: LazyJsFunction<PromiseThenWithReject> =
+            __wry_submit_js_function!("(obj, resolve, reject) => obj[\"then\"](resolve, reject)");
+        func.call(promise, resolve, reject);
+    }
+
+    pub fn promise_to_future_with_callbacks(
+        attach: impl FnOnce(&PromiseCallback, &PromiseCallback),
+    ) -> PromiseFuture {
+        let inner = Rc::new(RefCell::new(PromiseFutureInner {
+            state: PromiseFutureState::Attaching,
+            task: None,
+        }));
+
+        let resolve = {
+            let inner = inner.clone();
+            Closure::<dyn FnMut(JsValue)>::once(move |value| {
+                finish_promise_future(&inner, Ok(value));
+            })
+        };
+
+        let reject = {
+            let inner = inner.clone();
+            Closure::<dyn FnMut(JsValue)>::once(move |value| {
+                finish_promise_future(&inner, Err(value));
+            })
+        };
+
+        attach(&resolve, &reject);
+
+        let callbacks = PromiseCallbacks {
+            _resolve: resolve,
+            _reject: reject,
+        };
+        let mut inner_mut = inner.borrow_mut();
+        let callbacks_to_drop = if matches!(inner_mut.state, PromiseFutureState::Attaching) {
+            inner_mut.state = PromiseFutureState::Pending(callbacks);
+            None
+        } else {
+            Some(callbacks)
+        };
+        drop(inner_mut);
+        drop(callbacks_to_drop);
+
+        PromiseFuture { inner }
+    }
+
+    pub fn promise_to_future(promise: JsValue) -> PromiseFuture {
+        promise_to_future_with_callbacks(|resolve, reject| {
+            promise_then_with_reject(&promise, resolve, reject);
+        })
+    }
+
+    impl Future for PromiseFuture {
+        type Output = Result<JsValue, JsValue>;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let mut inner = self.inner.borrow_mut();
+            match core::mem::replace(&mut inner.state, PromiseFutureState::Consumed) {
+                PromiseFutureState::Ready(result) => Poll::Ready(result),
+                state @ (PromiseFutureState::Attaching | PromiseFutureState::Pending(_)) => {
+                    inner.state = state;
+                    inner.task = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+                PromiseFutureState::Consumed => {
+                    panic!("PromiseFuture polled after completion")
+                }
+            }
+        }
+    }
+
+    impl Drop for PromiseFuture {
+        fn drop(&mut self) {
+            let callbacks_to_drop = match core::mem::replace(
+                &mut self.inner.borrow_mut().state,
+                PromiseFutureState::Consumed,
+            ) {
+                PromiseFutureState::Pending(callbacks) => Some(callbacks),
+                _ => None,
+            };
+            drop(callbacks_to_drop);
+        }
     }
 
     /// Convert a panic value into a JsValue error.
@@ -569,11 +728,13 @@ impl<T: ?Sized> ScopedClosure<'static, T> {
         let value = crate::__rt::wbg_cast::<CallbackKey<FnPtr>, crate::JsValue>(
             CallbackKey::new_with_policy(key, crate::encode::CallbackPolicy::JsOwnedOnce),
         );
-        // Once-cells dispose themselves after the first call; the closure
-        // never disposes from Rust-side drop, but encoders still need to flush.
+        // Once-cells dispose themselves after the first call, but they still
+        // need Rust-side ownership while a `Closure` handle exists. Promise
+        // adapters store resolve/reject once-closures and rely on dropping the
+        // pair after the first completion to dispose the unused callback.
         Self {
             _phantom: core::marker::PhantomData,
-            callback: crate::closure::CallbackOwnership::Detached,
+            callback: crate::closure::CallbackOwnership::Owned,
             value,
         }
     }
@@ -785,18 +946,14 @@ where
     where
         F: WasmClosureFnOnce<T, A, R> + MaybeUnwindSafe,
     {
-        let mut closure = <F as WasmClosureFnOnce<T, A, R>>::into_closure(fn_once);
-        closure.callback.detach();
-        closure
+        <F as WasmClosureFnOnce<T, A, R>>::into_closure(fn_once)
     }
 
     pub fn once_aborting<F, A, R>(fn_once: F) -> Self
     where
         F: WasmClosureFnOnceAbort<T, A, R>,
     {
-        let mut closure = <F as WasmClosureFnOnceAbort<T, A, R>>::into_closure(fn_once);
-        closure.callback.detach();
-        closure
+        <F as WasmClosureFnOnceAbort<T, A, R>>::into_closure(fn_once)
     }
 
     pub fn once_assert_unwind_safe<F, A, R>(fn_once: F) -> Self

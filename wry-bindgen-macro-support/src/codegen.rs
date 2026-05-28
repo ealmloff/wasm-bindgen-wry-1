@@ -634,8 +634,9 @@ fn generate_function(
         None => quote_spanned! {span=> () },
     };
 
-    // Handle async functions - generate code that uses JsFuture
-    // For async functions with catch, skip the try-catch wrapper since JsFuture already returns Result
+    // Handle async functions with a wry-specific Promise adapter. For async
+    // functions with catch, skip the try-catch wrapper since the adapter
+    // returns Result.
     if func.is_async {
         let js_code = generate_js_code(func, vendor_prefixes, prefix, true);
         let js_code_str = js_code.to_arrow_function();
@@ -812,7 +813,7 @@ fn class_return_type(func: &ImportFunction, class: &str) -> Option<syn::Type> {
 }
 
 /// Generate code for an async imported function
-/// Uses wasm_bindgen_futures::JsFuture to convert Promise to Future
+/// Uses wry-bindgen's Promise adapter to convert Promise to Future.
 fn generate_async_function(
     func: &ImportFunction,
     type_generics: &HashMap<String, syn::Generics>,
@@ -828,25 +829,34 @@ fn generate_async_function(
     let (fn_generics, _, fn_where_clause) = call_generics.split_for_impl();
 
     let fn_params = &args.fn_params;
-    let fn_types = &args.fn_types;
-    let call_values = &args.call_values;
+    let mut fn_types_with_callbacks = args.fn_type_list.clone();
+    fn_types_with_callbacks.push(quote_spanned! {span=> &#krate::__rt::PromiseCallback });
+    fn_types_with_callbacks.push(quote_spanned! {span=> &#krate::__rt::PromiseCallback });
+    let fn_types_with_callbacks = quote_spanned! {span=> #(#fn_types_with_callbacks),* };
 
-    // Generate the async function body
-    // - Call JS function which returns a Promise (as JsValue)
-    // - Cast to js_sys::Promise
-    // - Wrap in JsFuture and await
+    let mut call_values_with_callbacks = args.call_value_list.clone();
+    call_values_with_callbacks.push(quote_spanned! {span=> __resolve });
+    call_values_with_callbacks.push(quote_spanned! {span=> __reject });
+    let call_values_with_callbacks = quote_spanned! {span=> #(#call_values_with_callbacks),* };
+
+    // Generate the async function body:
+    // - Create the resolve/reject callbacks before calling JS
+    // - In one JS evaluation, call the import and attach the callbacks to the
+    //   returned Promise
+    // - Await it with the wry adapter, which tolerates callback-before-store
+    let js_code_str = async_promise_attach_js_code(js_code_str);
     let async_body = quote_spanned! {span=>
-        // Call the function, get Promise as JsValue
-        let __promise_val = #krate::__wry_call_js_function!(#js_code_str, fn(#fn_types) -> #krate::JsValue, (#call_values));
-
-        // Cast to js_sys::Promise and wrap in JsFuture
-        let __promise: ::wasm_bindgen_futures::js_sys::Promise =
-            #krate::JsCast::unchecked_from_js(__promise_val);
-        ::wasm_bindgen_futures::JsFuture::from(__promise).await
+        #krate::__rt::promise_to_future_with_callbacks(|__resolve, __reject| {
+            #krate::__wry_call_js_function!(
+                #js_code_str,
+                fn(#fn_types_with_callbacks),
+                (#call_values_with_callbacks)
+            );
+        }).await
     };
 
-    // Generate return type handling
-    // JsFuture::from(promise).await returns Result<JsValue, JsValue>
+    // Generate return type handling.
+    // promise_to_future(promise).await returns Result<JsValue, JsValue>.
     // - For Result<T, E> return types: map Ok value, keep Err as JsValue
     // - For non-Result types: unwrap and cast
     let (ret_clause, ret_handling) = match &func.ret {
@@ -1094,7 +1104,8 @@ fn generate_js_code(
     };
 
     // Wrap in try-catch if catch attribute is present
-    // Skip for async functions since JsFuture already returns Result<JsValue, JsValue>
+    // Skip for async functions since the Promise adapter already returns
+    // Result<JsValue, JsValue>.
     let body = if func.catch && !skip_catch_wrapper {
         wrap_body_with_try_catch(&body)
     } else {
@@ -1154,14 +1165,39 @@ impl JsCode {
     }
 }
 
+fn params_with_promise_callbacks(params: &str) -> String {
+    if params == "()" {
+        "(__wryResolve, __wryReject)".to_string()
+    } else {
+        let params = params
+            .strip_suffix(')')
+            .expect("generated JS params should be parenthesized");
+        format!("{params}, __wryResolve, __wryReject)")
+    }
+}
+
+fn async_promise_attach_js_code(js_code: &str) -> String {
+    let Some((params, body)) = js_code.split_once(" => ") else {
+        panic!("generated async JS code should be an arrow function");
+    };
+    let params = params_with_promise_callbacks(params);
+    format!(
+        "{params} => {{{{ try {{{{ Promise.resolve({body}).then(__wryResolve, __wryReject); }}}} catch (e) {{{{ __wryReject(e); }}}} }}}}"
+    )
+}
+
 /// Generated argument information
 struct GeneratedArgs {
     /// Function parameter declarations: `arg1: T1, arg2: T2`
     fn_params: TokenStream,
     /// Just the types for fn pointer: `T1, T2`
     fn_types: TokenStream,
+    /// Individual fn pointer type tokens.
+    fn_type_list: Vec<TokenStream>,
     /// Values to pass to call: `&self.obj, arg1, arg2`
     call_values: TokenStream,
+    /// Individual values to pass to call.
+    call_value_list: Vec<TokenStream>,
 }
 
 /// Generate argument lists
@@ -1215,7 +1251,9 @@ fn generate_args(func: &ImportFunction, krate: &TokenStream) -> syn::Result<Gene
     Ok(GeneratedArgs {
         fn_params: fn_params_tokens,
         fn_types: fn_types_tokens,
+        fn_type_list: fn_types,
         call_values: call_values_tokens,
+        call_value_list: call_values,
     })
 }
 

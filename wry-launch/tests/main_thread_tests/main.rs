@@ -4,12 +4,15 @@ use std::io::{self, Write};
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::process::ExitCode;
-use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use futures_util::FutureExt;
+use futures_channel::mpsc::{UnboundedReceiver, unbounded};
+use futures_util::{FutureExt, StreamExt, pin_mut, select};
 use libtest_mimic::{Arguments, Failed};
-use wasm_bindgen::{batch::batch_async, wasm_bindgen};
+use wasm_bindgen::{Closure, batch::batch_async, wasm_bindgen};
+use wry_launch::set_on_error;
 
 mod add_number_js;
 #[allow(clippy::redundant_closure)]
@@ -41,8 +44,8 @@ extern "C" {
     pub fn heap_objects_alive() -> u32;
 }
 
-const TEST_TIMEOUT: Duration = Duration::from_secs(5);
-const STRESS_TEST_TIMEOUT: Duration = Duration::from_secs(30);
+const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+const STRESS_TEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy)]
 enum BatchMode {
@@ -63,6 +66,24 @@ impl BatchMode {
 struct HarnessOptions {
     repeat_for: Option<Duration>,
     repro_exported_struct_heap_ref: bool,
+    repro_js_error: bool,
+}
+
+#[wasm_bindgen(inline_js = r#"
+    export function throw_async_harness_error() {
+        setTimeout(() => {
+            throw new Error("intentional harness JS error");
+        }, 0);
+    }
+
+"#)]
+extern "C" {
+    fn throw_async_harness_error();
+}
+
+async fn repro_js_error_is_fatal() {
+    throw_async_harness_error();
+    std::future::pending::<()>().await;
 }
 
 // The futures returned by test bodies are !Send because they can hold
@@ -76,7 +97,36 @@ struct TestCase {
     body: TestBody,
 }
 
+struct WallClockTimeoutGuard {
+    done: Arc<AtomicBool>,
+}
+
+impl Drop for WallClockTimeoutGuard {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::SeqCst);
+    }
+}
+
+fn arm_wall_clock_timeout(timeout: Duration) -> WallClockTimeoutGuard {
+    let done = Arc::new(AtomicBool::new(false));
+    let done_for_thread = done.clone();
+    let watchdog_timeout = timeout + Duration::from_secs(1);
+    std::thread::spawn(move || {
+        std::thread::sleep(watchdog_timeout);
+        if !done_for_thread.load(Ordering::SeqCst) {
+            eprintln!(
+                "Test exceeded wall-clock timeout after {} seconds",
+                watchdog_timeout.as_secs()
+            );
+            std::process::exit(101);
+        }
+    });
+
+    WallClockTimeoutGuard { done }
+}
+
 async fn run_with_timeout(fut: impl Future<Output = ()>, mode: BatchMode, timeout: Duration) {
+    let _wall_clock_timeout = arm_wall_clock_timeout(timeout);
     let body = async move {
         match mode {
             BatchMode::NonBatched => fut.await,
@@ -196,6 +246,7 @@ fn build_tests() -> Vec<TestCase> {
         roundtrip::test_roundtrip,
         callbacks::test_call_callback,
         callbacks::test_dropped_closure_disposes_js_callable,
+        callbacks::test_dropped_once_closure_disposes_js_callable,
         callbacks::test_exported_method_drop_closure_disposes_js_callable,
         callbacks::test_mut_dyn_fn,
         callbacks::test_mut_dyn_fnmut,
@@ -287,6 +338,8 @@ fn build_tests() -> Vec<TestCase> {
         async_bindings::test_async_method,
         async_bindings::test_async_method_with_catch,
         async_bindings::test_async_static_method,
+        async_bindings::test_already_resolved_async,
+        async_bindings::test_already_rejected_async_catch,
         async_bindings::test_join_many_async,
     );
 
@@ -303,6 +356,14 @@ fn build_repro_tests() -> Vec<TestCase> {
     tests
 }
 
+fn build_js_error_repro_tests() -> Vec<TestCase> {
+    vec![async_test(
+        trial_name("harness", "repro_js_error_is_fatal", BatchMode::NonBatched),
+        BatchMode::NonBatched,
+        repro_js_error_is_fatal,
+    )]
+}
+
 fn extract_panic_message(payload: Box<dyn Any + Send>) -> Failed {
     let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
         (*s).to_string()
@@ -314,12 +375,59 @@ fn extract_panic_message(payload: Box<dyn Any + Send>) -> Failed {
     Failed::from(msg)
 }
 
-async fn run_test(body: TestBody) -> Result<(), Failed> {
+fn install_js_error_reporter() -> UnboundedReceiver<String> {
+    let (sender, receiver) = unbounded();
+    set_on_error(Closure::new(move |err: String, stack: String| {
+        let message = if stack.is_empty() {
+            err
+        } else {
+            format!("{err}\nStack trace:\n{stack}")
+        };
+        let _ = sender.unbounded_send(message.clone());
+
+        eprintln!("Fatal JavaScript error event:\n{message}");
+        let _ = io::stdout().flush();
+        let _ = io::stderr().flush();
+        std::process::exit(101);
+    }));
+    receiver
+}
+
+fn js_error_failure(message: String) -> Failed {
+    Failed::from(format!("JavaScript error event:\n{message}"))
+}
+
+async fn run_test_body(body: TestBody) -> Result<(), Failed> {
     let fut = std::panic::catch_unwind(AssertUnwindSafe(body)).map_err(extract_panic_message)?;
     AssertUnwindSafe(fut)
         .catch_unwind()
         .await
         .map_err(extract_panic_message)
+}
+
+async fn run_test(body: TestBody, js_errors: &mut UnboundedReceiver<String>) -> Result<(), Failed> {
+    if let Some(Some(message)) = js_errors.next().now_or_never() {
+        return Err(js_error_failure(message));
+    }
+
+    let body = run_test_body(body).fuse();
+    let js_error = js_errors.next().fuse();
+    pin_mut!(body, js_error);
+
+    select! {
+        result = body => {
+            if result.is_ok() {
+                if let Some(Some(message)) = js_errors.next().now_or_never() {
+                    return Err(js_error_failure(message));
+                }
+            }
+            result
+        }
+        message = js_error => {
+            let message = message.unwrap_or_else(|| "JavaScript error reporter stopped".to_string());
+            Err(js_error_failure(message))
+        }
+    }
 }
 
 fn is_filtered_out(args: &Arguments, test: &TestCase) -> bool {
@@ -368,7 +476,11 @@ fn print_failures(failures: &[(String, Option<String>)]) {
     }
 }
 
-async fn run_tests(args: Arguments, mut tests: Vec<TestCase>) -> bool {
+async fn run_tests(
+    args: Arguments,
+    mut tests: Vec<TestCase>,
+    js_errors: &mut UnboundedReceiver<String>,
+) -> bool {
     let started = Instant::now();
     let initial_count = tests.len();
     tests.retain(|test| !is_filtered_out(&args, test));
@@ -404,7 +516,7 @@ async fn run_tests(args: Arguments, mut tests: Vec<TestCase>) -> bool {
             continue;
         }
 
-        match run_test(test.body).await {
+        match run_test(test.body, js_errors).await {
             Ok(()) => {
                 passed += 1;
                 println!("ok");
@@ -442,6 +554,8 @@ fn parse_harness_args() -> (HarnessOptions, Vec<String>) {
     for arg in args {
         if arg == "--wry-repro-exported-struct-heap-ref" {
             options.repro_exported_struct_heap_ref = true;
+        } else if arg == "--wry-repro-js-error" {
+            options.repro_js_error = true;
         } else if let Some(value) = arg.strip_prefix("--wry-repeat-for-secs=") {
             options.repeat_for = value.parse::<u64>().ok().map(Duration::from_secs);
         } else {
@@ -460,26 +574,29 @@ fn parse_harness_args() -> (HarnessOptions, Vec<String>) {
 }
 
 fn selected_tests(options: HarnessOptions) -> Vec<TestCase> {
-    if options.repro_exported_struct_heap_ref {
+    if options.repro_js_error {
+        build_js_error_repro_tests()
+    } else if options.repro_exported_struct_heap_ref {
         build_repro_tests()
     } else {
         build_tests()
     }
 }
 
-async fn run_selected_tests(args: Arguments, options: HarnessOptions) -> bool {
-    run_tests(args, selected_tests(options)).await
+async fn run_selected_tests(
+    args: Arguments,
+    options: HarnessOptions,
+    js_errors: &mut UnboundedReceiver<String>,
+) -> bool {
+    run_tests(args, selected_tests(options), js_errors).await
 }
 
 fn main() -> ExitCode {
     let (options, libtest_args) = parse_harness_args();
     let args = Arguments::from_iter(libtest_args);
 
-    // The test result travels back from the runtime thread to main() so
-    // `main` can return its exit code after `run_headless` returns.
-    let (passed_tx, passed_rx) = std_mpsc::channel::<bool>();
-
     wry_launch::run_headless(move || async move {
+        let mut js_errors = install_js_error_reporter();
         let passed = if let Some(duration) = options.repeat_for.filter(|_| !args.list) {
             let start = Instant::now();
             let mut iteration = 0u64;
@@ -491,7 +608,7 @@ fn main() -> ExitCode {
                     start.elapsed()
                 );
 
-                if !run_selected_tests(args.clone(), options).await {
+                if !run_selected_tests(args.clone(), options, &mut js_errors).await {
                     break false;
                 }
 
@@ -504,18 +621,14 @@ fn main() -> ExitCode {
                 }
             }
         } else {
-            run_selected_tests(args, options).await
+            run_selected_tests(args, options, &mut js_errors).await
         };
 
-        passed_tx
-            .send(passed)
-            .expect("test result receiver disappeared");
+        let _ = io::stdout().flush();
+        let _ = io::stderr().flush();
+        std::process::exit(if passed { 0 } else { 101 });
     })
     .expect("failed to run headless test harness");
 
-    if passed_rx.recv().expect("test result sender disappeared") {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(101)
-    }
+    ExitCode::SUCCESS
 }

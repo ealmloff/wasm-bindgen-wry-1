@@ -89,6 +89,55 @@ pub(crate) fn test_dropped_closure_disposes_js_callable() {
     clear_callback_for_drop_test();
 }
 
+pub(crate) fn test_dropped_once_closure_disposes_js_callable() {
+    #[wasm_bindgen(inline_js = r#"
+        let storedDroppedOnceCallback = null;
+
+        export function store_once_callback_for_drop_test(cb) {
+            storedDroppedOnceCallback = cb;
+        }
+
+        export function dropped_once_callback_throws_after_rust_drop() {
+            try {
+                storedDroppedOnceCallback(1);
+                return false;
+            } catch (error) {
+                return String(error && error.message ? error.message : error)
+                    .includes("already been dropped");
+            }
+        }
+
+        export function clear_once_callback_for_drop_test() {
+            storedDroppedOnceCallback = null;
+        }
+    "#)]
+    extern "C" {
+        fn store_once_callback_for_drop_test(cb: &Closure<dyn FnMut(u32)>);
+        fn dropped_once_callback_throws_after_rust_drop() -> bool;
+        fn clear_once_callback_for_drop_test();
+    }
+
+    let called = std::rc::Rc::new(Cell::new(false));
+    let called_clone = called.clone();
+    let callback = Closure::<dyn FnMut(u32)>::once(move |_| {
+        called_clone.set(true);
+    });
+
+    store_once_callback_for_drop_test(&callback);
+    drop(callback);
+
+    assert!(
+        dropped_once_callback_throws_after_rust_drop(),
+        "dropped once closure should dispose the JS callable"
+    );
+    assert!(
+        !called.get(),
+        "dropped once closure should not call back into Rust"
+    );
+
+    clear_once_callback_for_drop_test();
+}
+
 #[wasm_bindgen(inline_js = r#"
     let storedRuntimeBorrowedDropCallback = null;
 
