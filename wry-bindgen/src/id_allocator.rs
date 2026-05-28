@@ -415,7 +415,10 @@ mod tests {
     #[test]
     fn inbound_heap_ids_collapse_into_one_install_batch() {
         let mut heap = HeapIds::new();
-        let ids = [heap.next_inbound_js_heap_id(), heap.next_inbound_js_heap_id()];
+        let ids = [
+            heap.next_inbound_js_heap_id(),
+            heap.next_inbound_js_heap_id(),
+        ];
         assert_eq!(ids, [JSIDX_RESERVED, JSIDX_RESERVED + 1]);
 
         let batch = heap.take_pending_install_ids();

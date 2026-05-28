@@ -140,8 +140,7 @@ impl WryIPC {
 pub(crate) fn progress_js_with<O>(
     mut with_respond: impl for<'a> FnMut(DecodedData<'a>) -> O,
 ) -> Option<O> {
-    let response =
-        with_runtime(|runtime| runtime.ipc().receivers.write().recv_blocking())?;
+    let response = with_runtime(|runtime| runtime.ipc().receivers.write().recv_blocking())?;
     dispatch_inbound_message(&response, &mut with_respond)
 }
 
