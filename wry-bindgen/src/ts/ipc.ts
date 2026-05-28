@@ -197,38 +197,42 @@ function handleBinaryResponse(
     // This frame persists across all operations and nested calls.
     window.jsHeap.pushBorrowFrame();
 
-    while (decoder.hasMoreU32()) {
-      const fnId = decoder.takeU32();
-      const typeInfo = parseTypeInfo(decoder);
+    // The borrow frame and reservation scope are popped in `finally` so a throw
+    // inside the op loop cannot leave either stack desynced.
+    try {
+      while (decoder.hasMoreU32()) {
+        const fnId = decoder.takeU32();
+        const typeInfo = parseTypeInfo(decoder);
 
-      const functionRegistry = getFunctionRegistry();
-      const jsFunction = functionRegistry[fnId];
-      if (!jsFunction) {
-        throw new Error("Unknown function ID in response: " + fnId);
+        const functionRegistry = getFunctionRegistry();
+        const jsFunction = functionRegistry[fnId];
+        if (!jsFunction) {
+          throw new Error("Unknown function ID in response: " + fnId);
+        }
+
+        let params: unknown[];
+        try {
+          params = typeInfo.paramTypes.map((paramType) => paramType.decode(decoder));
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const source = String(jsFunction).replace(/\s+/g, " ").slice(0, 160);
+          throw new Error(
+            `Failed to decode parameters for function ID ${fnId} (${source}): ${message}`
+          );
+        }
+
+        const result = jsFunction(...params);
+
+        if (typeInfo.returnType instanceof HeapRefType && reservedIds.length > 0) {
+          window.jsHeap.fillNextReserved(result);
+        } else {
+          typeInfo.returnType.encode(encoder, result);
+        }
       }
-
-      let params: unknown[];
-      try {
-        params = typeInfo.paramTypes.map((paramType) => paramType.decode(decoder));
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        const source = String(jsFunction).replace(/\s+/g, " ").slice(0, 160);
-        throw new Error(
-          `Failed to decode parameters for function ID ${fnId} (${source}): ${message}`
-        );
-      }
-
-      const result = jsFunction(...params);
-
-      if (typeInfo.returnType instanceof HeapRefType && reservedIds.length > 0) {
-        window.jsHeap.fillNextReserved(result);
-      } else {
-        typeInfo.returnType.encode(encoder, result);
-      }
+    } finally {
+      window.jsHeap.popBorrowFrame();
+      window.jsHeap.popReservationScope();
     }
-
-    window.jsHeap.popBorrowFrame();
-    window.jsHeap.popReservationScope();
 
     const nextResponse = sync_request_binary(
       `/__wbg__/handler`,

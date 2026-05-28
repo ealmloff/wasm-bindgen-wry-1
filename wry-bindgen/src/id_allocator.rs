@@ -100,9 +100,6 @@ pub(crate) type InstallIdBatch = Vec<u64>;
 
 struct HeapIds {
     slab: IdSlab,
-    /// A stack of ongoing function encodings with the ids that need to be freed
-    /// after each one is done.
-    ids_to_free: Vec<Vec<u64>>,
     /// IDs allocated while decoding the current inbound message, awaiting the
     /// next outbound's install prelude. Every outbound drains this via
     /// `take_pending_install_ids`, and the protocol decodes exactly one inbound
@@ -117,7 +114,6 @@ impl HeapIds {
     fn new() -> Self {
         Self {
             slab: IdSlab::new(JSIDX_RESERVED),
-            ids_to_free: Vec::new(),
             pending_install_ids: Vec::new(),
             reserved_placeholder_ids: Vec::new(),
         }
@@ -145,20 +141,12 @@ impl HeapIds {
         id
     }
 
-    fn release_heap_id(&mut self, id: u64) -> Option<u64> {
+    fn release_heap_slot(&mut self, id: u64) {
         if id < JSIDX_RESERVED {
             unreachable!("Attempted to release reserved JS heap ID {}", id);
         }
 
         self.slab.release(id);
-
-        match self.ids_to_free.last_mut() {
-            Some(ids) => {
-                ids.push(id);
-                None
-            }
-            None => Some(id),
-        }
     }
 
     fn recycle_heap_id(&mut self, id: u64) {
@@ -169,24 +157,6 @@ impl HeapIds {
 
     fn recycle_heap_id_if_released(&mut self, id: u64) -> bool {
         id >= JSIDX_RESERVED && self.slab.recycle_if_released(id)
-    }
-
-    fn push_ids_to_free(&mut self) {
-        self.ids_to_free.push(Vec::new());
-    }
-
-    fn pop_and_release_ids(&mut self) -> Vec<u64> {
-        let ids = self
-            .ids_to_free
-            .pop()
-            .expect("pop_and_release_ids called with empty frame stack");
-
-        if let Some(parent) = self.ids_to_free.last_mut() {
-            parent.extend(ids);
-            Vec::new()
-        } else {
-            ids
-        }
     }
 
     fn take_pending_install_ids(&mut self) -> InstallIdBatch {
@@ -334,9 +304,10 @@ impl IdAllocator {
         self.borrows.pop_frame();
     }
 
-    /// Track a heap ID as released and return it if JS should be notified now.
-    pub(crate) fn release_heap_id(&mut self, id: u64) -> Option<u64> {
-        self.heap.release_heap_id(id)
+    /// Release a heap ID's slab slot. Whether JS should be notified now is
+    /// decided by the runtime's operation-free batching, not here.
+    pub(crate) fn release_heap_slot(&mut self, id: u64) {
+        self.heap.release_heap_slot(id);
     }
 
     pub(crate) fn recycle_heap_id(&mut self, id: u64) {
@@ -345,14 +316,6 @@ impl IdAllocator {
 
     pub(crate) fn recycle_heap_id_if_released(&mut self, id: u64) -> bool {
         self.heap.recycle_heap_id_if_released(id)
-    }
-
-    pub(crate) fn push_ids_to_free(&mut self) {
-        self.heap.push_ids_to_free();
-    }
-
-    pub(crate) fn pop_and_release_ids(&mut self) -> Vec<u64> {
-        self.heap.pop_and_release_ids()
     }
 
     /// Take the IDs JS should install for objects it sent to Rust. Empty when
@@ -428,7 +391,7 @@ mod tests {
         let mut heap = HeapIds::new();
         let id = heap.next_placeholder_id();
         assert_eq!(id, JSIDX_RESERVED);
-        assert_eq!(heap.release_heap_id(id), Some(id));
+        heap.release_heap_slot(id);
         heap.recycle_heap_id(id);
         assert_eq!(heap.next_placeholder_id(), id);
     }
@@ -437,7 +400,7 @@ mod tests {
     fn inbound_drop_uses_normal_release_path() {
         let mut heap = HeapIds::new();
         let id = heap.next_inbound_js_heap_id();
-        assert_eq!(heap.release_heap_id(id), Some(id));
+        heap.release_heap_slot(id);
 
         let next = heap.next_placeholder_id();
         assert_ne!(next, id);
@@ -480,7 +443,7 @@ mod tests {
     fn observe_js_heap_id_reserves_recycled_id() {
         let mut heap = HeapIds::new();
         let id = heap.next_placeholder_id();
-        assert_eq!(heap.release_heap_id(id), Some(id));
+        heap.release_heap_slot(id);
         heap.recycle_heap_id(id);
 
         heap.observe_js_heap_id(id);

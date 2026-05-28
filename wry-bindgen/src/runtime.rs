@@ -181,17 +181,13 @@ fn dispatch_inbound_message<O>(
 }
 
 fn handle_inbound_evaluate(mut data: DecodedData<'_>) {
-    with_runtime(|runtime| {
-        // Mark that we are inside a callback so any Evaluate this callback
-        // emits is routed back through the parked JS XHR instead of a fresh
-        // top-level `evaluate_script`.
-        runtime.enter_inbound_evaluate();
-    });
+    // Mark that we are inside a callback so any Evaluate this callback emits is
+    // routed back through the parked JS XHR instead of a fresh top-level
+    // `evaluate_script`. The guard restores the depth even if the callback
+    // panics.
+    let _eval = InboundEvaluateGuard::new();
     prepare_js_to_rust_data(&mut data);
     handle_rust_callback(&mut data);
-    with_runtime(|runtime| {
-        runtime.leave_inbound_evaluate();
-    });
 }
 
 fn prepare_js_to_rust_data(data: &mut DecodedData) {
@@ -214,15 +210,14 @@ fn handle_rust_callback(data: &mut DecodedData) {
                 rust_callback.clone_rc()
             });
 
-            // Push a borrow frame before calling the callback - nested calls won't clear our borrowed refs
-            with_runtime(|state| state.push_borrow_frame());
+            // Push a borrow frame before calling the callback - nested calls
+            // won't clear our borrowed refs. The guard pops the frame even if
+            // the callback panics.
+            let _frame = BorrowFrameGuard::new();
 
             let mut encoder = respond_encoder();
             // Call through the cloned Rc (uniform Fn interface)
             (callback)(data, &mut encoder);
-
-            // Pop the borrow frame after the callback completes
-            with_runtime(|state| state.pop_borrow_frame());
 
             finish_respond_message(encoder)
         }
@@ -264,6 +259,40 @@ fn handle_rust_callback(data: &mut DecodedData) {
         _ => panic!("Unknown Rust callback function ID: {fn_id}"),
     };
     with_runtime(|runtime| runtime.ipc().js_response(runtime.webview_id(), response));
+}
+
+/// Scopes a borrow frame for the duration of a callback. The frame is pushed on
+/// construction and popped on drop, so it survives a panicking callback.
+struct BorrowFrameGuard;
+
+impl BorrowFrameGuard {
+    fn new() -> Self {
+        with_runtime(|state| state.push_borrow_frame());
+        Self
+    }
+}
+
+impl Drop for BorrowFrameGuard {
+    fn drop(&mut self) {
+        with_runtime(|state| state.pop_borrow_frame());
+    }
+}
+
+/// Scopes the inbound-evaluate depth for the duration of a JS→Rust callback. The
+/// depth is incremented on construction and decremented on drop.
+struct InboundEvaluateGuard;
+
+impl InboundEvaluateGuard {
+    fn new() -> Self {
+        with_runtime(|state| state.enter_inbound_evaluate());
+        Self
+    }
+}
+
+impl Drop for InboundEvaluateGuard {
+    fn drop(&mut self) {
+        with_runtime(|state| state.leave_inbound_evaluate());
+    }
 }
 
 fn respond_encoder() -> crate::ipc::EncodedData {

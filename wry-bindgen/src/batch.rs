@@ -19,6 +19,17 @@ use crate::runtime::WryIPC;
 use crate::type_cache::TypeCache;
 use crate::value::JSIDX_RESERVED;
 
+/// One operation's deferred cleanup: heap slots and Rust object handles whose
+/// release was requested while the operation was encoding. Both are flushed
+/// together once the operation completes.
+#[derive(Default)]
+pub(crate) struct OperationFreeFrame {
+    /// Released heap slots to drop in JS and recycle at flush end.
+    heap_ids: Vec<u64>,
+    /// Rust object handles to remove from the store at flush end.
+    object_handles: Vec<u32>,
+}
+
 /// State for batching operations and object storage.
 /// Every evaluation is a batch - it may just have one operation.
 ///
@@ -34,9 +45,10 @@ pub struct Runtime {
     type_cache: TypeCache,
     /// Exported Rust structs and callbacks stored by handle.
     objects: BTreeMap<u32, Box<dyn Any>>,
-    /// Rust-owned object handles to drop after the current encoded JS call
-    /// has finished executing.
-    objects_to_free: Vec<Vec<u32>>,
+    /// Per-operation deferred cleanup frames. Each in-flight operation pushes
+    /// one frame; released heap IDs and object handles accumulate into the top
+    /// frame and are flushed when the operation completes.
+    op_free_stack: Vec<OperationFreeFrame>,
     /// The ipc layer used to communicate with the JS runtime
     ipc: WryIPC,
     /// The id of the webview this is associated with
@@ -61,7 +73,7 @@ impl Runtime {
             type_cache: TypeCache::new(),
             // Object store starts empty
             objects: BTreeMap::new(),
-            objects_to_free: Vec::new(),
+            op_free_stack: Vec::new(),
             ipc,
             webview_id,
             thread_locals: BTreeMap::new(),
@@ -128,8 +140,17 @@ impl Runtime {
     }
 
     /// Track a heap ID as released and queue it for JS drop when appropriate.
+    /// Returns the ID when there is no open operation frame to batch it into,
+    /// signalling the caller to notify JS immediately.
     pub fn release_heap_id(&mut self, id: u64) -> Option<u64> {
-        self.id_allocator.release_heap_id(id)
+        self.id_allocator.release_heap_slot(id);
+        match self.op_free_stack.last_mut() {
+            Some(frame) => {
+                frame.heap_ids.push(id);
+                None
+            }
+            None => Some(id),
+        }
     }
 
     pub fn recycle_heap_id(&mut self, id: u64) {
@@ -186,36 +207,36 @@ impl Runtime {
         self.encoder.byte_len() <= 17
     }
 
-    pub(crate) fn push_ids_to_free(&mut self) {
-        self.id_allocator.push_ids_to_free();
-        self.objects_to_free.push(Vec::new());
-    }
-
-    pub(crate) fn pop_and_release_ids(&mut self) -> Vec<u64> {
-        self.id_allocator.pop_and_release_ids()
+    pub(crate) fn push_operation_frame(&mut self) {
+        self.op_free_stack.push(OperationFreeFrame::default());
     }
 
     pub(crate) fn release_object_handle(&mut self, handle: ObjectHandle) -> Option<Box<dyn Any>> {
-        match self.objects_to_free.last_mut() {
-            Some(handles) => {
-                handles.push(handle.raw());
+        match self.op_free_stack.last_mut() {
+            Some(frame) => {
+                frame.object_handles.push(handle.raw());
                 None
             }
             None => self.remove_object_untyped(handle.raw()),
         }
     }
 
-    pub(crate) fn pop_and_release_objects(&mut self) -> Vec<u32> {
-        let handles = self
-            .objects_to_free
+    /// Pop the current operation's free frame. If a parent frame exists, the
+    /// released IDs and handles collapse into it (so nested ops flush with
+    /// their parent) and an empty frame is returned; otherwise the frame is
+    /// handed back for the caller to flush.
+    pub(crate) fn pop_operation_frame(&mut self) -> OperationFreeFrame {
+        let frame = self
+            .op_free_stack
             .pop()
-            .expect("pop_and_release_objects called with empty frame stack");
+            .expect("pop_operation_frame called with empty frame stack");
 
-        if let Some(parent) = self.objects_to_free.last_mut() {
-            parent.extend(handles);
-            Vec::new()
+        if let Some(parent) = self.op_free_stack.last_mut() {
+            parent.heap_ids.extend(frame.heap_ids);
+            parent.object_handles.extend(frame.object_handles);
+            OperationFreeFrame::default()
         } else {
-            handles
+            frame
         }
     }
 
@@ -529,7 +550,7 @@ pub(crate) fn run_js_sync<R: BatchableResult>(
     // we are encoding, but they should be queued after this operation.
     let mut batch = with_runtime(|state| {
         // Push a new operation into the batch
-        state.push_ids_to_free();
+        state.push_operation_frame();
         state.take_encoder()
     });
     add_operation(&mut batch, fn_id, add_args);
@@ -562,15 +583,13 @@ pub(crate) fn run_js_sync<R: BatchableResult>(
         placeholder.unwrap_or_else(|| flush_and_return::<R>())
     };
 
-    // After running, free any queued IDs for this operation
-    let ids = with_runtime(|state| state.pop_and_release_ids());
-    for id in ids {
+    // After running, free any queued IDs and object handles for this operation
+    let frame = with_runtime(|state| state.pop_operation_frame());
+    for id in frame.heap_ids {
         crate::js_helpers::js_drop_heap_ref(id);
         recycle_heap_id_after_js_drop(id);
     }
-
-    let objects = with_runtime(|state| state.pop_and_release_objects());
-    for handle in objects {
+    for handle in frame.object_handles {
         let object = with_runtime(|state| state.remove_object_untyped(handle));
         drop(object);
     }
