@@ -288,6 +288,7 @@ fn app() {
             }
         }) as Box<dyn Fn(f64, f64)>);
         onMapMouseMove(&map, &mouse_move_cb);
+        mouse_move_cb.forget();
 
         // Click handler to add markers
         let state_click = state.clone();
@@ -311,11 +312,13 @@ fn app() {
                 );
             }) as Box<dyn Fn(f64, f64)>);
             onMarkerDragEnd(&marker, &drag_cb);
+            drag_cb.forget();
 
             state_click.borrow_mut().markers.push(marker);
             update_marker_count(state_click.borrow().markers.len());
         }) as Box<dyn Fn(f64, f64)>);
         onMapClick(&map, &click_cb);
+        click_cb.forget();
 
         // Search button
         let state_search = state.clone();
@@ -403,6 +406,7 @@ fn setup_search_handler(state: Rc<RefCell<AppState>>, map: JsValue) {
     search_btn
         .add_event_listener_with_callback("click", search_closure.as_ref().unchecked_ref())
         .unwrap_throw();
+    search_closure.forget();
 
     // Enter key in search input
     let input = document.get_element_by_id("search-input").unwrap_throw();
@@ -414,6 +418,7 @@ fn setup_search_handler(state: Rc<RefCell<AppState>>, map: JsValue) {
     input
         .add_event_listener_with_callback("keypress", enter_closure.as_ref().unchecked_ref())
         .unwrap_throw();
+    enter_closure.forget();
 }
 
 fn setup_location_handler(state: Rc<RefCell<AppState>>, map: JsValue) {
@@ -465,6 +470,7 @@ fn setup_location_handler(state: Rc<RefCell<AppState>>, map: JsValue) {
     location_btn
         .add_event_listener_with_callback("click", location_closure.as_ref().unchecked_ref())
         .unwrap_throw();
+    location_closure.forget();
 }
 
 fn setup_clear_handler(state: Rc<RefCell<AppState>>) {
@@ -482,4 +488,5 @@ fn setup_clear_handler(state: Rc<RefCell<AppState>>) {
     clear_btn
         .add_event_listener_with_callback("click", clear_closure.as_ref().unchecked_ref())
         .unwrap_throw();
+    clear_closure.forget();
 }

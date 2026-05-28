@@ -138,6 +138,43 @@ pub(crate) fn test_dropped_once_closure_disposes_js_callable() {
     clear_once_callback_for_drop_test();
 }
 
+pub(crate) fn test_long_lived_callback_survives_setup_scope() {
+    #[wasm_bindgen(inline_js = r#"
+        let storedLongLivedCallback = null;
+
+        export function store_long_lived_callback(cb) {
+            storedLongLivedCallback = cb;
+        }
+
+        export function call_long_lived_callback(value) {
+            try {
+                return storedLongLivedCallback(value);
+            } catch (_error) {
+                return -1;
+            }
+        }
+
+        export function clear_long_lived_callback() {
+            storedLongLivedCallback = null;
+        }
+    "#)]
+    extern "C" {
+        fn store_long_lived_callback(cb: &Closure<dyn Fn(i32) -> i32>);
+        fn call_long_lived_callback(value: i32) -> i32;
+        fn clear_long_lived_callback();
+    }
+
+    {
+        let callback: Closure<dyn Fn(i32) -> i32> = Closure::wrap(Box::new(|value| value + 1));
+        store_long_lived_callback(&callback);
+        callback.forget();
+    }
+
+    assert_eq!(call_long_lived_callback(41), 42);
+
+    clear_long_lived_callback();
+}
+
 #[wasm_bindgen(inline_js = r#"
     let storedRuntimeBorrowedDropCallback = null;
 

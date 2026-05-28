@@ -250,6 +250,7 @@ fn build_tests() -> Vec<TestCase> {
         callbacks::test_call_callback,
         callbacks::test_dropped_closure_disposes_js_callable,
         callbacks::test_dropped_once_closure_disposes_js_callable,
+        callbacks::test_long_lived_callback_survives_setup_scope,
         callbacks::test_exported_method_drop_closure_disposes_js_callable,
         callbacks::test_mut_dyn_fn,
         callbacks::test_mut_dyn_fnmut,
