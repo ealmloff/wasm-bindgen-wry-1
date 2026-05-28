@@ -168,11 +168,9 @@ fn dispatch_inbound_message<O>(
                 // closes, so types it carried can be sent as `TYPE_CACHED`
                 // from here on.
                 runtime.pop_and_ack_type_cache_frame();
-                runtime.open_inbound_batch();
             });
             prepare_js_to_rust_data(&mut data);
             let result = with_respond(data);
-            with_runtime(|runtime| runtime.close_inbound_batch());
             Some(result)
         }
         DecodedVariant::Evaluate { data } => {
@@ -184,7 +182,6 @@ fn dispatch_inbound_message<O>(
 
 fn handle_inbound_evaluate(mut data: DecodedData<'_>) {
     with_runtime(|runtime| {
-        runtime.open_inbound_batch();
         // Mark that we are inside a callback so any Evaluate this callback
         // emits is routed back through the parked JS XHR instead of a fresh
         // top-level `evaluate_script`.
@@ -194,7 +191,6 @@ fn handle_inbound_evaluate(mut data: DecodedData<'_>) {
     handle_rust_callback(&mut data);
     with_runtime(|runtime| {
         runtime.leave_inbound_evaluate();
-        runtime.close_inbound_batch();
     });
 }
 

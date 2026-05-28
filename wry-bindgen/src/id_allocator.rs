@@ -103,15 +103,12 @@ struct HeapIds {
     /// A stack of ongoing function encodings with the ids that need to be freed
     /// after each one is done.
     ids_to_free: Vec<Vec<u64>>,
-    /// Stack of in-progress inbound batches. The top is the batch IDs from the
-    /// currently-decoding inbound message are appended to; nested inbound
-    /// dispatches push a fresh frame and pop it on completion.
-    inbound_batch_stack: Vec<Vec<u64>>,
-    /// The one closed inbound batch waiting to ride out on the next Rust-to-JS
-    /// message's prelude. Under strict ping-pong every inbound message is
-    /// answered before the next is decoded, so at most one batch is ever
-    /// pending — the next outbound always drains it before another closes.
-    queued_install_ids: Option<InstallIdBatch>,
+    /// IDs allocated while decoding the current inbound message, awaiting the
+    /// next outbound's install prelude. Every outbound drains this via
+    /// `take_pending_install_ids`, and the protocol decodes exactly one inbound
+    /// between consecutive outbounds, so at each drain this holds exactly that
+    /// one message's IDs — no per-message framing is needed.
+    pending_install_ids: Vec<u64>,
     /// IDs reserved as placeholders for JS function return values.
     reserved_placeholder_ids: Vec<u64>,
 }
@@ -121,8 +118,7 @@ impl HeapIds {
         Self {
             slab: IdSlab::new(JSIDX_RESERVED),
             ids_to_free: Vec::new(),
-            inbound_batch_stack: Vec::new(),
-            queued_install_ids: None,
+            pending_install_ids: Vec::new(),
             reserved_placeholder_ids: Vec::new(),
         }
     }
@@ -143,30 +139,9 @@ impl HeapIds {
         id
     }
 
-    fn open_inbound_batch(&mut self) {
-        self.inbound_batch_stack.push(Vec::new());
-    }
-
-    fn close_inbound_batch(&mut self) {
-        let batch = self
-            .inbound_batch_stack
-            .pop()
-            .expect("close_inbound_batch called with no open batch");
-        if !batch.is_empty() {
-            debug_assert!(
-                self.queued_install_ids.is_none(),
-                "a pending install batch was not drained before another closed"
-            );
-            self.queued_install_ids = Some(batch);
-        }
-    }
-
     fn next_inbound_js_heap_id(&mut self) -> u64 {
         let id = self.slab.alloc();
-        self.inbound_batch_stack
-            .last_mut()
-            .expect("next_inbound_js_heap_id called with no open batch")
-            .push(id);
+        self.pending_install_ids.push(id);
         id
     }
 
@@ -214,18 +189,8 @@ impl HeapIds {
         }
     }
 
-    fn take_queued_install_ids(&mut self) -> InstallIdBatch {
-        // While decoding a callback, the IDs for its arguments live in the open
-        // inbound frame and must ship on the callback's *first* outbound — which
-        // happens before `close_inbound_batch` would move them to
-        // `queued_install_ids`. Drain the open frame first (matching JS's LIFO
-        // DHR stack), then fall back to the one closed-but-unshipped batch.
-        if let Some(top) = self.inbound_batch_stack.last_mut() {
-            if !top.is_empty() {
-                return core::mem::take(top);
-            }
-        }
-        self.queued_install_ids.take().unwrap_or_default()
+    fn take_pending_install_ids(&mut self) -> InstallIdBatch {
+        core::mem::take(&mut self.pending_install_ids)
     }
 
     fn take_reserved_placeholder_ids(&mut self) -> Vec<u64> {
@@ -351,14 +316,6 @@ impl IdAllocator {
         self.heap.next_inbound_js_heap_id()
     }
 
-    pub(crate) fn open_inbound_batch(&mut self) {
-        self.heap.open_inbound_batch();
-    }
-
-    pub(crate) fn close_inbound_batch(&mut self) {
-        self.heap.close_inbound_batch();
-    }
-
     /// Get the next borrow ID from the borrow stack (indices 1-127).
     ///
     /// The borrow stack grows downward from JSIDX_OFFSET (128) toward 1.
@@ -400,8 +357,8 @@ impl IdAllocator {
 
     /// Take the IDs JS should install for objects it sent to Rust. Empty when
     /// the last inbound message carried no heap refs.
-    pub(crate) fn take_queued_install_ids(&mut self) -> InstallIdBatch {
-        self.heap.take_queued_install_ids()
+    pub(crate) fn take_pending_install_ids(&mut self) -> InstallIdBatch {
+        self.heap.take_pending_install_ids()
     }
 
     /// Take IDs JS should reserve for pending Rust-to-JS return values.
@@ -479,15 +436,13 @@ mod tests {
     #[test]
     fn inbound_drop_uses_normal_release_path() {
         let mut heap = HeapIds::new();
-        heap.open_inbound_batch();
         let id = heap.next_inbound_js_heap_id();
-        heap.close_inbound_batch();
         assert_eq!(heap.release_heap_id(id), Some(id));
 
         let next = heap.next_placeholder_id();
         assert_ne!(next, id);
 
-        let batch = heap.take_queued_install_ids();
+        let batch = heap.take_pending_install_ids();
         assert_eq!(batch, vec![id]);
 
         heap.recycle_heap_id(id);
@@ -495,38 +450,30 @@ mod tests {
     }
 
     #[test]
-    fn inbound_heap_ids_in_one_open_batch_collapse_into_one_install_frame() {
+    fn inbound_heap_ids_collapse_into_one_install_batch() {
         let mut heap = HeapIds::new();
-        heap.open_inbound_batch();
         let ids = [heap.next_inbound_js_heap_id(), heap.next_inbound_js_heap_id()];
-        heap.close_inbound_batch();
         assert_eq!(ids, [JSIDX_RESERVED, JSIDX_RESERVED + 1]);
 
-        let batch = heap.take_queued_install_ids();
+        let batch = heap.take_pending_install_ids();
         assert_eq!(batch, ids);
-        assert!(heap.take_queued_install_ids().is_empty());
+        assert!(heap.take_pending_install_ids().is_empty());
     }
 
     #[test]
-    fn closing_an_empty_inbound_batch_does_not_enqueue_a_frame() {
+    fn taking_with_no_inbound_ids_is_empty() {
         let mut heap = HeapIds::new();
-        heap.open_inbound_batch();
-        heap.close_inbound_batch();
-        assert!(heap.take_queued_install_ids().is_empty());
+        assert!(heap.take_pending_install_ids().is_empty());
     }
 
     #[test]
-    fn each_inbound_batch_is_drained_before_the_next_closes() {
+    fn each_take_drains_only_ids_since_the_last_take() {
         let mut heap = HeapIds::new();
-        heap.open_inbound_batch();
         let first = heap.next_inbound_js_heap_id();
-        heap.close_inbound_batch();
-        assert_eq!(heap.take_queued_install_ids(), vec![first]);
+        assert_eq!(heap.take_pending_install_ids(), vec![first]);
 
-        heap.open_inbound_batch();
         let second = heap.next_inbound_js_heap_id();
-        heap.close_inbound_batch();
-        assert_eq!(heap.take_queued_install_ids(), vec![second]);
+        assert_eq!(heap.take_pending_install_ids(), vec![second]);
     }
 
     #[test]

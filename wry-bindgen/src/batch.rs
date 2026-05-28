@@ -102,21 +102,10 @@ impl Runtime {
         self.id_allocator.next_placeholder_id()
     }
 
-    /// Allocate the next ID for a JS object sent without encoding an ID. Must
-    /// be called while an inbound decode batch is open.
+    /// Allocate the next ID for a JS object sent without encoding an ID. The ID
+    /// joins the pending install batch shipped on the next Rust-to-JS message.
     pub fn get_next_inbound_js_heap_id(&mut self) -> u64 {
         self.id_allocator.next_inbound_js_heap_id()
-    }
-
-    /// Open a fresh inbound batch before starting to decode an inbound message.
-    pub(crate) fn open_inbound_batch(&mut self) {
-        self.id_allocator.open_inbound_batch();
-    }
-
-    /// Close the current inbound batch; if non-empty it joins the FIFO that the
-    /// next Rust-to-JS message will ship out.
-    pub(crate) fn close_inbound_batch(&mut self) {
-        self.id_allocator.close_inbound_batch();
     }
 
     /// Get the next borrow ID from the borrow stack (indices 1-127).
@@ -177,7 +166,7 @@ impl Runtime {
         mut encoder: EncodedData,
         reserved_ids: Option<&[u64]>,
     ) -> OutboundIPCMessage {
-        let install_ids = self.take_queued_install_ids();
+        let install_ids = self.take_pending_install_ids();
         prepend_rust_to_js_prelude(&mut encoder, &install_ids, reserved_ids);
         let pending_type_ids = encoder.take_pending_type_ids();
         // Reserved-ids is only passed for outbound Evaluates; Responds pass
@@ -239,8 +228,8 @@ impl Runtime {
     }
 
     /// Take the IDs JS should install for objects it sent to Rust.
-    pub(crate) fn take_queued_install_ids(&mut self) -> InstallIdBatch {
-        self.id_allocator.take_queued_install_ids()
+    pub(crate) fn take_pending_install_ids(&mut self) -> InstallIdBatch {
+        self.id_allocator.take_pending_install_ids()
     }
 
     /// Take IDs JS should reserve for pending Rust-to-JS return values.
