@@ -12,7 +12,7 @@ use std::boxed::Box;
 use crate::encode::{BatchableResult, BinaryDecode};
 use crate::id_allocator::{IdAllocator, InstallIdBatch};
 use crate::ipc::DecodedData;
-use crate::ipc::{EncodedData, JsConsumedAction, MessageType, OutboundIPCMessage};
+use crate::ipc::{EncodedData, MessageType, OutboundIPCMessage};
 use crate::lazy::ThreadLocalKey;
 use crate::object_store::ObjectHandle;
 use crate::runtime::WryIPC;
@@ -167,11 +167,9 @@ impl Runtime {
     ) -> OutboundIPCMessage {
         let install_ids = self.take_queued_install_id_batches();
         prepend_rust_to_js_prelude(&mut encoder, &install_ids, reserved_ids);
-        let actions = encoder.take_js_consumed_actions();
         OutboundIPCMessage::new(
             crate::ipc::IPCMessage::new(encoder.to_bytes()),
             self.current_js_request_id(),
-            actions,
         )
     }
 
@@ -239,13 +237,12 @@ impl Runtime {
     pub(crate) fn extend_encoder(&mut self, other: &EncodedData) {
         // Manually extend to avoid adding an extra message type byte or message
         // header.
+        self.type_cache
+            .move_pending_request(other.request_id(), self.encoder.request_id());
         self.encoder.u8_buf.extend_from_slice(&other.u8_buf[1..]);
         self.encoder.u32_buf.extend_from_slice(&other.u32_buf[1..]);
         self.encoder.u16_buf.extend_from_slice(&other.u16_buf);
         self.encoder.str_buf.extend_from_slice(&other.str_buf);
-        self.encoder
-            .js_consumed_actions
-            .extend_from_slice(&other.js_consumed_actions);
         self.encoder
             .heap_ids_to_recycle_after_flush
             .extend_from_slice(&other.heap_ids_to_recycle_after_flush);
@@ -253,27 +250,18 @@ impl Runtime {
     }
 
     /// Get or create a type ID for the given type definition bytes.
-    /// Returns (type_id, is_cached) where is_cached is true if the type was already in the cache.
+    /// Returns (type_id, is_cached) where is_cached is true if JS has acked it.
     pub(crate) fn get_or_create_type_id(&mut self, type_bytes: Vec<u8>) -> (u32, bool) {
         self.type_cache.get_or_create_type_id(type_bytes)
     }
 
-    /// Mark type IDs as available in JS after JS acknowledges parsing them.
-    pub(crate) fn ack_type_id(&mut self, type_id: u32) {
-        self.type_cache.ack_type_id(type_id);
+    pub(crate) fn register_type_id_for_request(&mut self, request_id: u32, type_id: u32) {
+        self.type_cache
+            .register_type_id_for_request(request_id, type_id);
     }
 
-    pub(crate) fn apply_js_consumed_actions(
-        &mut self,
-        actions: impl IntoIterator<Item = JsConsumedAction>,
-    ) {
-        for action in actions {
-            match action {
-                JsConsumedAction::TypeDefinitionParsed { type_id } => {
-                    self.ack_type_id(type_id);
-                }
-            }
-        }
+    pub(crate) fn ack_rust_request(&mut self, request_id: u32) {
+        self.type_cache.ack_request(request_id);
     }
 
     /// Insert an exported object and return its handle.
@@ -693,7 +681,7 @@ mod take_encoder_tests {
     }
 
     #[test]
-    fn empty_take_encoder_should_not_skip_rust_request_ids() {
+    fn empty_take_encoder_should_preserve_rust_request_id_sequence() {
         let mut runtime = test_runtime();
         assert!(runtime.is_empty());
 
@@ -703,10 +691,11 @@ mod take_encoder_tests {
 
         let first_id = request_id(&first);
         let second_id = request_id(&second);
+        assert_eq!(first_id % 2, 1, "Rust request IDs should be odd");
         assert_eq!(
             second_id,
-            first_id + 1,
-            "empty take_encoder skipped a request ID: first={first_id}, second={second_id}"
+            first_id + 2,
+            "empty take_encoder skipped a Rust request ID: first={first_id}, second={second_id}"
         );
     }
 }

@@ -186,10 +186,6 @@ fn dispatch_inbound_message<O>(
     expected_respond_request_id: Option<u32>,
     with_respond: &mut impl for<'a> FnMut(DecodedData<'a>) -> O,
 ) -> Option<O> {
-    with_runtime(|runtime| {
-        runtime.apply_js_consumed_actions(response.js_consumed_actions.iter().copied())
-    });
-
     let decoder = response
         .message
         .decoded()
@@ -199,6 +195,7 @@ fn dispatch_inbound_message<O>(
             if let Some(expected_request_id) = expected_respond_request_id {
                 debug_assert_eq!(header.request_id, expected_request_id);
             }
+            with_runtime(|runtime| runtime.ack_rust_request(header.request_id));
             prepare_js_to_rust_data(&mut data, header.request_id);
             Some(with_respond(data))
         }

@@ -108,27 +108,15 @@ pub(crate) struct MessageHeader {
     pub(crate) request_id: u32,
 }
 
-/// Internal action Rust can take once JS has consumed a Rust-to-JS message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum JsConsumedAction {
-    /// JS parsed a full callback type definition and can now accept its cache ID.
-    TypeDefinitionParsed { type_id: u32 },
-}
-
-/// Message sent from JS to Rust, plus transport-owned actions proven by that
-/// inbound message.
+/// Message sent from JS to Rust.
 #[derive(Debug, Clone)]
 pub(crate) struct InboundIPCMessage {
     pub(crate) message: IPCMessage,
-    pub(crate) js_consumed_actions: Vec<JsConsumedAction>,
 }
 
 impl InboundIPCMessage {
-    pub(crate) fn new(message: IPCMessage, js_consumed_actions: Vec<JsConsumedAction>) -> Self {
-        Self {
-            message,
-            js_consumed_actions,
-        }
+    pub(crate) fn new(message: IPCMessage) -> Self {
+        Self { message }
     }
 }
 
@@ -138,19 +126,13 @@ impl InboundIPCMessage {
 pub(crate) struct OutboundIPCMessage {
     pub(crate) message: IPCMessage,
     pub(crate) route_request_id: Option<u32>,
-    pub(crate) js_consumed_actions: Vec<JsConsumedAction>,
 }
 
 impl OutboundIPCMessage {
-    pub(crate) fn new(
-        message: IPCMessage,
-        route_request_id: Option<u32>,
-        js_consumed_actions: Vec<JsConsumedAction>,
-    ) -> Self {
+    pub(crate) fn new(message: IPCMessage, route_request_id: Option<u32>) -> Self {
         Self {
             message,
             route_request_id,
-            js_consumed_actions,
         }
     }
 }
@@ -165,8 +147,8 @@ impl OutboundIPCMessage {
 /// Rust-to-JS heap ID lists are encoded in the u32 buffer as `count: u32`
 /// followed by `count` u64 IDs, each split into low/high u32 words.
 ///
-/// Rust only emits `TYPE_CACHED` after transport metadata confirms JS consumed
-/// the corresponding `TYPE_FULL`.
+/// Rust only emits `TYPE_CACHED` after the runtime observes a JS response for
+/// a request that carried the corresponding `TYPE_FULL`.
 ///
 /// Evaluate format (supports batching - multiple operations in one message):
 /// - u8: message type (0)
@@ -411,7 +393,6 @@ pub struct EncodedData {
     pub(crate) u16_buf: Vec<u16>,
     pub(crate) u32_buf: Vec<u32>,
     pub(crate) str_buf: Vec<u8>,
-    pub(crate) js_consumed_actions: Vec<JsConsumedAction>,
     pub(crate) heap_ids_to_recycle_after_flush: Vec<u64>,
     /// Flag indicating that this batch must be flushed before returning.
     /// Used for stack-allocated callbacks that need synchronous invocation.
@@ -426,7 +407,6 @@ impl EncodedData {
             u16_buf: Vec::new(),
             u32_buf: Vec::new(),
             str_buf: Vec::new(),
-            js_consumed_actions: Vec::new(),
             heap_ids_to_recycle_after_flush: Vec::new(),
             needs_flush: false,
         }
@@ -438,14 +418,11 @@ impl EncodedData {
         self.needs_flush = true;
     }
 
-    /// Record an action Rust should take after JS consumes the message this
-    /// encoder is building.
-    pub(crate) fn push_js_consumed_action(&mut self, action: JsConsumedAction) {
-        self.js_consumed_actions.push(action);
-    }
-
-    pub(crate) fn take_js_consumed_actions(&mut self) -> Vec<JsConsumedAction> {
-        core::mem::take(&mut self.js_consumed_actions)
+    pub(crate) fn request_id(&self) -> u32 {
+        self.u32_buf
+            .first()
+            .copied()
+            .expect("encoded IPC message is missing request ID")
     }
 
     pub(crate) fn defer_heap_id_recycle_until_flush(&mut self, id: u64) {
@@ -551,8 +528,6 @@ impl EncodedData {
         self.u16_buf.extend_from_slice(&other.u16_buf);
         self.u32_buf.extend_from_slice(&other.u32_buf);
         self.str_buf.extend_from_slice(&other.str_buf);
-        self.js_consumed_actions
-            .extend_from_slice(&other.js_consumed_actions);
         self.heap_ids_to_recycle_after_flush
             .extend_from_slice(&other.heap_ids_to_recycle_after_flush);
         self.needs_flush |= other.needs_flush;
@@ -584,25 +559,6 @@ mod tests {
             panic!("expected Evaluate message");
         };
         assert_eq!(data.take_u32().unwrap(), 99);
-    }
-
-    #[test]
-    fn js_consumed_actions_are_not_encoded() {
-        let mut encoder = EncodedData::new();
-        encoder.push_u8(MessageType::Respond as u8);
-        encoder.push_u32(7);
-        encoder.push_js_consumed_action(JsConsumedAction::TypeDefinitionParsed { type_id: 3 });
-
-        let msg = IPCMessage::new(encoder.to_bytes());
-        let DecodedVariant::Respond { data, .. } = msg.decoded().unwrap() else {
-            panic!("expected Respond message");
-        };
-        assert!(data.is_empty());
-
-        assert_eq!(
-            encoder.take_js_consumed_actions(),
-            vec![JsConsumedAction::TypeDefinitionParsed { type_id: 3 }]
-        );
     }
 
     #[test]

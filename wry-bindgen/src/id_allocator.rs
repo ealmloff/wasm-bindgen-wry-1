@@ -375,7 +375,7 @@ impl IdAllocator {
     /// Allocate an ID for a Rust-originated IPC Evaluate message.
     pub(crate) fn next_rust_request_id(&mut self) -> u32 {
         let id = self.next_rust_request_id;
-        self.next_rust_request_id = self.next_rust_request_id.wrapping_add(1).max(1);
+        self.next_rust_request_id = self.next_rust_request_id.wrapping_add(2);
         id
     }
 

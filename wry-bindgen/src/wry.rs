@@ -21,8 +21,7 @@ use http::Response;
 use crate::batch::{Runtime, in_runtime};
 use crate::function_registry::FUNCTION_REGISTRY;
 use crate::ipc::{
-    DecodedVariant, IPCMessage, InboundIPCMessage, JsConsumedAction, MessageType,
-    OutboundIPCMessage, decode_data,
+    DecodedVariant, IPCMessage, InboundIPCMessage, MessageType, OutboundIPCMessage, decode_data,
 };
 use crate::runtime::{AppEventVariant, IPCSenders, WryBindgenEvent, WryIPC, handle_callbacks};
 
@@ -126,17 +125,12 @@ struct WebviewMessageLayer {
     /// delivered through a suspended JS call, `route_request_id` identifies
     /// the JS request whose responder should be replaced by the JS Respond.
     rust_evaluate_routes: HashMap<u32, RustEvaluateRoute>,
-    /// Actions from Rust Respond messages. They are applied on the next
-    /// JS-to-Rust message, which proves JS has resumed and consumed the
-    /// previous response payload.
-    pending_js_consumed_actions: Vec<JsConsumedAction>,
     /// The sender used to forward decoded IPC messages to the Rust runtime.
     sender: IPCSenders,
 }
 
 struct RustEvaluateRoute {
     route_request_id: Option<u32>,
-    js_consumed_actions: Vec<JsConsumedAction>,
 }
 
 impl WebviewState {
@@ -159,7 +153,6 @@ impl WebviewMessageLayer {
         Self {
             response_channels: HashMap::new(),
             rust_evaluate_routes: HashMap::new(),
-            pending_js_consumed_actions: Vec::new(),
             sender,
         }
     }
@@ -190,18 +183,10 @@ impl WebviewMessageLayer {
         true
     }
 
-    fn set_rust_evaluate_route(
-        &mut self,
-        request_id: u32,
-        route_request_id: Option<u32>,
-        js_consumed_actions: Vec<JsConsumedAction>,
-    ) {
+    fn set_rust_evaluate_route(&mut self, request_id: u32, route_request_id: Option<u32>) {
         match self.rust_evaluate_routes.entry(request_id) {
             Entry::Vacant(route) => {
-                route.insert(RustEvaluateRoute {
-                    route_request_id,
-                    js_consumed_actions,
-                });
+                route.insert(RustEvaluateRoute { route_request_id });
             }
             Entry::Occupied(_) => {
                 panic!("Overwriting existing Rust Evaluate route {request_id}");
@@ -213,25 +198,15 @@ impl WebviewMessageLayer {
         self.rust_evaluate_routes.remove(&request_id)
     }
 
-    fn queue_js_consumed_actions(&mut self, actions: Vec<JsConsumedAction>) {
-        self.pending_js_consumed_actions.extend(actions);
-    }
-
-    fn take_pending_js_consumed_actions(&mut self) -> Vec<JsConsumedAction> {
-        core::mem::take(&mut self.pending_js_consumed_actions)
-    }
-
     fn receive_js_message(&mut self, msg: IPCMessage, responder: WryBindgenResponder) {
         let msg_type = msg.ty().unwrap();
         let header = msg.header().unwrap();
-        let mut js_consumed_actions;
         let mut response_channel_id = None;
 
         match msg_type {
             // New call from JS - save the sync response channel and
             // wait for the Rust application thread to respond.
             MessageType::Evaluate => {
-                js_consumed_actions = self.take_pending_js_consumed_actions();
                 self.set_response_channel(header.request_id, responder);
                 response_channel_id = Some(header.request_id);
             }
@@ -242,8 +217,6 @@ impl WebviewMessageLayer {
                     responder.respond(error_response());
                     return;
                 };
-                js_consumed_actions = self.take_pending_js_consumed_actions();
-                js_consumed_actions.extend(route.js_consumed_actions);
                 match route.route_request_id {
                     Some(route_request_id) => {
                         self.set_response_channel(route_request_id, responder);
@@ -256,10 +229,7 @@ impl WebviewMessageLayer {
             }
         }
 
-        if !self
-            .sender
-            .start_send(InboundIPCMessage::new(msg, js_consumed_actions))
-        {
+        if !self.sender.start_send(InboundIPCMessage::new(msg)) {
             self.respond_channel_with_error(response_channel_id);
         }
     }
@@ -268,7 +238,6 @@ impl WebviewMessageLayer {
         let header = ipc_msg.message.header().unwrap();
         let ty = ipc_msg.message.ty().unwrap();
         let route_request_id = ipc_msg.route_request_id;
-        let js_consumed_actions = ipc_msg.js_consumed_actions;
         let message = ipc_msg.message;
 
         match ty {
@@ -279,7 +248,6 @@ impl WebviewMessageLayer {
                         header.request_id
                     );
                 };
-                self.queue_js_consumed_actions(js_consumed_actions);
                 if self.respond_to_channel(route_request_id, message) {
                     return None;
                 }
@@ -289,11 +257,7 @@ impl WebviewMessageLayer {
                 );
             }
             MessageType::Evaluate => {
-                self.set_rust_evaluate_route(
-                    header.request_id,
-                    route_request_id,
-                    js_consumed_actions,
-                );
+                self.set_rust_evaluate_route(header.request_id, route_request_id);
 
                 if let Some(route_request_id) = route_request_id {
                     if self.respond_to_channel(route_request_id, message) {

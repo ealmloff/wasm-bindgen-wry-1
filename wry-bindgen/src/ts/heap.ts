@@ -74,7 +74,7 @@ class JSHeap {
   declare private borrowFrameStack: number[];
   // Stack of reservation scopes: each scope tracks exact IDs reserved by Rust
   declare private reservationStack: { ids: number[]; nextIndex: number }[];
-  declare private deferredHeapRefs: Map<number, DeferredHeapRefs[]>;
+  declare private deferredHeapRefs: Map<number, DeferredHeapRefs>;
 
   constructor() {
     // Slots 0-127 are for borrow stack (1-127 usable), slots 128-131
@@ -109,55 +109,25 @@ class JSHeap {
 
   deferHeapRefs(requestId: number): DeferredHeapRefs {
     const refs = new DeferredHeapRefs(this, requestId);
-    let frames = this.deferredHeapRefs.get(requestId);
-    if (!frames) {
-      frames = [];
-      this.deferredHeapRefs.set(requestId, frames);
-    }
-    frames.push(refs);
+    this.deferredHeapRefs.set(requestId, refs);
     return refs;
   }
 
   resolveDeferredHeapRefs(requestId: number, ids: number[]): boolean {
-    const frames = this.deferredHeapRefs.get(requestId);
-    if (!frames) {
+    const refs = this.deferredHeapRefs.get(requestId);
+    if (!refs) {
       return false;
     }
 
-    let frameIndex = -1;
-    for (let i = frames.length - 1; i >= 0; i--) {
-      if (frames[i].count() === ids.length) {
-        frameIndex = i;
-        break;
-      }
-    }
-    if (frameIndex < 0) {
-      return false;
-    }
-
-    const refs = frames[frameIndex];
     refs.resolve(ids);
-    frames.splice(frameIndex, 1);
-    if (frames.length === 0) {
-      this.deferredHeapRefs.delete(requestId);
-    }
+    this.deferredHeapRefs.delete(requestId);
     return true;
   }
 
   releaseEmptyDeferredHeapRefs(refs: DeferredHeapRefs): void {
     refs.finishIfEmpty();
-    if (refs.count() === 0) {
-      const frames = this.deferredHeapRefs.get(refs.rawId());
-      if (!frames) {
-        return;
-      }
-      const frameIndex = frames.indexOf(refs);
-      if (frameIndex >= 0) {
-        frames.splice(frameIndex, 1);
-      }
-      if (frames.length === 0) {
-        this.deferredHeapRefs.delete(refs.rawId());
-      }
+    if (refs.count() === 0 && this.deferredHeapRefs.get(refs.rawId()) === refs) {
+      this.deferredHeapRefs.delete(refs.rawId());
     }
   }
 

@@ -36,13 +36,13 @@ interface MessageHeader {
   requestId: number;
 }
 
-let nextJsRequestId = 1;
+let nextJsRequestId = 2;
 
 function allocateJsRequestId(): number {
   const id = nextJsRequestId;
-  nextJsRequestId = (nextJsRequestId + 1) >>> 0;
+  nextJsRequestId = (nextJsRequestId + 2) >>> 0;
   if (nextJsRequestId === 0) {
-    nextJsRequestId = 1;
+    nextJsRequestId = 2;
   }
   return id;
 }
