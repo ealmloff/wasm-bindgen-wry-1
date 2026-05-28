@@ -214,17 +214,6 @@ pub(crate) enum DecodedVariant<'a> {
     Evaluate { data: DecodedData<'a> },
 }
 
-/// Context that changes how some values are decoded from a message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DecodeContext {
-    /// Values use their normal wire representation.
-    Normal,
-    /// JS sent heap references without IDs. Rust allocates them into the
-    /// current inbound batch and ships the IDs back in the next outbound
-    /// message's install-batch list.
-    DeferredHeapRefs,
-}
-
 /// Decoded binary data with aligned buffer access.
 #[derive(Debug)]
 pub struct DecodedData<'a> {
@@ -232,7 +221,6 @@ pub struct DecodedData<'a> {
     u16_buf: &'a [u16],
     u32_buf: &'a [u32],
     str_buf: &'a [u8],
-    context: DecodeContext,
 }
 
 impl<'a> DecodedData<'a> {
@@ -277,16 +265,7 @@ impl<'a> DecodedData<'a> {
             u16_buf,
             u32_buf,
             str_buf,
-            context: DecodeContext::Normal,
         })
-    }
-
-    pub(crate) fn set_context(&mut self, context: DecodeContext) {
-        self.context = context;
-    }
-
-    pub(crate) fn context(&self) -> DecodeContext {
-        self.context
     }
 
     /// Take a u8 from the buffer.

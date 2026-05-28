@@ -95,4 +95,29 @@ pub(crate) fn test_roundtrip() {
         let mut bytes = vec![4u8, 5];
         assert_eq!(clamped_mut_len(Clamped(&mut bytes[..])), 2);
     }
+
+    // Heap-ref slice encoders: &[T] / &mut [T] where T: JsGeneric (e.g. JsValue).
+    {
+        use wasm_bindgen::JsValue;
+        #[wasm_bindgen(inline_js = "export function heapref_array_len(x) { return x.length; }")]
+        extern "C" {
+            #[wasm_bindgen(js_name = heapref_array_len)]
+            fn jsval_slice_len(x: &[JsValue]) -> u32;
+            #[wasm_bindgen(js_name = heapref_array_len)]
+            fn jsval_mut_slice_len(x: &mut [JsValue]) -> u32;
+        }
+        let mut v = vec![JsValue::from_f64(1.0), JsValue::from_f64(2.0)];
+        assert_eq!(jsval_slice_len(&v[..]), 2);
+        assert_eq!(jsval_mut_slice_len(&mut v[..]), 2);
+    }
+
+    // Borrowed primitive encoder: &T encodes via clone.
+    {
+        #[wasm_bindgen(inline_js = "export function double_num(x) { return x * 2; }")]
+        extern "C" {
+            #[wasm_bindgen(js_name = double_num)]
+            fn double_u32_ref(x: &u32) -> u32;
+        }
+        assert_eq!(double_u32_ref(&21u32), 42);
+    }
 }

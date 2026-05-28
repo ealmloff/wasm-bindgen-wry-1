@@ -10,7 +10,7 @@ use core::marker::PhantomData;
 
 use crate::batch::{Runtime, with_runtime};
 use crate::convert::RefFromBinaryDecode;
-use crate::ipc::{DecodeContext, DecodeError, DecodedData, EncodedData};
+use crate::ipc::{DecodeError, DecodedData, EncodedData};
 use crate::object_store::ObjectHandle;
 use crate::value::JsValue;
 use crate::{
@@ -580,18 +580,12 @@ impl BinaryEncode for JsValue {
 }
 
 impl BinaryDecode for JsValue {
-    fn decode(decoder: &mut DecodedData) -> Result<Self, DecodeError> {
-        match decoder.context() {
-            DecodeContext::Normal => {
-                let id = decoder.take_u64()?;
-                with_runtime(|runtime| runtime.observe_js_heap_id(id));
-                Ok(JsValue::from_id(id))
-            }
-            DecodeContext::DeferredHeapRefs => {
-                let id = with_runtime(|runtime| runtime.get_next_inbound_js_heap_id());
-                Ok(JsValue::from_id(id))
-            }
-        }
+    fn decode(_decoder: &mut DecodedData) -> Result<Self, DecodeError> {
+        // JS always sends heap references without inline IDs: Rust allocates them
+        // into the current inbound batch and ships the IDs back in the next
+        // outbound message's install-batch list.
+        let id = with_runtime(|runtime| runtime.get_next_inbound_js_heap_id());
+        Ok(JsValue::from_id(id))
     }
 }
 

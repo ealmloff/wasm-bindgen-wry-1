@@ -14,7 +14,7 @@ use spin::RwLock;
 use crate::BinaryDecode;
 use crate::batch::with_runtime;
 use crate::function::{CALL_EXPORT_FN_ID, DROP_NATIVE_REF_FN_ID, RustCallback};
-use crate::ipc::{DecodeContext, MessageType};
+use crate::ipc::MessageType;
 use crate::ipc::{DecodedData, DecodedVariant, InboundIPCMessage, OutboundIPCMessage};
 use crate::object_store::ObjectHandle;
 
@@ -161,14 +161,13 @@ fn dispatch_inbound_message<O>(
         .decoded()
         .expect("Failed to decode response");
     match decoder {
-        DecodedVariant::Respond { mut data } => {
+        DecodedVariant::Respond { data } => {
             with_runtime(|runtime| {
                 // JS has now consumed the Rust→JS Evaluate this Respond
                 // closes, so types it carried can be sent as `TYPE_CACHED`
                 // from here on.
                 runtime.pop_and_ack_type_cache_frame();
             });
-            prepare_js_to_rust_data(&mut data);
             let result = with_respond(data);
             Some(result)
         }
@@ -185,12 +184,7 @@ fn handle_inbound_evaluate(mut data: DecodedData<'_>) {
     // `evaluate_script`. The guard restores the depth even if the callback
     // panics.
     let _eval = InboundEvaluateGuard::new();
-    prepare_js_to_rust_data(&mut data);
     handle_rust_callback(&mut data);
-}
-
-fn prepare_js_to_rust_data(data: &mut DecodedData) {
-    data.set_context(DecodeContext::DeferredHeapRefs);
 }
 
 /// Handle a Rust callback invocation from JavaScript.
