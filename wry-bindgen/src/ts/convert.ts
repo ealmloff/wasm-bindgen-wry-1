@@ -71,14 +71,19 @@ export function debug_string(x: any): string {
 
 // Arithmetic operators
 export function js_checked_div(a: any, b: any): any {
+  // Keep in sync with wasm-bindgen's `Intrinsic::CheckedDiv` JS emission.
   try {
     return a / b;
   } catch (e) {
-    return e;
+    if (e instanceof RangeError) {
+      return e;
+    }
+    throw e;
   }
 }
 export function js_pow(a: any, b: any): any {
-  return Math.pow(a, b);
+  // Keep in sync with wasm-bindgen's `Intrinsic::Pow` JS emission.
+  return a ** b;
 }
 export function js_add(a: any, b: any): any {
   return a + b;

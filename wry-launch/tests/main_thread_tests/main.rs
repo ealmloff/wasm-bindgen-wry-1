@@ -22,6 +22,7 @@ mod borrow_stack;
 mod callbacks;
 mod catch_attribute;
 mod clamped;
+mod deferred_heap_refs;
 mod export_call;
 mod indexing;
 mod is_type_of;
@@ -219,6 +220,16 @@ macro_rules! async_trials {
 fn build_tests() -> Vec<TestCase> {
     let mut tests: Vec<TestCase> = Vec::new();
 
+    tests.push(sync_test(
+        trial_name(
+            "deferred_heap_refs",
+            "test_nested_js_request_keeps_rust_deferred_heap_ref_frame",
+            BatchMode::NonBatched,
+        ),
+        BatchMode::NonBatched,
+        deferred_heap_refs::test_nested_js_request_keeps_rust_deferred_heap_ref_frame,
+    ));
+
     tests.push(async_test_with_timeout(
         trial_name(
             "opaque_id_stress",
@@ -267,6 +278,7 @@ fn build_tests() -> Vec<TestCase> {
         jsvalue::test_jsvalue_as_string,
         jsvalue::test_jsvalue_as_f64,
         jsvalue::test_jsvalue_arithmetic,
+        jsvalue::test_jsvalue_bigint_pow_preserves_bigint_semantics,
         jsvalue::test_jsvalue_bitwise,
         jsvalue::test_jsvalue_comparisons,
         jsvalue::test_jsvalue_loose_eq_coercion,
