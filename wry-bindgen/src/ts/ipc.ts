@@ -32,41 +32,12 @@ const DROP_NATIVE_REF_FN_ID = 0xffffffff;
 // Reserved function ID for calling exported Rust struct methods - must match Rust's CALL_EXPORT_FN_ID
 const CALL_EXPORT_FN_ID = 0xfffffffe;
 
-interface MessageHeader {
-  requestId: number;
-}
-
-let nextJsRequestId = 2;
-
-function allocateJsRequestId(): number {
-  const id = nextJsRequestId;
-  nextJsRequestId = (nextJsRequestId + 2) >>> 0;
-  if (nextJsRequestId === 0) {
-    nextJsRequestId = 2;
-  }
-  return id;
-}
-
-function pushMessageHeader(
-  encoder: DataEncoder,
-  msgType: MessageType,
-  requestId: number
-): void {
+function pushMessageHeader(encoder: DataEncoder, msgType: MessageType): void {
   encoder.pushU8(msgType);
-  encoder.pushU32(requestId);
 }
 
-function takeMessageHeader(decoder: DataDecoder): {
-  msgType: MessageType;
-  header: MessageHeader;
-} {
-  const rawMsgType = decoder.takeU8();
-  return {
-    msgType: rawMsgType,
-    header: {
-      requestId: decoder.takeU32(),
-    },
-  };
+function takeMessageType(decoder: DataDecoder): MessageType {
+  return decoder.takeU8();
 }
 
 /**
@@ -105,15 +76,15 @@ function sync_request_binary(
 function sendEvaluateToRust(
   encodePayload: (encoder: DataEncoder) => void
 ): DataDecoder | null {
-  const requestId = allocateJsRequestId();
-  const pendingHeapRefs = window.jsHeap.deferHeapRefs(requestId);
+  const pendingHeapRefs = window.jsHeap.deferHeapRefs();
   const encoder = new DataEncoder(pendingHeapRefs);
-  pushMessageHeader(encoder, MessageType.Evaluate, requestId);
+  pushMessageHeader(encoder, MessageType.Evaluate);
   encodePayload(encoder);
 
   try {
-    const response = sync_request_binary(`/__wbg__/handler`, encoder.finalize());
-    return handleBinaryResponse(response, requestId);
+    return handleBinaryResponse(
+      sync_request_binary(`/__wbg__/handler`, encoder.finalize())
+    );
   } finally {
     window.jsHeap.releaseEmptyDeferredHeapRefs(pendingHeapRefs);
   }
@@ -192,12 +163,8 @@ function takeIdList(decoder: DataDecoder): number[] {
 function installDeferredHeapRefFrames(decoder: DataDecoder): void {
   const frameCount = decoder.takeU32();
   for (let i = 0; i < frameCount; i++) {
-    const requestId = decoder.takeU32();
     const ids = takeIdList(decoder);
-    const installed = window.jsHeap.resolveDeferredHeapRefs(requestId, ids);
-    if (!installed) {
-      throw new Error(`Unknown deferred heap-ref request ID: ${requestId}`);
-    }
+    window.jsHeap.resolveDeferredHeapRefs(ids);
   }
 }
 
@@ -206,62 +173,43 @@ function installDeferredHeapRefFrames(decoder: DataDecoder): void {
  * May contain nested Evaluate calls (for callbacks).
  */
 function handleBinaryResponse(
-  response: ArrayBuffer | null,
-  expectedRespondRequestId: number = 0
+  response: ArrayBuffer | null
 ): DataDecoder | null {
   if (!response || response.byteLength === 0) {
-    if (expectedRespondRequestId !== 0) {
-      throw new Error(`Missing response for request ID ${expectedRespondRequestId}`);
-    }
     return null;
   }
 
   const decoder = new DataDecoder(response);
-  const { msgType, header } = takeMessageHeader(decoder);
+  const msgType = takeMessageType(decoder);
 
   if (msgType === MessageType.Respond) {
-    if (
-      expectedRespondRequestId !== 0 &&
-      header.requestId !== expectedRespondRequestId
-    ) {
-      throw new Error(
-        `Response ID mismatch: expected ${expectedRespondRequestId}, got ${header.requestId}`
-      );
-    }
     installDeferredHeapRefFrames(decoder);
-    // Respond - just return the decoder for further processing
     return decoder;
   } else if (msgType === MessageType.Evaluate) {
-    // Evaluate - Rust is calling JS functions (possibly multiple)
-
     installDeferredHeapRefFrames(decoder);
 
     // Read the explicit placeholder IDs Rust reserved for this batch.
     const reservedIds = takeIdList(decoder);
     window.jsHeap.pushReservationScope(reservedIds);
 
-    const pendingHeapRefs = window.jsHeap.deferHeapRefs(header.requestId);
+    const pendingHeapRefs = window.jsHeap.deferHeapRefs();
     const encoder = new DataEncoder(pendingHeapRefs);
-    pushMessageHeader(encoder, MessageType.Respond, header.requestId);
+    pushMessageHeader(encoder, MessageType.Respond);
 
-    // Push a single borrow frame for this entire Evaluate message
-    // This frame persists across all operations and nested calls
+    // Push a single borrow frame for this entire Evaluate message.
+    // This frame persists across all operations and nested calls.
     window.jsHeap.pushBorrowFrame();
 
-    // Process all operations
     while (decoder.hasMoreU32()) {
       const fnId = decoder.takeU32();
-      // Parse type information (cached or full)
       const typeInfo = parseTypeInfo(decoder);
 
-      // Get the raw JS function
       const functionRegistry = getFunctionRegistry();
       const jsFunction = functionRegistry[fnId];
       if (!jsFunction) {
         throw new Error("Unknown function ID in response: " + fnId);
       }
 
-      // Decode parameters using their respective types
       let params: unknown[];
       try {
         params = typeInfo.paramTypes.map((paramType) => paramType.decode(decoder));
@@ -273,23 +221,16 @@ function handleBinaryResponse(
         );
       }
 
-      // Call the original JS function with decoded parameters
       const result = jsFunction(...params);
 
-      // If return type is HeapRef and Rust reserved slots, fill the next reserved slot.
-      // Otherwise fall back to normal encode() behavior.
       if (typeInfo.returnType instanceof HeapRefType && reservedIds.length > 0) {
         window.jsHeap.fillNextReserved(result);
       } else {
-        // Encode the result using the return type
         typeInfo.returnType.encode(encoder, result);
       }
     }
 
-    // Pop the borrow frame after all operations complete
     window.jsHeap.popBorrowFrame();
-
-    // Pop the reservation scope
     window.jsHeap.popReservationScope();
 
     const nextResponse = sync_request_binary(
@@ -297,7 +238,7 @@ function handleBinaryResponse(
       encoder.finalize()
     );
     window.jsHeap.releaseEmptyDeferredHeapRefs(pendingHeapRefs);
-    return handleBinaryResponse(nextResponse, expectedRespondRequestId);
+    return handleBinaryResponse(nextResponse);
   }
 
   if (!decoder.isEmpty()) {
@@ -315,6 +256,5 @@ export {
   MessageType,
   DROP_NATIVE_REF_FN_ID,
   CALL_EXPORT_FN_ID,
-  allocateJsRequestId,
   pushMessageHeader,
 };

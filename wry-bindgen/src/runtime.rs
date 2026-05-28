@@ -4,7 +4,6 @@
 //! JavaScript environment via winit's event loop.
 
 use core::pin::Pin;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use alloc::boxed::Box;
@@ -15,7 +14,7 @@ use spin::RwLock;
 use crate::BinaryDecode;
 use crate::batch::with_runtime;
 use crate::function::{CALL_EXPORT_FN_ID, DROP_NATIVE_REF_FN_ID, RustCallback};
-use crate::ipc::{DecodeContext, MessageHeader, MessageType};
+use crate::ipc::{DecodeContext, MessageType};
 use crate::ipc::{DecodedData, DecodedVariant, InboundIPCMessage, OutboundIPCMessage};
 use crate::object_store::ObjectHandle;
 
@@ -83,7 +82,6 @@ impl IPCSenders {
 struct IPCReceivers {
     eval_receiver: Pin<Box<Receiver<InboundIPCMessage>>>,
     respond_receiver: futures_channel::mpsc::UnboundedReceiver<InboundIPCMessage>,
-    buffered_responds: BTreeMap<u32, InboundIPCMessage>,
 }
 
 impl IPCReceivers {
@@ -92,7 +90,6 @@ impl IPCReceivers {
             let Self {
                 eval_receiver,
                 respond_receiver,
-                ..
             } = self;
             futures_util::select_biased! {
                 // We need to always poll the respond receiver first. If the response is ready, quit immediately
@@ -105,24 +102,6 @@ impl IPCReceivers {
                 },
             }
         })
-    }
-
-    pub fn recv_blocking_for(&mut self, request_id: u32) -> Option<InboundIPCMessage> {
-        if let Some(msg) = self.buffered_responds.remove(&request_id) {
-            return Some(msg);
-        }
-
-        loop {
-            let msg = self.recv_blocking()?;
-            if msg.message.ty().ok()? == MessageType::Respond {
-                let response_id = msg.message.header().ok()?.request_id;
-                if response_id != request_id {
-                    self.buffered_responds.insert(response_id, msg);
-                    continue;
-                }
-            }
-            return Some(msg);
-        }
     }
 }
 
@@ -147,7 +126,6 @@ impl WryIPC {
         let receivers = RwLock::new(IPCReceivers {
             eval_receiver: Box::pin(eval_receiver),
             respond_receiver,
-            buffered_responds: BTreeMap::new(),
         });
         let ipc = Self { proxy, receivers };
         (ipc, senders)
@@ -160,30 +138,23 @@ impl WryIPC {
 }
 
 pub(crate) fn progress_js_with<O>(
-    request_id: u32,
     mut with_respond: impl for<'a> FnMut(DecodedData<'a>) -> O,
 ) -> Option<O> {
-    let response = with_runtime(|runtime| {
-        runtime
-            .ipc()
-            .receivers
-            .write()
-            .recv_blocking_for(request_id)
-    })?;
-    dispatch_inbound_message(&response, Some(request_id), &mut with_respond)
+    let response =
+        with_runtime(|runtime| runtime.ipc().receivers.write().recv_blocking())?;
+    dispatch_inbound_message(&response, &mut with_respond)
 }
 
 pub async fn handle_callbacks() {
     let receiver = with_runtime(|runtime| runtime.ipc().receivers.read().eval_receiver.clone());
 
     while let Ok(response) = receiver.recv().await {
-        dispatch_inbound_message(&response, None, &mut |_| unreachable!());
+        dispatch_inbound_message(&response, &mut |_| unreachable!());
     }
 }
 
 fn dispatch_inbound_message<O>(
     response: &InboundIPCMessage,
-    expected_respond_request_id: Option<u32>,
     with_respond: &mut impl for<'a> FnMut(DecodedData<'a>) -> O,
 ) -> Option<O> {
     let decoder = response
@@ -191,30 +162,35 @@ fn dispatch_inbound_message<O>(
         .decoded()
         .expect("Failed to decode response");
     match decoder {
-        DecodedVariant::Respond { header, mut data } => {
-            if let Some(expected_request_id) = expected_respond_request_id {
-                debug_assert_eq!(header.request_id, expected_request_id);
-            }
-            with_runtime(|runtime| runtime.ack_rust_request(header.request_id));
-            prepare_js_to_rust_data(&mut data, header.request_id);
-            Some(with_respond(data))
+        DecodedVariant::Respond { mut data } => {
+            with_runtime(|runtime| {
+                // JS has now consumed the Rust→JS Evaluate this Respond
+                // closes, so types it carried can be sent as `TYPE_CACHED`
+                // from here on.
+                runtime.pop_and_ack_type_cache_frame();
+                runtime.open_inbound_batch();
+            });
+            prepare_js_to_rust_data(&mut data);
+            let result = with_respond(data);
+            with_runtime(|runtime| runtime.close_inbound_batch());
+            Some(result)
         }
-        DecodedVariant::Evaluate { header, data } => {
-            handle_inbound_evaluate(header, data);
+        DecodedVariant::Evaluate { data } => {
+            handle_inbound_evaluate(data);
             None
         }
     }
 }
 
-fn handle_inbound_evaluate(header: MessageHeader, mut data: DecodedData<'_>) {
-    prepare_js_to_rust_data(&mut data, header.request_id);
-    with_runtime(|runtime| runtime.push_inbound_js_request(header.request_id));
+fn handle_inbound_evaluate(mut data: DecodedData<'_>) {
+    with_runtime(|runtime| runtime.open_inbound_batch());
+    prepare_js_to_rust_data(&mut data);
     handle_rust_callback(&mut data);
-    with_runtime(|runtime| runtime.pop_inbound_js_request(header.request_id));
+    with_runtime(|runtime| runtime.close_inbound_batch());
 }
 
-fn prepare_js_to_rust_data(data: &mut DecodedData, request_id: u32) {
-    data.set_context(DecodeContext::DeferredHeapRefs { request_id });
+fn prepare_js_to_rust_data(data: &mut DecodedData) {
+    data.set_context(DecodeContext::DeferredHeapRefs);
 }
 
 /// Handle a Rust callback invocation from JavaScript.
@@ -288,12 +264,6 @@ fn handle_rust_callback(data: &mut DecodedData) {
 fn respond_encoder() -> crate::ipc::EncodedData {
     let mut encoder = crate::ipc::EncodedData::new();
     encoder.push_u8(MessageType::Respond as u8);
-    let request_id = with_runtime(|runtime| runtime.current_js_request_id());
-    assert_ne!(
-        request_id, None,
-        "Rust response created outside a JS-originated request"
-    );
-    encoder.push_u32(request_id.expect("checked above"));
     encoder
 }
 

@@ -55,11 +55,11 @@ pub trait BatchableResult: BinaryDecode {
     }
 }
 
-/// Marker for cached type definition (type already sent, just reference by ID)
+/// Marker for cached type definition (type already sent, reference by ID).
 /// Format: [TYPE_CACHED] [type_id: u32]
 pub(crate) const TYPE_CACHED: u8 = 0xFF;
 
-/// Marker for full type definition (first time sending this type signature)
+/// Marker for full type definition (first time sending this type signature).
 /// Format: [TYPE_FULL] [type_id: u32] [param_count: u8] [param TypeDefs...] [return TypeDef]
 pub(crate) const TYPE_FULL: u8 = 0xFE;
 
@@ -587,8 +587,8 @@ impl BinaryDecode for JsValue {
                 with_runtime(|runtime| runtime.observe_js_heap_id(id));
                 Ok(JsValue::from_id(id))
             }
-            DecodeContext::DeferredHeapRefs { request_id } => {
-                let id = with_runtime(|runtime| runtime.get_next_inbound_js_heap_id(request_id));
+            DecodeContext::DeferredHeapRefs => {
+                let id = with_runtime(|runtime| runtime.get_next_inbound_js_heap_id());
                 Ok(JsValue::from_id(id))
             }
         }

@@ -25,13 +25,14 @@ pub const DROP_NATIVE_REF_FN_ID: u32 = 0xFFFFFFFF;
 pub const CALL_EXPORT_FN_ID: u32 = 0xFFFFFFFE;
 
 /// Encode type definitions for a function call.
-/// On first call for a type signature, sends TYPE_FULL + id + param_count + type defs.
-/// Once JS acknowledges parsing that full definition, sends TYPE_CACHED + id.
+///
+/// On first encounter, emits `TYPE_FULL` + id + inline definition and records
+/// the id on the current encoder's pending-ack list. Once JS has acked the
+/// `TYPE_FULL` (signalled by the matching JS Respond popping the type-cache
+/// frame), subsequent calls emit `TYPE_CACHED` + id.
 fn encode_function_types(encoder: &mut EncodedData, encode_types: impl FnOnce(&mut Vec<u8>)) {
-    // Always encode type definitions to get stable cache bytes.
     let mut type_buf = Vec::new();
     encode_types(&mut type_buf);
-    let request_id = encoder.request_id();
 
     with_runtime(|state| {
         let (id, can_use_cached) = state.get_or_create_type_id(type_buf.clone());
@@ -41,8 +42,7 @@ fn encode_function_types(encoder: &mut EncodedData, encode_types: impl FnOnce(&m
         } else {
             encoder.push_u8(TYPE_FULL);
             encoder.push_u32(id);
-            state.register_type_id_for_request(request_id, id);
-
+            encoder.register_pending_type_id(id);
             for byte in type_buf {
                 encoder.push_u8(byte);
             }

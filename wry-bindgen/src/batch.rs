@@ -30,10 +30,8 @@ pub struct Runtime {
     id_allocator: IdAllocator,
     /// Whether we're inside a batch() call
     is_batching: bool,
-    /// Type cache for avoiding resending type definitions to JS.
+    /// Function-type definitions JS has been told about.
     type_cache: TypeCache,
-    /// Stack of JS-originated IPC requests currently executing Rust code.
-    inbound_js_request_stack: Vec<u32>,
     /// Exported Rust structs and callbacks stored by handle.
     objects: BTreeMap<u32, Box<dyn Any>>,
     /// Rust-owned object handles to drop after the current encoded JS call
@@ -49,14 +47,13 @@ pub struct Runtime {
 
 impl Runtime {
     pub(crate) fn new(ipc: WryIPC, webview_id: u64) -> Self {
-        let mut id_allocator = IdAllocator::new();
-        let encoder = Self::new_encoder_for_evaluate(&mut id_allocator);
+        let id_allocator = IdAllocator::new();
+        let encoder = Self::new_encoder_for_evaluate();
         Self {
             encoder,
             id_allocator,
             is_batching: false,
             type_cache: TypeCache::new(),
-            inbound_js_request_stack: Vec::new(),
             // Object store starts empty
             objects: BTreeMap::new(),
             objects_to_free: Vec::new(),
@@ -66,10 +63,9 @@ impl Runtime {
         }
     }
 
-    fn new_encoder_for_evaluate(id_allocator: &mut IdAllocator) -> EncodedData {
+    fn new_encoder_for_evaluate() -> EncodedData {
         let mut encoder = EncodedData::new();
         encoder.push_u8(MessageType::Evaluate as u8);
-        encoder.push_u32(id_allocator.next_rust_request_id());
         encoder
     }
 
@@ -83,28 +79,21 @@ impl Runtime {
         self.id_allocator.next_placeholder_id()
     }
 
-    /// Allocate the next ID for a JS object sent without encoding an ID.
-    pub fn get_next_inbound_js_heap_id(&mut self, request_id: u32) -> u64 {
-        self.id_allocator.next_inbound_js_heap_id(request_id)
+    /// Allocate the next ID for a JS object sent without encoding an ID. Must
+    /// be called while an inbound decode batch is open.
+    pub fn get_next_inbound_js_heap_id(&mut self) -> u64 {
+        self.id_allocator.next_inbound_js_heap_id()
     }
 
-    pub(crate) fn push_inbound_js_request(&mut self, request_id: u32) {
-        self.inbound_js_request_stack.push(request_id);
+    /// Open a fresh inbound batch before starting to decode an inbound message.
+    pub(crate) fn open_inbound_batch(&mut self) {
+        self.id_allocator.open_inbound_batch();
     }
 
-    pub(crate) fn pop_inbound_js_request(&mut self, request_id: u32) {
-        let popped = self
-            .inbound_js_request_stack
-            .pop()
-            .expect("pop_inbound_js_request called with empty stack");
-        assert_eq!(
-            popped, request_id,
-            "inbound JS request stack was popped out of order"
-        );
-    }
-
-    pub(crate) fn current_js_request_id(&self) -> Option<u32> {
-        self.inbound_js_request_stack.last().copied()
+    /// Close the current inbound batch; if non-empty it joins the FIFO that the
+    /// next Rust-to-JS message will ship out.
+    pub(crate) fn close_inbound_batch(&mut self) {
+        self.id_allocator.close_inbound_batch();
     }
 
     /// Get the next borrow ID from the borrow stack (indices 1-127).
@@ -167,10 +156,14 @@ impl Runtime {
     ) -> OutboundIPCMessage {
         let install_ids = self.take_queued_install_id_batches();
         prepend_rust_to_js_prelude(&mut encoder, &install_ids, reserved_ids);
-        OutboundIPCMessage::new(
-            crate::ipc::IPCMessage::new(encoder.to_bytes()),
-            self.current_js_request_id(),
-        )
+        let pending_type_ids = encoder.take_pending_type_ids();
+        // Reserved-ids is only passed for outbound Evaluates; Responds pass
+        // None. Only Evaluates push a type-cache frame because JS will only
+        // send us an inbound Respond that closes one of those frames.
+        if reserved_ids.is_some() {
+            self.type_cache.push_pending_frame(pending_type_ids);
+        }
+        OutboundIPCMessage::new(crate::ipc::IPCMessage::new(encoder.to_bytes()))
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -230,38 +223,36 @@ impl Runtime {
     }
 
     pub(crate) fn take_encoder(&mut self) -> EncodedData {
-        let next = Self::new_encoder_for_evaluate(&mut self.id_allocator);
+        let next = Self::new_encoder_for_evaluate();
         core::mem::replace(&mut self.encoder, next)
     }
 
     pub(crate) fn extend_encoder(&mut self, other: &EncodedData) {
-        // Manually extend to avoid adding an extra message type byte or message
-        // header.
-        self.type_cache
-            .move_pending_request(other.request_id(), self.encoder.request_id());
+        // Manually extend to avoid adding an extra message type byte for the
+        // inner encoder.
         self.encoder.u8_buf.extend_from_slice(&other.u8_buf[1..]);
-        self.encoder.u32_buf.extend_from_slice(&other.u32_buf[1..]);
+        self.encoder.u32_buf.extend_from_slice(&other.u32_buf);
         self.encoder.u16_buf.extend_from_slice(&other.u16_buf);
         self.encoder.str_buf.extend_from_slice(&other.str_buf);
         self.encoder
             .heap_ids_to_recycle_after_flush
             .extend_from_slice(&other.heap_ids_to_recycle_after_flush);
+        self.encoder
+            .pending_type_ids
+            .extend_from_slice(&other.pending_type_ids);
         self.encoder.needs_flush |= other.needs_flush;
     }
 
-    /// Get or create a type ID for the given type definition bytes.
-    /// Returns (type_id, is_cached) where is_cached is true if JS has acked it.
+    /// Get or create a type ID for a function-type definition. The second
+    /// element is true if JS has already acked a `TYPE_FULL` for this ID.
     pub(crate) fn get_or_create_type_id(&mut self, type_bytes: Vec<u8>) -> (u32, bool) {
         self.type_cache.get_or_create_type_id(type_bytes)
     }
 
-    pub(crate) fn register_type_id_for_request(&mut self, request_id: u32, type_id: u32) {
-        self.type_cache
-            .register_type_id_for_request(request_id, type_id);
-    }
-
-    pub(crate) fn ack_rust_request(&mut self, request_id: u32) {
-        self.type_cache.ack_request(request_id);
+    /// Pop the top pending-ack frame and mark its type IDs as acked. Called
+    /// when an inbound JS Respond arrives.
+    pub(crate) fn pop_and_ack_type_cache_frame(&mut self) {
+        self.type_cache.pop_and_ack_pending_frame();
     }
 
     /// Insert an exported object and return its handle.
@@ -348,9 +339,8 @@ fn push_id_list(buf: &mut Vec<u32>, ids: &[u64]) {
 
 fn push_install_batches(buf: &mut Vec<u32>, batches: &[InstallIdBatch]) {
     buf.push(batches.len() as u32);
-    for batch in batches {
-        buf.push(batch.request_id);
-        push_id_list(buf, &batch.ids);
+    for ids in batches {
+        push_id_list(buf, ids);
     }
 }
 
@@ -592,19 +582,15 @@ pub(crate) fn flush_and_then<R>(mut then: impl for<'a> FnMut(DecodedData<'a>) ->
     use crate::runtime::WryBindgenEvent;
 
     let (batch_msg, heap_ids_to_recycle_after_flush) = with_runtime(|state| state.take_message());
-    let request_id = batch_msg
-        .message
-        .header()
-        .expect("Failed to decode batch message header")
-        .request_id;
 
-    // Send and wait for result
+    // Send and wait for the matching Respond. Under strict ping-pong the next
+    // non-Evaluate inbound is necessarily the answer to this outbound.
     with_runtime(|runtime| {
         (runtime.ipc().proxy)(WryBindgenEvent::ipc(runtime.webview_id(), batch_msg))
     });
     let mut heap_ids_to_recycle_after_flush = Some(heap_ids_to_recycle_after_flush);
     loop {
-        if let Some(result) = crate::runtime::progress_js_with(request_id, &mut then) {
+        if let Some(result) = crate::runtime::progress_js_with(&mut then) {
             recycle_heap_ids_after_flush(
                 heap_ids_to_recycle_after_flush
                     .take()
@@ -673,29 +659,16 @@ mod take_encoder_tests {
         Runtime::new(ipc, 0)
     }
 
-    fn request_id(encoder: &EncodedData) -> u32 {
-        IPCMessage::new(encoder.to_bytes())
-            .header()
-            .expect("encoded message should have a header")
-            .request_id
-    }
-
     #[test]
-    fn empty_take_encoder_should_preserve_rust_request_id_sequence() {
+    fn take_encoder_yields_an_evaluate_message_with_no_request_id() {
         let mut runtime = test_runtime();
         assert!(runtime.is_empty());
 
         let first = runtime.take_encoder();
-        assert!(runtime.is_empty());
-        let second = runtime.take_encoder();
-
-        let first_id = request_id(&first);
-        let second_id = request_id(&second);
-        assert_eq!(first_id % 2, 1, "Rust request IDs should be odd");
-        assert_eq!(
-            second_id,
-            first_id + 2,
-            "empty take_encoder skipped a Rust request ID: first={first_id}, second={second_id}"
-        );
+        let bytes = IPCMessage::new(first.to_bytes());
+        assert_eq!(bytes.ty().unwrap(), MessageType::Evaluate);
+        // The encoder holds only the single message-type byte — no per-message
+        // request ID lives on the wire anymore.
+        assert!(first.u32_buf.is_empty());
     }
 }

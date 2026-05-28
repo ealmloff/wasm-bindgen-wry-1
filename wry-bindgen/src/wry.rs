@@ -13,7 +13,7 @@ use core::cell::RefCell;
 use core::future::poll_fn;
 use core::pin::{Pin, pin};
 use futures_util::FutureExt;
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use http::Response;
@@ -117,20 +117,32 @@ struct WebviewState {
 }
 
 /// Transport-owned IPC routing state for one webview.
+///
+/// Under strict synchronous ping-pong:
+///
+/// - At most one JS XHR is suspended at any moment (JS blocks on each XHR
+///   before it can send the next one), so the responder lives in a single
+///   `current_xhr` slot.
+/// - The remaining state is the stack of Rust Evaluates currently being
+///   processed by JS. Each frame just remembers whether it was delivered as
+///   the response to a parked JS XHR (nested) or via `evaluate_script`
+///   (top-level), so the matching JS Respond knows whether to hand the new
+///   XHR off as the next wait point or close the chain with a blank reply.
 struct WebviewMessageLayer {
-    /// Sync HTTP responders for JS-originated calls that are suspended while
-    /// Rust runs and may send nested JS work before the final response.
-    response_channels: HashMap<u32, WryBindgenResponder>,
-    /// Rust Evaluate requests currently executing in JS. If a request was
-    /// delivered through a suspended JS call, `route_request_id` identifies
-    /// the JS request whose responder should be replaced by the JS Respond.
-    rust_evaluate_routes: HashMap<u32, RustEvaluateRoute>,
+    current_xhr: Option<WryBindgenResponder>,
+    rust_eval_stack: Vec<RustEvalKind>,
     /// The sender used to forward decoded IPC messages to the Rust runtime.
     sender: IPCSenders,
 }
 
-struct RustEvaluateRoute {
-    route_request_id: Option<u32>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RustEvalKind {
+    /// Delivered via `evaluate_script` — no parent XHR to hand off to when JS
+    /// responds.
+    TopLevel,
+    /// Delivered as the response to a parked JS XHR — when JS responds, the
+    /// new XHR becomes the next wait point.
+    Nested,
 }
 
 impl WebviewState {
@@ -151,134 +163,80 @@ impl WebviewState {
 impl WebviewMessageLayer {
     fn new(sender: IPCSenders) -> Self {
         Self {
-            response_channels: HashMap::new(),
-            rust_evaluate_routes: HashMap::new(),
+            current_xhr: None,
+            rust_eval_stack: Vec::new(),
             sender,
         }
     }
 
-    fn set_response_channel(&mut self, id: u32, responder: WryBindgenResponder) {
-        if id == 0 {
-            panic!("Cannot store responder for response channel 0");
-        }
-        match self.response_channels.entry(id) {
-            Entry::Vacant(channel) => {
-                channel.insert(responder);
-            }
-            Entry::Occupied(_) => {
-                panic!("Overwriting existing response channel {id}");
-            }
-        }
-    }
-
-    fn take_response_channel(&mut self, id: u32) -> Option<WryBindgenResponder> {
-        self.response_channels.remove(&id)
-    }
-
-    fn respond_to_channel(&mut self, id: u32, response: IPCMessage) -> bool {
-        let Some(responder) = self.take_response_channel(id) else {
-            return false;
-        };
-        responder.respond_ipc(response);
-        true
-    }
-
-    fn set_rust_evaluate_route(&mut self, request_id: u32, route_request_id: Option<u32>) {
-        match self.rust_evaluate_routes.entry(request_id) {
-            Entry::Vacant(route) => {
-                route.insert(RustEvaluateRoute { route_request_id });
-            }
-            Entry::Occupied(_) => {
-                panic!("Overwriting existing Rust Evaluate route {request_id}");
-            }
-        }
-    }
-
-    fn take_rust_evaluate_route(&mut self, request_id: u32) -> Option<RustEvaluateRoute> {
-        self.rust_evaluate_routes.remove(&request_id)
-    }
-
     fn receive_js_message(&mut self, msg: IPCMessage, responder: WryBindgenResponder) {
         let msg_type = msg.ty().unwrap();
-        let header = msg.header().unwrap();
-        let mut response_channel_id = None;
+
+        // JS can only send a message when it isn't blocked on an existing XHR,
+        // so `current_xhr` must be empty at this point.
+        if self.current_xhr.is_some() {
+            responder.respond(error_response());
+            return;
+        }
 
         match msg_type {
-            // New call from JS - save the sync response channel and
-            // wait for the Rust application thread to respond.
+            // New call from JS — park the XHR. Rust will reply via either a
+            // Respond (the answer) or an Evaluate (a nested Rust→JS call
+            // delivered through the suspended XHR).
             MessageType::Evaluate => {
-                self.set_response_channel(header.request_id, responder);
-                response_channel_id = Some(header.request_id);
+                self.current_xhr = Some(responder);
             }
-            // Response from JS to a previous Rust Evaluate. The route was
-            // recorded when Wry delivered that Evaluate to JS.
-            MessageType::Respond => {
-                let Some(route) = self.take_rust_evaluate_route(header.request_id) else {
+            // Response from JS closes the most recent Rust Evaluate frame.
+            // Nested frames hand the new XHR off as the next wait point;
+            // top-level frames have no parent so we close the chain with a
+            // blank response right here.
+            MessageType::Respond => match self.rust_eval_stack.pop() {
+                Some(RustEvalKind::Nested) => {
+                    self.current_xhr = Some(responder);
+                }
+                Some(RustEvalKind::TopLevel) => {
+                    responder.respond(blank_response());
+                }
+                None => {
                     responder.respond(error_response());
                     return;
-                };
-                match route.route_request_id {
-                    Some(route_request_id) => {
-                        self.set_response_channel(route_request_id, responder);
-                        response_channel_id = Some(route_request_id);
-                    }
-                    None => {
-                        responder.respond(blank_response());
-                    }
                 }
-            }
+            },
         }
 
         if !self.sender.start_send(InboundIPCMessage::new(msg)) {
-            self.respond_channel_with_error(response_channel_id);
+            if let Some(responder) = self.current_xhr.take() {
+                responder.respond(error_response());
+            }
         }
     }
 
     fn receive_rust_message(&mut self, ipc_msg: OutboundIPCMessage) -> Option<IPCMessage> {
-        let header = ipc_msg.message.header().unwrap();
         let ty = ipc_msg.message.ty().unwrap();
-        let route_request_id = ipc_msg.route_request_id;
         let message = ipc_msg.message;
 
         match ty {
             MessageType::Respond => {
-                let Some(route_request_id) = route_request_id else {
-                    panic!(
-                        "Rust response {} did not specify a JS response route",
-                        header.request_id
-                    );
-                };
-                if self.respond_to_channel(route_request_id, message) {
-                    return None;
+                let responder = self
+                    .current_xhr
+                    .take()
+                    .expect("Rust Respond with no suspended JS XHR to reply to");
+                responder.respond_ipc(message);
+                None
+            }
+            MessageType::Evaluate => match self.current_xhr.take() {
+                Some(responder) => {
+                    // Nested: deliver as the response to the parked JS XHR.
+                    responder.respond_ipc(message);
+                    self.rust_eval_stack.push(RustEvalKind::Nested);
+                    None
                 }
-                panic!(
-                    "No JS response channel {} for IPC message {}",
-                    route_request_id, header.request_id
-                );
-            }
-            MessageType::Evaluate => {
-                self.set_rust_evaluate_route(header.request_id, route_request_id);
-
-                if let Some(route_request_id) = route_request_id {
-                    if self.respond_to_channel(route_request_id, message) {
-                        return None;
-                    }
-                    panic!(
-                        "No JS response channel {} for IPC message {}",
-                        route_request_id, header.request_id
-                    );
+                None => {
+                    // Top-level: caller delivers via `evaluate_script`.
+                    self.rust_eval_stack.push(RustEvalKind::TopLevel);
+                    Some(message)
                 }
-            }
-        }
-
-        Some(message)
-    }
-
-    fn respond_channel_with_error(&mut self, response_channel_id: Option<u32>) {
-        if let Some(response_channel_id) = response_channel_id {
-            if let Some(responder) = self.take_response_channel(response_channel_id) {
-                responder.respond(error_response());
-            }
+            },
         }
     }
 }
@@ -652,10 +610,9 @@ mod tests {
     use super::*;
     use crate::ipc::EncodedData;
 
-    fn handler_request(message_type: MessageType, request_id: u32) -> http::Request<Vec<u8>> {
+    fn handler_request(message_type: MessageType) -> http::Request<Vec<u8>> {
         let mut data = EncodedData::new();
         data.push_u8(message_type as u8);
-        data.push_u32(request_id);
 
         let engine = base64::engine::general_purpose::STANDARD;
         let body_base64 = engine.encode(data.to_bytes());
@@ -676,7 +633,7 @@ mod tests {
 
         let response = Rc::new(RefCell::new(None));
         let captured_response = response.clone();
-        let request = handler_request(MessageType::Evaluate, 1);
+        let request = handler_request(MessageType::Evaluate);
 
         let unhandled = protocol_handler.handle_request(
             "wry",

@@ -6,22 +6,23 @@ const JSIDX_TRUE = JSIDX_OFFSET + 2;
 const JSIDX_FALSE = JSIDX_OFFSET + 3;
 const JSIDX_RESERVED = JSIDX_OFFSET + 4;
 
-// Object store implementation for JS heap types
+// Object store implementation for JS heap types.
+//
+// A `DeferredHeapRefs` collects values JS encoded without knowing their heap
+// IDs yet. Rust allocates the IDs as it decodes the message and ships them
+// back in the next outbound's install-batch prelude. Under strict ping-pong
+// the matching is purely positional — install batches arrive in Rust's
+// decode order, and JS's queue of unresolved batches is drained in matching
+// LIFO order (most recently created first).
 class DeferredHeapRefs {
   declare private heap: JSHeap;
-  declare private requestId: number;
   declare private values: unknown[];
   declare private resolved: boolean;
 
-  constructor(heap: JSHeap, requestId: number) {
+  constructor(heap: JSHeap) {
     this.heap = heap;
-    this.requestId = requestId;
     this.values = [];
     this.resolved = false;
-  }
-
-  rawId(): number {
-    return this.requestId;
   }
 
   count(): number {
@@ -55,14 +56,6 @@ class DeferredHeapRefs {
       this.heap.insertAt(ids[i], this.values[i]);
     }
   }
-
-  finishIfEmpty(): void {
-    if (this.resolved) {
-      return;
-    }
-
-    this.resolved = this.values.length === 0;
-  }
 }
 
 class JSHeap {
@@ -74,7 +67,10 @@ class JSHeap {
   declare private borrowFrameStack: number[];
   // Stack of reservation scopes: each scope tracks exact IDs reserved by Rust
   declare private reservationStack: { ids: number[]; nextIndex: number }[];
-  declare private deferredHeapRefs: Map<number, DeferredHeapRefs>;
+  // Stack of DeferredHeapRefs awaiting Rust-allocated install IDs. Rust ships
+  // batches in decode order; the most recently created DHR is at the top and
+  // is the one being installed by the next batch in an inbound prelude.
+  declare private deferredHeapRefs: DeferredHeapRefs[];
 
   constructor() {
     // Slots 0-127 are for borrow stack (1-127 usable), slots 128-131
@@ -94,7 +90,7 @@ class JSHeap {
     this.borrowFrameStack = [];
     // Reservation stack starts empty
     this.reservationStack = [];
-    this.deferredHeapRefs = new Map();
+    this.deferredHeapRefs = [];
   }
 
   insertAt(id: number, value: unknown): void {
@@ -107,27 +103,34 @@ class JSHeap {
     this.slots.set(id, value);
   }
 
-  deferHeapRefs(requestId: number): DeferredHeapRefs {
-    const refs = new DeferredHeapRefs(this, requestId);
-    this.deferredHeapRefs.set(requestId, refs);
+  deferHeapRefs(): DeferredHeapRefs {
+    const refs = new DeferredHeapRefs(this);
+    this.deferredHeapRefs.push(refs);
     return refs;
   }
 
-  resolveDeferredHeapRefs(requestId: number, ids: number[]): boolean {
-    const refs = this.deferredHeapRefs.get(requestId);
+  // Apply the next install batch from an inbound prelude to the most
+  // recently created unresolved DeferredHeapRefs.
+  resolveDeferredHeapRefs(ids: number[]): void {
+    const refs = this.deferredHeapRefs.pop();
     if (!refs) {
-      return false;
+      throw new Error(
+        "Received an install batch but no deferred heap-ref frame is pending"
+      );
     }
-
     refs.resolve(ids);
-    this.deferredHeapRefs.delete(requestId);
-    return true;
   }
 
+  // Drop a DHR if it never collected any values. Called after a JS-to-Rust
+  // outbound completes, since Rust will only ship an install batch when the
+  // DHR is non-empty.
   releaseEmptyDeferredHeapRefs(refs: DeferredHeapRefs): void {
-    refs.finishIfEmpty();
-    if (refs.count() === 0 && this.deferredHeapRefs.get(refs.rawId()) === refs) {
-      this.deferredHeapRefs.delete(refs.rawId());
+    if (refs.count() !== 0) {
+      return;
+    }
+    const top = this.deferredHeapRefs.length - 1;
+    if (top >= 0 && this.deferredHeapRefs[top] === refs) {
+      this.deferredHeapRefs.pop();
     }
   }
 

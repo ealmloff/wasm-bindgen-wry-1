@@ -100,14 +100,6 @@ pub(crate) enum MessageType {
     Respond = 1,
 }
 
-/// Common IPC message header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct MessageHeader {
-    /// Evaluate request ID. Respond messages use the same ID as the Evaluate
-    /// they answer.
-    pub(crate) request_id: u32,
-}
-
 /// Message sent from JS to Rust.
 #[derive(Debug, Clone)]
 pub(crate) struct InboundIPCMessage {
@@ -120,20 +112,15 @@ impl InboundIPCMessage {
     }
 }
 
-/// Message sent from Rust to JS, with routing metadata kept outside the binary
-/// IPC payload.
+/// Message sent from Rust to JS.
 #[derive(Debug, Clone)]
 pub(crate) struct OutboundIPCMessage {
     pub(crate) message: IPCMessage,
-    pub(crate) route_request_id: Option<u32>,
 }
 
 impl OutboundIPCMessage {
-    pub(crate) fn new(message: IPCMessage, route_request_id: Option<u32>) -> Self {
-        Self {
-            message,
-            route_request_id,
-        }
+    pub(crate) fn new(message: IPCMessage) -> Self {
+        Self { message }
     }
 }
 
@@ -141,18 +128,18 @@ impl OutboundIPCMessage {
 ///
 /// Message format in the u8 buffer:
 /// - First u8: message type (0 = Evaluate, 1 = Respond)
-/// - First u32 value: request ID
 /// - Remaining data depends on message type
+///
+/// Under strict synchronous ping-pong, routing is fully determined by message
+/// polarity plus the per-side call stack. There are no per-message request IDs.
 ///
 /// Rust-to-JS heap ID lists are encoded in the u32 buffer as `count: u32`
 /// followed by `count` u64 IDs, each split into low/high u32 words.
 ///
-/// Rust only emits `TYPE_CACHED` after the runtime observes a JS response for
-/// a request that carried the corresponding `TYPE_FULL`.
-///
 /// Evaluate format (supports batching - multiple operations in one message):
 /// - u8: message type (0)
-/// - install batches: heap IDs JS should install for deferred JS-originated arguments
+/// - install batches: heap IDs JS should install for previously deferred
+///   JS-originated values, in FIFO order
 /// - id list: heap IDs JS should reserve for Rust-to-JS return placeholders
 /// - For each operation (read until buffer exhausted):
 ///   - u32: function ID
@@ -160,7 +147,8 @@ impl OutboundIPCMessage {
 ///
 /// Respond format:
 /// - u8: message type (1)
-/// - install batches: heap IDs JS should install for deferred JS-originated arguments
+/// - install batches: heap IDs JS should install for previously deferred
+///   JS-originated values, in FIFO order
 /// - For each operation result:
 ///   - encoded return value (varies by function)
 #[derive(Debug, Clone)]
@@ -185,35 +173,13 @@ impl IPCMessage {
         }
     }
 
-    /// Get the common message header.
-    pub fn header(&self) -> Result<MessageHeader, DecodeError> {
-        let mut decoded = DecodedData::from_bytes(&self.data)?;
-        let message_type = decoded.take_u8()?;
-        match message_type {
-            0 | 1 => {}
-            v => return Err(DecodeError::InvalidMessageType { value: v }),
-        }
-        Ok(MessageHeader {
-            request_id: decoded.take_u32()?,
-        })
-    }
-
     /// Decode the message into its variant form.
     pub fn decoded(&self) -> Result<DecodedVariant<'_>, DecodeError> {
         let mut decoded = DecodedData::from_bytes(&self.data)?;
         let message_type = decoded.take_u8()?;
-        let header = MessageHeader {
-            request_id: decoded.take_u32()?,
-        };
         let message_type = match message_type {
-            0 => DecodedVariant::Evaluate {
-                header,
-                data: decoded,
-            },
-            1 => DecodedVariant::Respond {
-                header,
-                data: decoded,
-            },
+            0 => DecodedVariant::Evaluate { data: decoded },
+            1 => DecodedVariant::Respond { data: decoded },
             v => return Err(DecodeError::InvalidMessageType { value: v }),
         };
         Ok(message_type)
@@ -234,15 +200,9 @@ impl IPCMessage {
 #[derive(Debug)]
 pub(crate) enum DecodedVariant<'a> {
     /// Response from JS/Rust
-    Respond {
-        header: MessageHeader,
-        data: DecodedData<'a>,
-    },
+    Respond { data: DecodedData<'a> },
     /// Evaluation request
-    Evaluate {
-        header: MessageHeader,
-        data: DecodedData<'a>,
-    },
+    Evaluate { data: DecodedData<'a> },
 }
 
 /// Context that changes how some values are decoded from a message.
@@ -250,9 +210,10 @@ pub(crate) enum DecodedVariant<'a> {
 pub(crate) enum DecodeContext {
     /// Values use their normal wire representation.
     Normal,
-    /// JS sent heap references without IDs. Rust allocates IDs and later sends
-    /// install metadata back to JS for this request.
-    DeferredHeapRefs { request_id: u32 },
+    /// JS sent heap references without IDs. Rust allocates them into the
+    /// current inbound batch and ships the IDs back in the next outbound
+    /// message's install-batch list.
+    DeferredHeapRefs,
 }
 
 /// Decoded binary data with aligned buffer access.
@@ -394,6 +355,10 @@ pub struct EncodedData {
     pub(crate) u32_buf: Vec<u32>,
     pub(crate) str_buf: Vec<u8>,
     pub(crate) heap_ids_to_recycle_after_flush: Vec<u64>,
+    /// Type IDs whose `TYPE_FULL` definition was written into this encoder.
+    /// They become safe to send as `TYPE_CACHED` only after JS has parsed
+    /// this outbound, which the matching JS Respond signals.
+    pub(crate) pending_type_ids: Vec<u32>,
     /// Flag indicating that this batch must be flushed before returning.
     /// Used for stack-allocated callbacks that need synchronous invocation.
     pub(crate) needs_flush: bool,
@@ -408,6 +373,7 @@ impl EncodedData {
             u32_buf: Vec::new(),
             str_buf: Vec::new(),
             heap_ids_to_recycle_after_flush: Vec::new(),
+            pending_type_ids: Vec::new(),
             needs_flush: false,
         }
     }
@@ -418,11 +384,14 @@ impl EncodedData {
         self.needs_flush = true;
     }
 
-    pub(crate) fn request_id(&self) -> u32 {
-        self.u32_buf
-            .first()
-            .copied()
-            .expect("encoded IPC message is missing request ID")
+    /// Record that this encoder's outbound is introducing a new type ID with
+    /// `TYPE_FULL`. The ID will be acked when JS responds to this outbound.
+    pub(crate) fn register_pending_type_id(&mut self, type_id: u32) {
+        self.pending_type_ids.push(type_id);
+    }
+
+    pub(crate) fn take_pending_type_ids(&mut self) -> Vec<u32> {
+        core::mem::take(&mut self.pending_type_ids)
     }
 
     pub(crate) fn defer_heap_id_recycle_until_flush(&mut self, id: u64) {
@@ -546,14 +515,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn message_header_consumes_only_request_id() {
+    fn message_header_only_carries_message_type() {
         let mut encoder = EncodedData::new();
         encoder.push_u8(MessageType::Evaluate as u8);
-        encoder.push_u32(42);
         encoder.push_u32(99);
 
         let msg = IPCMessage::new(encoder.to_bytes());
-        assert_eq!(msg.header().unwrap().request_id, 42);
+        assert_eq!(msg.ty().unwrap(), MessageType::Evaluate);
 
         let DecodedVariant::Evaluate { mut data, .. } = msg.decoded().unwrap() else {
             panic!("expected Evaluate message");
