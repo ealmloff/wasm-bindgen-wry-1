@@ -183,10 +183,19 @@ fn dispatch_inbound_message<O>(
 }
 
 fn handle_inbound_evaluate(mut data: DecodedData<'_>) {
-    with_runtime(|runtime| runtime.open_inbound_batch());
+    with_runtime(|runtime| {
+        runtime.open_inbound_batch();
+        // Mark that we are inside a callback so any Evaluate this callback
+        // emits is routed back through the parked JS XHR instead of a fresh
+        // top-level `evaluate_script`.
+        runtime.enter_inbound_evaluate();
+    });
     prepare_js_to_rust_data(&mut data);
     handle_rust_callback(&mut data);
-    with_runtime(|runtime| runtime.close_inbound_batch());
+    with_runtime(|runtime| {
+        runtime.leave_inbound_evaluate();
+        runtime.close_inbound_batch();
+    });
 }
 
 fn prepare_js_to_rust_data(data: &mut DecodedData) {

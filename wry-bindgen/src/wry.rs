@@ -213,6 +213,7 @@ impl WebviewMessageLayer {
 
     fn receive_rust_message(&mut self, ipc_msg: OutboundIPCMessage) -> Option<IPCMessage> {
         let ty = ipc_msg.message.ty().unwrap();
+        let top_level = ipc_msg.top_level;
         let message = ipc_msg.message;
 
         match ty {
@@ -224,19 +225,29 @@ impl WebviewMessageLayer {
                 responder.respond_ipc(message);
                 None
             }
-            MessageType::Evaluate => match self.current_xhr.take() {
-                Some(responder) => {
-                    // Nested: deliver as the response to the parked JS XHR.
-                    responder.respond_ipc(message);
-                    self.rust_eval_stack.push(RustEvalKind::Nested);
-                    None
-                }
-                None => {
-                    // Top-level: caller delivers via `evaluate_script`.
-                    self.rust_eval_stack.push(RustEvalKind::TopLevel);
-                    Some(message)
-                }
-            },
+            // The runtime tells us whether this Evaluate is a fresh top-level
+            // call or a nested response inside a callback. We must not infer it
+            // from `current_xhr`: a callback XHR can already be parked (awaiting
+            // the app future to pick it up) when the app future emits an
+            // unrelated top-level eval, which would otherwise be misdelivered as
+            // that callback's response.
+            MessageType::Evaluate if top_level => {
+                // Top-level: caller delivers via `evaluate_script`. JS, if it is
+                // currently blocked on a parked callback XHR, will run this only
+                // once that callback's JS→Rust chain fully resolves.
+                self.rust_eval_stack.push(RustEvalKind::TopLevel);
+                Some(message)
+            }
+            MessageType::Evaluate => {
+                // Nested: deliver as the response to the parked JS XHR.
+                let responder = self
+                    .current_xhr
+                    .take()
+                    .expect("Nested Rust Evaluate with no suspended JS XHR to reply to");
+                responder.respond_ipc(message);
+                self.rust_eval_stack.push(RustEvalKind::Nested);
+                None
+            }
         }
     }
 }

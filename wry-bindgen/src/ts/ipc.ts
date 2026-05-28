@@ -81,13 +81,9 @@ function sendEvaluateToRust(
   pushMessageHeader(encoder, MessageType.Evaluate);
   encodePayload(encoder);
 
-  try {
-    return handleBinaryResponse(
-      sync_request_binary(`/__wbg__/handler`, encoder.finalize())
-    );
-  } finally {
-    window.jsHeap.releaseEmptyDeferredHeapRefs(pendingHeapRefs);
-  }
+  return handleBinaryResponse(
+    sync_request_binary(`/__wbg__/handler`, encoder.finalize())
+  );
 }
 
 /**
@@ -160,10 +156,11 @@ function takeIdList(decoder: DataDecoder): number[] {
   return ids;
 }
 
-function installDeferredHeapRefFrames(decoder: DataDecoder): void {
-  const frameCount = decoder.takeU32();
-  for (let i = 0; i < frameCount; i++) {
-    const ids = takeIdList(decoder);
+function installDeferredHeapRefs(decoder: DataDecoder): void {
+  // A single install id-list rides in every prelude. An empty list means the
+  // last inbound message carried no heap refs, so there is nothing to resolve.
+  const ids = takeIdList(decoder);
+  if (ids.length > 0) {
     window.jsHeap.resolveDeferredHeapRefs(ids);
   }
 }
@@ -183,10 +180,10 @@ function handleBinaryResponse(
   const msgType = takeMessageType(decoder);
 
   if (msgType === MessageType.Respond) {
-    installDeferredHeapRefFrames(decoder);
+    installDeferredHeapRefs(decoder);
     return decoder;
   } else if (msgType === MessageType.Evaluate) {
-    installDeferredHeapRefFrames(decoder);
+    installDeferredHeapRefs(decoder);
 
     // Read the explicit placeholder IDs Rust reserved for this batch.
     const reservedIds = takeIdList(decoder);
@@ -237,7 +234,6 @@ function handleBinaryResponse(
       `/__wbg__/handler`,
       encoder.finalize()
     );
-    window.jsHeap.releaseEmptyDeferredHeapRefs(pendingHeapRefs);
     return handleBinaryResponse(nextResponse);
   }
 

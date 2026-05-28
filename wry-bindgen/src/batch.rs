@@ -43,6 +43,11 @@ pub struct Runtime {
     webview_id: u64,
     /// Thread locals associated with the runtime
     thread_locals: BTreeMap<ThreadLocalKey<'static>, Box<dyn Any>>,
+    /// How many JS→Rust callbacks (inbound Evaluates) are currently executing
+    /// on the stack. Zero means any outbound Evaluate is a fresh top-level call
+    /// from the app future; non-zero means it is a nested response inside a
+    /// callback and must travel back through the parked JS XHR.
+    inbound_evaluate_depth: u32,
 }
 
 impl Runtime {
@@ -60,7 +65,25 @@ impl Runtime {
             ipc,
             webview_id,
             thread_locals: BTreeMap::new(),
+            inbound_evaluate_depth: 0,
         }
+    }
+
+    /// Mark that a JS→Rust callback (inbound Evaluate) has started executing.
+    pub(crate) fn enter_inbound_evaluate(&mut self) {
+        self.inbound_evaluate_depth += 1;
+    }
+
+    /// Mark that a JS→Rust callback has finished executing.
+    pub(crate) fn leave_inbound_evaluate(&mut self) {
+        self.inbound_evaluate_depth -= 1;
+    }
+
+    /// Whether we are currently executing inside a JS→Rust callback. When true,
+    /// outbound Evaluates are nested responses to the parked JS XHR rather than
+    /// fresh top-level calls.
+    fn in_inbound_evaluate(&self) -> bool {
+        self.inbound_evaluate_depth > 0
     }
 
     fn new_encoder_for_evaluate() -> EncodedData {
@@ -154,7 +177,7 @@ impl Runtime {
         mut encoder: EncodedData,
         reserved_ids: Option<&[u64]>,
     ) -> OutboundIPCMessage {
-        let install_ids = self.take_queued_install_id_batches();
+        let install_ids = self.take_queued_install_ids();
         prepend_rust_to_js_prelude(&mut encoder, &install_ids, reserved_ids);
         let pending_type_ids = encoder.take_pending_type_ids();
         // Reserved-ids is only passed for outbound Evaluates; Responds pass
@@ -163,7 +186,10 @@ impl Runtime {
         if reserved_ids.is_some() {
             self.type_cache.push_pending_frame(pending_type_ids);
         }
-        OutboundIPCMessage::new(crate::ipc::IPCMessage::new(encoder.to_bytes()))
+        // Only Evaluates (reserved_ids is Some) can be top-level; they are
+        // top-level exactly when no callback is currently on the stack.
+        let top_level = reserved_ids.is_some() && !self.in_inbound_evaluate();
+        OutboundIPCMessage::new(crate::ipc::IPCMessage::new(encoder.to_bytes()), top_level)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -212,9 +238,9 @@ impl Runtime {
         self.is_batching
     }
 
-    /// Take ID batches JS should install for objects it sent to Rust.
-    pub(crate) fn take_queued_install_id_batches(&mut self) -> Vec<InstallIdBatch> {
-        self.id_allocator.take_queued_install_id_batches()
+    /// Take the IDs JS should install for objects it sent to Rust.
+    pub(crate) fn take_queued_install_ids(&mut self) -> InstallIdBatch {
+        self.id_allocator.take_queued_install_ids()
     }
 
     /// Take IDs JS should reserve for pending Rust-to-JS return values.
@@ -337,24 +363,21 @@ fn push_id_list(buf: &mut Vec<u32>, ids: &[u64]) {
     }
 }
 
-fn push_install_batches(buf: &mut Vec<u32>, batches: &[InstallIdBatch]) {
-    buf.push(batches.len() as u32);
-    for ids in batches {
-        push_id_list(buf, ids);
-    }
-}
-
 fn prepend_rust_to_js_prelude(
     encoder: &mut EncodedData,
-    install_ids: &[InstallIdBatch],
+    install_ids: &[u64],
     reserved_ids: Option<&[u64]>,
 ) {
     let mut prelude = Vec::new();
-    push_install_batches(&mut prelude, install_ids);
+    // A single install id-list: empty (count 0) when the last inbound message
+    // carried no heap refs, otherwise the IDs for that one batch.
+    push_id_list(&mut prelude, install_ids);
     if let Some(reserved_ids) = reserved_ids {
         push_id_list(&mut prelude, reserved_ids);
     }
-    encoder.insert_u32s(1, &prelude);
+    // The message type lives in the u8 buffer, so the u32 buffer starts with
+    // the prelude at index 0 (no request_id word precedes it anymore).
+    encoder.insert_u32s(0, &prelude);
 }
 
 thread_local! {

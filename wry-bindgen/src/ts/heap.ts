@@ -12,17 +12,24 @@ const JSIDX_RESERVED = JSIDX_OFFSET + 4;
 // IDs yet. Rust allocates the IDs as it decodes the message and ships them
 // back in the next outbound's install-batch prelude. Under strict ping-pong
 // the matching is purely positional — install batches arrive in Rust's
-// decode order, and JS's queue of unresolved batches is drained in matching
+// decode order, and JS's stack of unresolved batches is drained in matching
 // LIFO order (most recently created first).
+//
+// Both sides track a batch only once it actually holds a value: Rust enqueues
+// an install batch only when non-empty, and JS enqueues a `DeferredHeapRefs`
+// onto the heap's stack only on its first pushed value. That keeps the two
+// stacks growing in lockstep so positional matching stays exact.
 class DeferredHeapRefs {
   declare private heap: JSHeap;
   declare private values: unknown[];
   declare private resolved: boolean;
+  declare private enqueued: boolean;
 
   constructor(heap: JSHeap) {
     this.heap = heap;
     this.values = [];
     this.resolved = false;
+    this.enqueued = false;
   }
 
   count(): number {
@@ -32,6 +39,12 @@ class DeferredHeapRefs {
   push(value: unknown): void {
     if (this.resolved) {
       throw new Error("Deferred heap refs already resolved");
+    }
+    // Lazily join the heap's stack on the first value so empty batches never
+    // appear there — matching Rust, which only enqueues non-empty batches.
+    if (!this.enqueued) {
+      this.enqueued = true;
+      this.heap.enqueueDeferredHeapRefs(this);
     }
     this.values.push(value);
   }
@@ -103,10 +116,16 @@ class JSHeap {
     this.slots.set(id, value);
   }
 
+  // Create a batch for an outbound message. It joins the stack lazily, only
+  // once it collects its first value (see DeferredHeapRefs.push).
   deferHeapRefs(): DeferredHeapRefs {
-    const refs = new DeferredHeapRefs(this);
+    return new DeferredHeapRefs(this);
+  }
+
+  // Push a non-empty batch onto the stack. Called by DeferredHeapRefs on its
+  // first value so empty batches never occupy a stack slot.
+  enqueueDeferredHeapRefs(refs: DeferredHeapRefs): void {
     this.deferredHeapRefs.push(refs);
-    return refs;
   }
 
   // Apply the next install batch from an inbound prelude to the most
@@ -119,19 +138,6 @@ class JSHeap {
       );
     }
     refs.resolve(ids);
-  }
-
-  // Drop a DHR if it never collected any values. Called after a JS-to-Rust
-  // outbound completes, since Rust will only ship an install batch when the
-  // DHR is non-empty.
-  releaseEmptyDeferredHeapRefs(refs: DeferredHeapRefs): void {
-    if (refs.count() !== 0) {
-      return;
-    }
-    const top = this.deferredHeapRefs.length - 1;
-    if (top >= 0 && this.deferredHeapRefs[top] === refs) {
-      this.deferredHeapRefs.pop();
-    }
   }
 
   // Push a reservation scope for exact IDs allocated by Rust

@@ -116,11 +116,20 @@ impl InboundIPCMessage {
 #[derive(Debug, Clone)]
 pub(crate) struct OutboundIPCMessage {
     pub(crate) message: IPCMessage,
+    /// For Evaluate messages, whether this is a fresh top-level call from the
+    /// app future (delivered via `evaluate_script`) rather than a nested
+    /// response inside a JS→Rust callback (delivered through the parked XHR).
+    ///
+    /// This must be decided by the runtime, which alone knows its callback
+    /// depth: a parked-but-unprocessed callback XHR would otherwise make a
+    /// genuinely top-level eval look nested to the transport. Responds ignore
+    /// this flag — they always answer the parked XHR.
+    pub(crate) top_level: bool,
 }
 
 impl OutboundIPCMessage {
-    pub(crate) fn new(message: IPCMessage) -> Self {
-        Self { message }
+    pub(crate) fn new(message: IPCMessage, top_level: bool) -> Self {
+        Self { message, top_level }
     }
 }
 
