@@ -29,8 +29,9 @@ pub fn bench_batch_create_element_1() {
 }
 
 pub fn bench_batch_create_element_100() {
-    let _results = wry_launch::batch(|| {
+    wry_launch::batch(|| {
         let tag = "div".to_string();
-        (0..100).map(|_| create_element(&tag)).collect::<Vec<_>>()
+        let results = (0..100).map(|_| create_element(&tag)).collect::<Vec<_>>();
+        drop(results);
     });
 }

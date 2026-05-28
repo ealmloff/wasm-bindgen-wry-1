@@ -10,10 +10,10 @@ const JSIDX_RESERVED = JSIDX_OFFSET + 4;
 //
 // A `DeferredHeapRefs` collects values JS encoded without knowing their heap
 // IDs yet. Rust allocates the IDs as it decodes the message and ships them
-// back in the next outbound's install-batch prelude. Under strict ping-pong
-// the matching is purely positional — install batches arrive in Rust's
-// decode order, and JS's stack of unresolved batches is drained in matching
-// LIFO order (most recently created first).
+// back in outbound install-batch preludes. Matching is positional: install IDs
+// arrive in Rust decode order, and JS installs them into the most recent
+// unresolved batch first. A single JS→Rust message can be installed in chunks
+// if Rust calls back into JS while it is still decoding later heap-ref args.
 //
 // Both sides track a batch only once it actually holds a value: Rust enqueues
 // an install batch only when non-empty, and JS enqueues a `DeferredHeapRefs`
@@ -24,12 +24,14 @@ class DeferredHeapRefs {
   declare private values: unknown[];
   declare private resolved: boolean;
   declare private enqueued: boolean;
+  declare private nextInstallIndex: number;
 
   constructor(heap: JSHeap) {
     this.heap = heap;
     this.values = [];
     this.resolved = false;
     this.enqueued = false;
+    this.nextInstallIndex = 0;
   }
 
   count(): number {
@@ -39,6 +41,9 @@ class DeferredHeapRefs {
   push(value: unknown): void {
     if (this.resolved) {
       throw new Error("Deferred heap refs already resolved");
+    }
+    if (this.nextInstallIndex !== 0) {
+      throw new Error("Cannot add heap refs after install has started");
     }
     // Lazily join the heap's stack on the first value so empty batches never
     // appear there — matching Rust, which only enqueues non-empty batches.
@@ -57,17 +62,23 @@ class DeferredHeapRefs {
     if (this.resolved) {
       throw new Error("Deferred heap refs already resolved");
     }
-    this.resolved = true;
 
-    if (this.values.length !== ids.length) {
+    const remaining = this.values.length - this.nextInstallIndex;
+    if (ids.length > remaining) {
       throw new Error(
-        `Heap-ref install count mismatch: ${ids.length} IDs for ${this.values.length} values`
+        `Heap-ref install count mismatch: ${ids.length} IDs for ${remaining} remaining values`
       );
     }
 
     for (let i = 0; i < ids.length; i++) {
-      this.heap.insertAt(ids[i], this.values[i]);
+      this.heap.insertAt(ids[i], this.values[this.nextInstallIndex + i]);
     }
+    this.nextInstallIndex += ids.length;
+    this.resolved = this.nextInstallIndex === this.values.length;
+  }
+
+  isResolved(): boolean {
+    return this.resolved;
   }
 }
 
@@ -131,13 +142,16 @@ class JSHeap {
   // Apply the next install batch from an inbound prelude to the most
   // recently created unresolved DeferredHeapRefs.
   resolveDeferredHeapRefs(ids: number[]): void {
-    const refs = this.deferredHeapRefs.pop();
+    const refs = this.deferredHeapRefs[this.deferredHeapRefs.length - 1];
     if (!refs) {
       throw new Error(
         "Received an install batch but no deferred heap-ref frame is pending"
       );
     }
     refs.resolve(ids);
+    if (refs.isResolved()) {
+      this.deferredHeapRefs.pop();
+    }
   }
 
   // Push a reservation scope for exact IDs allocated by Rust

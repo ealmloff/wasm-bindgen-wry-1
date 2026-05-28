@@ -22,6 +22,7 @@ mod borrow_stack;
 mod callbacks;
 mod catch_attribute;
 mod clamped;
+mod closure_paths;
 mod deferred_heap_refs;
 mod export_call;
 mod indexing;
@@ -257,6 +258,12 @@ fn build_tests() -> Vec<TestCase> {
         callbacks::test_js_callback_multiple_heap_ref_args_share_request_id,
         callbacks::test_mut_dyn_fn_many_arity,
         callbacks::test_mut_dyn_fnmut_many_arity,
+        closure_paths::test_explicit_dyn_wrapped_borrowed_event_callbacks,
+        closure_paths::test_borrowed_first_once_callbacks,
+        closure_paths::test_borrowed_first_rest_arg_callbacks,
+        closure_paths::test_scoped_closure_borrow_constructors,
+        closure_paths::test_callback_reference_and_constructor_variants,
+        closure_paths::test_max_arity_closure_paths,
         reentrant_callbacks::test_reentrant_fn_closure,
         reentrant_callbacks::test_interleaved_fn_closures,
         jsvalue::test_jsvalue_constants,
@@ -351,7 +358,6 @@ fn build_tests() -> Vec<TestCase> {
 
     tests
 }
-
 
 fn extract_panic_message(payload: Box<dyn Any + Send>) -> Failed {
     let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
@@ -558,10 +564,7 @@ fn parse_harness_args() -> (HarnessOptions, Vec<String>) {
     (options, libtest_args)
 }
 
-async fn run_selected_tests(
-    args: Arguments,
-    js_errors: &mut UnboundedReceiver<String>,
-) -> bool {
+async fn run_selected_tests(args: Arguments, js_errors: &mut UnboundedReceiver<String>) -> bool {
     run_tests(args, build_tests(), js_errors).await
 }
 
