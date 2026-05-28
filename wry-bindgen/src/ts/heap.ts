@@ -247,11 +247,6 @@ class JSHeap {
       this.borrowStackPointer = savedPointer;
     }
   }
-
-  // Get the current borrow stack pointer (for testing)
-  getBorrowStackPointer(): number {
-    return this.borrowStackPointer;
-  }
 }
 
 export { DeferredHeapRefs, JSHeap };

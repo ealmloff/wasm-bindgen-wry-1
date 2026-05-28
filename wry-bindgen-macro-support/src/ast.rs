@@ -129,12 +129,19 @@ pub struct ImportFunction {
     pub rust_attrs: Vec<syn::Attribute>,
 }
 
+/// Build the token stream of preserved rust attributes for a generated function,
+/// appending `#[allow(non_snake_case)]`.
+fn fn_rust_attrs(
+    rust_attrs: &[syn::Attribute],
+    span: proc_macro2::Span,
+) -> proc_macro2::TokenStream {
+    quote_spanned! {span=> #(#rust_attrs)* #[allow(non_snake_case)] }
+}
+
 impl ImportFunction {
     /// Get the function rust attributes
     pub fn fn_rust_attrs(&self) -> proc_macro2::TokenStream {
-        let rust_attrs = &self.rust_attrs;
-        let span = self.rust_name.span();
-        quote_spanned! {span=> #(#rust_attrs)* #[allow(non_snake_case)] }
+        fn_rust_attrs(&self.rust_attrs, self.rust_name.span())
     }
 }
 
@@ -251,8 +258,6 @@ pub struct StructField {
     pub readonly: bool,
     /// Whether to clone the value in the getter (for non-Copy types)
     pub getter_with_clone: bool,
-    /// Whether to skip this field entirely
-    pub skip: bool,
 }
 
 /// An exported method from an impl block
@@ -283,9 +288,7 @@ pub struct ExportMethod {
 impl ExportMethod {
     /// Get the function rust attributes
     pub fn fn_rust_attrs(&self) -> proc_macro2::TokenStream {
-        let rust_attrs = &self.rust_attrs;
-        let span = self.rust_name.span();
-        quote_spanned! {span=> #(#rust_attrs)* #[allow(non_snake_case)] }
+        fn_rust_attrs(&self.rust_attrs, self.rust_name.span())
     }
 }
 
@@ -391,7 +394,6 @@ fn parse_struct(s: syn::ItemStruct, attrs: &BindgenAttrs) -> syn::Result<ExportS
                     ty: field.ty.clone(),
                     readonly: field_attrs.readonly.is_some(),
                     getter_with_clone: field_attrs.getter_with_clone.is_some(),
-                    skip: false,
                 });
             }
         }

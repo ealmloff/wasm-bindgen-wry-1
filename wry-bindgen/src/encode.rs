@@ -722,6 +722,46 @@ macro_rules! decode_args {
     }};
 }
 
+/// Emit the body of an `EncodeTypeDef::encode_type_def` for a callback type.
+///
+/// Writes `[Callback tag] [arg count] [arg TypeDefs...] [return TypeDef]`. The
+/// optional `borrow_first` flag (when present) pushes a `BorrowedRef` tag for the
+/// first argument instead of its `EncodeTypeDef`, used by the borrowed-first-arg
+/// closures.
+macro_rules! callback_type_def_body {
+    ($buf:expr; R = $R:ty; $($arg:ty),*) => {{
+        $buf.push(TypeTag::Callback as u8);
+        // Encode arg count
+        let mut count: u8 = 0;
+        $(
+            let _ = PhantomData::<$arg>;
+            count += 1;
+        )*
+        $buf.push(count);
+        // Encode each argument type
+        $(<$arg as EncodeTypeDef>::encode_type_def($buf);)*
+        // Encode return type
+        <$R as EncodeTypeDef>::encode_type_def($buf);
+    }};
+    // Borrowed-first-arg variant: the first argument is a borrowed ref encoded
+    // as a `BorrowedRef` tag, the remaining `$rest` args use their `EncodeTypeDef`.
+    ($buf:expr; R = $R:ty; borrow_first; $($rest:ty),*) => {{
+        $buf.push(TypeTag::Callback as u8);
+        // Encode arg count (starts at 1 for the borrowed first arg)
+        let mut count: u8 = 1;
+        $(
+            let _ = PhantomData::<$rest>;
+            count += 1;
+        )*
+        $buf.push(count);
+        // Encode each argument type
+        $buf.push(TypeTag::BorrowedRef as u8);
+        $(<$rest as EncodeTypeDef>::encode_type_def($buf);)*
+        // Encode return type
+        <$R as EncodeTypeDef>::encode_type_def($buf);
+    }};
+}
+
 macro_rules! impl_fnmut_stub {
     ($($arg:ident),*) => {
         // Implement EncodeTypeDef for fn(owned*) -> R
@@ -732,18 +772,7 @@ macro_rules! impl_fnmut_stub {
         {
             #[allow(unused)]
             fn encode_type_def(buf: &mut Vec<u8>) {
-                buf.push(TypeTag::Callback as u8);
-                // Encode arg count
-                let mut count: u8 = 0;
-                $(
-                    let _ = PhantomData::<$arg>;
-                    count += 1;
-                )*
-                buf.push(count);
-                // Encode each argument type
-                $(<$arg as EncodeTypeDef>::encode_type_def(buf);)*
-                // Encode return type
-                <R as EncodeTypeDef>::encode_type_def(buf);
+                callback_type_def_body!(buf; R = R; $($arg),*);
             }
         }
 
@@ -1038,6 +1067,91 @@ macro_rules! impl_fnmut_stub {
     };
 }
 
+/// Emit a `BinaryEncode` impl for a closure-reference type.
+///
+/// The closure reference is decomposed into a raw fat pointer (data + vtable) to
+/// erase its lifetime, registered as a `RustCallback`, and shipped to JS as a
+/// `CallbackKey`. SAFETY across all variants: the closure reference must remain
+/// valid for the duration of the JS call, which holds because `mark_needs_flush`
+/// forces synchronous invocation before this function returns.
+///
+/// Variants differ only in the closure trait (`Fn`/`FnMut`), the pointer
+/// mutability used to reconstruct it, and the `RustCallback` constructor.
+macro_rules! impl_closure_ref_binary_encode {
+    (
+        impl ($($self_ty:tt)*) via *mut dyn FnMut, $ctor:ident;
+        $($arg:ident),*
+    ) => {
+        impl<R, $($arg,)*> BinaryEncode for $($self_ty)*
+            where
+            $($arg: BinaryDecode + EncodeTypeDef + 'static, )*
+            R: BinaryEncode + EncodeTypeDef + 'static,
+        {
+            #[allow(non_snake_case)]
+            #[allow(unused)]
+            fn encode(self, encoder: &mut EncodedData) {
+                encoder.mark_needs_flush();
+
+                let ptr = self as *mut dyn FnMut($($arg),*) -> R;
+                let (data_ptr, vtable_ptr): (usize, usize) = unsafe { core::mem::transmute(ptr) };
+
+                let callback = crate::function::RustCallback::$ctor(
+                    move |decoder: &mut DecodedData, encoder: &mut EncodedData| {
+                        let ptr: *mut dyn FnMut($($arg),*) -> R = unsafe {
+                            core::mem::transmute((data_ptr, vtable_ptr))
+                        };
+                        let f: &mut dyn FnMut($($arg),*) -> R = unsafe { &mut *ptr };
+                        $(let $arg = <$arg as BinaryDecode>::decode(decoder).unwrap();)*
+                        let result = f($($arg),*);
+                        result.encode(encoder);
+                    },
+                );
+                let handle = crate::object_store::insert_object(callback);
+                let key: CallbackKey<fn($($arg),*) -> R> =
+                    CallbackKey::new_with_policy(handle, CallbackPolicy::RustOwned);
+                key.encode(encoder);
+                crate::batch::queue_rust_object_drop(handle);
+            }
+        }
+    };
+    (
+        impl ($($self_ty:tt)*) via *const dyn Fn, $ctor:ident;
+        $($arg:ident),*
+    ) => {
+        impl<R, $($arg,)*> BinaryEncode for $($self_ty)*
+            where
+            $($arg: BinaryDecode + EncodeTypeDef + 'static, )*
+            R: BinaryEncode + EncodeTypeDef + 'static,
+        {
+            #[allow(non_snake_case)]
+            #[allow(unused)]
+            fn encode(self, encoder: &mut EncodedData) {
+                encoder.mark_needs_flush();
+
+                let ptr = self as *const dyn Fn($($arg),*) -> R;
+                let (data_ptr, vtable_ptr): (usize, usize) = unsafe { core::mem::transmute(ptr) };
+
+                let callback = crate::function::RustCallback::$ctor(
+                    move |decoder: &mut DecodedData, encoder: &mut EncodedData| {
+                        let ptr: *const dyn Fn($($arg),*) -> R = unsafe {
+                            core::mem::transmute((data_ptr, vtable_ptr))
+                        };
+                        let f: &dyn Fn($($arg),*) -> R = unsafe { &*ptr };
+                        $(let $arg = <$arg as BinaryDecode>::decode(decoder).unwrap();)*
+                        let result = f($($arg),*);
+                        result.encode(encoder);
+                    },
+                );
+                let handle = crate::object_store::insert_object(callback);
+                let key: CallbackKey<fn($($arg),*) -> R> =
+                    CallbackKey::new_with_policy(handle, CallbackPolicy::RustOwned);
+                key.encode(encoder);
+                crate::batch::queue_rust_object_drop(handle);
+            }
+        }
+    };
+}
+
 /// Macro to implement EncodeTypeDef and BinaryEncode for closure reference types.
 /// These are used by js-sys bindings like `&mut dyn FnMut(JsValue, u32, Array) -> bool`.
 /// Unlike the WasmClosure impls above, these use simple BinaryDecode arguments without markers.
@@ -1051,63 +1165,15 @@ macro_rules! impl_closure_ref_encode {
         {
             #[allow(unused)]
             fn encode_type_def(buf: &mut Vec<u8>) {
-                buf.push(TypeTag::Callback as u8);
-                // Encode arg count
-                let mut count: u8 = 0;
-                $(
-                    let _ = PhantomData::<$arg>;
-                    count += 1;
-                )*
-                buf.push(count);
-                // Encode each argument type
-                $(<$arg as EncodeTypeDef>::encode_type_def(buf);)*
-                // Encode return type
-                <R as EncodeTypeDef>::encode_type_def(buf);
+                callback_type_def_body!(buf; R = R; $($arg),*);
             }
         }
 
         // Implement BinaryEncode for &mut dyn FnMut(...) -> R
-        impl<R, $($arg,)*> BinaryEncode for &mut dyn FnMut($($arg),*) -> R
-            where
-            $($arg: BinaryDecode + EncodeTypeDef + 'static, )*
-            R: BinaryEncode + EncodeTypeDef + 'static,
-        {
-            #[allow(non_snake_case)]
-            #[allow(unused)]
-            fn encode(self, encoder: &mut EncodedData) {
-                // Mark that this batch needs to be flushed synchronously.
-                // Stack-allocated callbacks must be invoked before this function returns,
-                // otherwise the pointer becomes invalid when the closure goes out of scope.
-                encoder.mark_needs_flush();
-
-                // Decompose fat pointer to (data_ptr, vtable_ptr) to erase the lifetime.
-                // SAFETY: The closure reference must remain valid for the duration of the JS call.
-                // This is safe because JS callbacks are invoked synchronously during the call.
-                let ptr = self as *mut dyn FnMut($($arg),*) -> R;
-                let (data_ptr, vtable_ptr): (usize, usize) = unsafe { core::mem::transmute(ptr) };
-
-                // Register the callback directly (without wbg_cast which would make a nested JS call)
-                let callback = crate::function::RustCallback::new_fn_mut(
-                    move |decoder: &mut DecodedData, encoder: &mut EncodedData| {
-                        // SAFETY: The pointer is valid for the duration of the JS call.
-                        // Reconstruct the fat pointer from the stored components.
-                        let ptr: *mut dyn FnMut($($arg),*) -> R = unsafe {
-                            core::mem::transmute((data_ptr, vtable_ptr))
-                        };
-                        let f: &mut dyn FnMut($($arg),*) -> R = unsafe { &mut *ptr };
-                        // Decode arguments and call the closure
-                        $(let $arg = <$arg as BinaryDecode>::decode(decoder).unwrap();)*
-                        let result = f($($arg),*);
-                        result.encode(encoder);
-                    },
-                );
-                let handle = crate::object_store::insert_object(callback);
-                let key: CallbackKey<fn($($arg),*) -> R> =
-                    CallbackKey::new_with_policy(handle, CallbackPolicy::RustOwned);
-                key.encode(encoder);
-                crate::batch::queue_rust_object_drop(handle);
-            }
-        }
+        impl_closure_ref_binary_encode!(
+            impl (&mut dyn FnMut($($arg),*) -> R) via *mut dyn FnMut, new_fn_mut;
+            $($arg),*
+        );
 
         // Implement EncodeTypeDef for &dyn Fn(...) -> R
         impl<R, $($arg,)*> EncodeTypeDef for &dyn Fn($($arg),*) -> R
@@ -1117,63 +1183,15 @@ macro_rules! impl_closure_ref_encode {
         {
             #[allow(unused)]
             fn encode_type_def(buf: &mut Vec<u8>) {
-                buf.push(TypeTag::Callback as u8);
-                // Encode arg count
-                let mut count: u8 = 0;
-                $(
-                    let _ = PhantomData::<$arg>;
-                    count += 1;
-                )*
-                buf.push(count);
-                // Encode each argument type
-                $(<$arg as EncodeTypeDef>::encode_type_def(buf);)*
-                // Encode return type
-                <R as EncodeTypeDef>::encode_type_def(buf);
+                callback_type_def_body!(buf; R = R; $($arg),*);
             }
         }
 
         // Implement BinaryEncode for &dyn Fn(...) -> R (supports reentrant calls)
-        impl<R, $($arg,)*> BinaryEncode for &dyn Fn($($arg),*) -> R
-            where
-            $($arg: BinaryDecode + EncodeTypeDef + 'static, )*
-            R: BinaryEncode + EncodeTypeDef + 'static,
-        {
-            #[allow(non_snake_case)]
-            #[allow(unused)]
-            fn encode(self, encoder: &mut EncodedData) {
-                // Mark that this batch needs to be flushed synchronously.
-                // Stack-allocated callbacks must be invoked before this function returns,
-                // otherwise the pointer becomes invalid when the closure goes out of scope.
-                encoder.mark_needs_flush();
-
-                // Decompose fat pointer to (data_ptr, vtable_ptr) to erase the lifetime.
-                // SAFETY: The closure reference must remain valid for the duration of the JS call.
-                // This is safe because JS callbacks are invoked synchronously during the call.
-                let ptr = self as *const dyn Fn($($arg),*) -> R;
-                let (data_ptr, vtable_ptr): (usize, usize) = unsafe { core::mem::transmute(ptr) };
-
-                // Register the callback directly (without wbg_cast which would make a nested JS call)
-                let callback = crate::function::RustCallback::new_fn(
-                    move |decoder: &mut DecodedData, encoder: &mut EncodedData| {
-                        // SAFETY: The pointer is valid for the duration of the JS call.
-                        // Reconstruct the fat pointer from the stored components.
-                        let ptr: *const dyn Fn($($arg),*) -> R = unsafe {
-                            core::mem::transmute((data_ptr, vtable_ptr))
-                        };
-                        let f: &dyn Fn($($arg),*) -> R = unsafe { &*ptr };
-                        // Decode arguments and call the closure
-                        $(let $arg = <$arg as BinaryDecode>::decode(decoder).unwrap();)*
-                        let result = f($($arg),*);
-                        result.encode(encoder);
-                    },
-                );
-                let handle = crate::object_store::insert_object(callback);
-                let key: CallbackKey<fn($($arg),*) -> R> =
-                    CallbackKey::new_with_policy(handle, CallbackPolicy::RustOwned);
-                key.encode(encoder);
-                crate::batch::queue_rust_object_drop(handle);
-            }
-        }
+        impl_closure_ref_binary_encode!(
+            impl (&dyn Fn($($arg),*) -> R) via *const dyn Fn, new_fn;
+            $($arg),*
+        );
 
         // Implement EncodeTypeDef for &mut dyn Fn(...) -> R
         impl<R, $($arg,)*> EncodeTypeDef for &mut dyn Fn($($arg),*) -> R
@@ -1183,64 +1201,16 @@ macro_rules! impl_closure_ref_encode {
         {
             #[allow(unused)]
             fn encode_type_def(buf: &mut Vec<u8>) {
-                buf.push(TypeTag::Callback as u8);
-                // Encode arg count
-                let mut count: u8 = 0;
-                $(
-                    let _ = PhantomData::<$arg>;
-                    count += 1;
-                )*
-                buf.push(count);
-                // Encode each argument type
-                $(<$arg as EncodeTypeDef>::encode_type_def(buf);)*
-                // Encode return type
-                <R as EncodeTypeDef>::encode_type_def(buf);
+                callback_type_def_body!(buf; R = R; $($arg),*);
             }
         }
 
         // Implement BinaryEncode for &mut dyn Fn(...) -> R (supports reentrant calls)
-        impl<R, $($arg,)*> BinaryEncode for &mut dyn Fn($($arg),*) -> R
-            where
-            $($arg: BinaryDecode + EncodeTypeDef + 'static, )*
-            R: BinaryEncode + EncodeTypeDef + 'static,
-        {
-            #[allow(non_snake_case)]
-            #[allow(unused)]
-            fn encode(self, encoder: &mut EncodedData) {
-                // Mark that this batch needs to be flushed synchronously.
-                // Stack-allocated callbacks must be invoked before this function returns,
-                // otherwise the pointer becomes invalid when the closure goes out of scope.
-                encoder.mark_needs_flush();
-
-                // Decompose fat pointer to (data_ptr, vtable_ptr) to erase the lifetime.
-                // SAFETY: The closure reference must remain valid for the duration of the JS call.
-                // This is safe because JS callbacks are invoked synchronously during the call.
-                // We use *const because Fn only requires & to call
-                let ptr = self as *const dyn Fn($($arg),*) -> R;
-                let (data_ptr, vtable_ptr): (usize, usize) = unsafe { core::mem::transmute(ptr) };
-
-                // Register the callback directly (without wbg_cast which would make a nested JS call)
-                let callback = crate::function::RustCallback::new_fn(
-                    move |decoder: &mut DecodedData, encoder: &mut EncodedData| {
-                        // SAFETY: The pointer is valid for the duration of the JS call.
-                        // Reconstruct the fat pointer from the stored components.
-                        let ptr: *const dyn Fn($($arg),*) -> R = unsafe {
-                            core::mem::transmute((data_ptr, vtable_ptr))
-                        };
-                        let f: &dyn Fn($($arg),*) -> R = unsafe { &*ptr };
-                        // Decode arguments and call the closure
-                        $(let $arg = <$arg as BinaryDecode>::decode(decoder).unwrap();)*
-                        let result = f($($arg),*);
-                        result.encode(encoder);
-                    },
-                );
-                let handle = crate::object_store::insert_object(callback);
-                let key: CallbackKey<fn($($arg),*) -> R> =
-                    CallbackKey::new_with_policy(handle, CallbackPolicy::RustOwned);
-                key.encode(encoder);
-                crate::batch::queue_rust_object_drop(handle);
-            }
-        }
+        // Uses *const because Fn only requires & to call.
+        impl_closure_ref_binary_encode!(
+            impl (&mut dyn Fn($($arg),*) -> R) via *const dyn Fn, new_fn;
+            $($arg),*
+        );
     };
 }
 
@@ -1280,19 +1250,7 @@ macro_rules! impl_fnmut_stub_ref {
         {
             #[allow(unused)]
             fn encode_type_def(buf: &mut Vec<u8>) {
-                buf.push(TypeTag::Callback as u8);
-                // Encode arg count
-                let mut count: u8 = 1;
-                $(
-                    let _ = PhantomData::<$rest>;
-                    count += 1;
-                )*
-                buf.push(count);
-                // Encode each argument type
-                buf.push(TypeTag::BorrowedRef as u8);
-                $(<$rest as EncodeTypeDef>::encode_type_def(buf);)*
-                // Encode return type
-                <R as EncodeTypeDef>::encode_type_def(buf);
+                callback_type_def_body!(buf; R = R; borrow_first; $($rest),*);
             }
         }
 
@@ -1673,29 +1631,25 @@ impl<T: BinaryDecode> BinaryDecode for Vec<T> {
 
 impl<T: BinaryDecode> BatchableResult for Vec<T> {}
 
-impl<T> BinaryEncode for &[T]
-where
-    T: crate::convert::JsGeneric,
-{
-    fn encode(self, encoder: &mut EncodedData) {
-        encoder.push_u32(self.len() as u32);
-        for val in self {
-            encoder.push_u64(val.as_ref().id());
-        }
-    }
+macro_rules! impl_jsgeneric_slice_encode {
+    ($($slice:ty),* $(,)?) => {
+        $(
+            impl<T> BinaryEncode for $slice
+            where
+                T: crate::convert::JsGeneric,
+            {
+                fn encode(self, encoder: &mut EncodedData) {
+                    encoder.push_u32(self.len() as u32);
+                    for val in self {
+                        encoder.push_u64(val.as_ref().id());
+                    }
+                }
+            }
+        )*
+    };
 }
 
-impl<T> BinaryEncode for &mut [T]
-where
-    T: crate::convert::JsGeneric,
-{
-    fn encode(self, encoder: &mut EncodedData) {
-        encoder.push_u32(self.len() as u32);
-        for val in self {
-            encoder.push_u64(val.as_ref().id());
-        }
-    }
-}
+impl_jsgeneric_slice_encode!(&[T], &mut [T]);
 
 // ============ Clamped<T> implementations ============
 

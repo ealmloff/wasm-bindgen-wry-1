@@ -166,23 +166,18 @@ export function drop_heap_ref(heapId: number): void {
   window.jsHeap.remove(heapId);
 }
 
-function disposeRustFunction(value: unknown): void {
-  const maybeWrapped = value as
+export function dispose_rust_function(heapId: number): void {
+  const value = window.jsHeap.get(heapId) as
     | {
         __wryRustFunction?: {
           disposeFromRust?: () => void;
         };
       }
     | undefined;
-  const rustFunction = maybeWrapped && maybeWrapped.__wryRustFunction;
+  const rustFunction = value && value.__wryRustFunction;
   if (rustFunction && typeof rustFunction.disposeFromRust === "function") {
     rustFunction.disposeFromRust();
   }
-}
-
-export function dispose_rust_function(heapId: number): void {
-  const value = window.jsHeap.get(heapId);
-  disposeRustFunction(value);
 }
 
 // Create a wrapper object for an exported Rust struct
@@ -195,4 +190,3 @@ export function create_rust_object_wrapper(handle: number, className: string): u
 export function extract_rust_handle(obj: any): number | null {
   return (obj && typeof obj.__handle === 'number') ? obj.__handle : null;
 }
-import { RustFunction } from "./rust_function";

@@ -15,7 +15,7 @@ use crate::BinaryDecode;
 use crate::batch::with_runtime;
 use crate::function::{CALL_EXPORT_FN_ID, DROP_NATIVE_REF_FN_ID, RustCallback};
 use crate::ipc::MessageType;
-use crate::ipc::{DecodedData, DecodedVariant, InboundIPCMessage, OutboundIPCMessage};
+use crate::ipc::{DecodedData, DecodedVariant, IPCMessage, OutboundIPCMessage};
 use crate::object_store::ObjectHandle;
 
 /// Application-level events that can be sent through the event loop.
@@ -66,13 +66,13 @@ pub(crate) enum AppEventVariant {
 
 #[derive(Clone)]
 pub(crate) struct IPCSenders {
-    eval_sender: Sender<InboundIPCMessage>,
-    respond_sender: futures_channel::mpsc::UnboundedSender<InboundIPCMessage>,
+    eval_sender: Sender<IPCMessage>,
+    respond_sender: futures_channel::mpsc::UnboundedSender<IPCMessage>,
 }
 
 impl IPCSenders {
-    pub(crate) fn start_send(&self, msg: InboundIPCMessage) -> bool {
-        match msg.message.ty().unwrap() {
+    pub(crate) fn start_send(&self, msg: IPCMessage) -> bool {
+        match msg.ty().unwrap() {
             MessageType::Evaluate => self.eval_sender.try_send(msg).is_ok(),
             MessageType::Respond => self.respond_sender.unbounded_send(msg).is_ok(),
         }
@@ -80,12 +80,12 @@ impl IPCSenders {
 }
 
 struct IPCReceivers {
-    eval_receiver: Pin<Box<Receiver<InboundIPCMessage>>>,
-    respond_receiver: futures_channel::mpsc::UnboundedReceiver<InboundIPCMessage>,
+    eval_receiver: Pin<Box<Receiver<IPCMessage>>>,
+    respond_receiver: futures_channel::mpsc::UnboundedReceiver<IPCMessage>,
 }
 
 impl IPCReceivers {
-    pub fn recv_blocking(&mut self) -> Option<InboundIPCMessage> {
+    pub fn recv_blocking(&mut self) -> Option<IPCMessage> {
         pollster::block_on(async {
             let Self {
                 eval_receiver,
@@ -153,13 +153,10 @@ pub async fn handle_callbacks() {
 }
 
 fn dispatch_inbound_message<O>(
-    response: &InboundIPCMessage,
+    response: &IPCMessage,
     with_respond: &mut impl for<'a> FnMut(DecodedData<'a>) -> O,
 ) -> Option<O> {
-    let decoder = response
-        .message
-        .decoded()
-        .expect("Failed to decode response");
+    let decoder = response.decoded().expect("Failed to decode response");
     match decoder {
         DecodedVariant::Respond { data } => {
             with_runtime(|runtime| {
@@ -241,9 +238,11 @@ fn handle_rust_callback(data: &mut DecodedData) {
 
             // Send response
             match result {
-                Ok(encoded) => new_respond_message(|encoder| {
+                Ok(encoded) => {
+                    let mut encoder = respond_encoder();
                     encoder.extend(&encoded);
-                }),
+                    finish_respond_message(encoder)
+                }
                 Err(err) => {
                     panic!("Export call failed: {err}");
                 }
@@ -296,10 +295,4 @@ fn respond_encoder() -> crate::ipc::EncodedData {
 
 fn finish_respond_message(encoder: crate::ipc::EncodedData) -> OutboundIPCMessage {
     with_runtime(|runtime| runtime.finish_respond_message(encoder))
-}
-
-fn new_respond_message(push_data: impl FnOnce(&mut crate::ipc::EncodedData)) -> OutboundIPCMessage {
-    let mut encoder = respond_encoder();
-    push_data(&mut encoder);
-    finish_respond_message(encoder)
 }

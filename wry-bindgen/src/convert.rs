@@ -54,9 +54,6 @@ pub trait OptionIntoWasmAbi: IntoWasmAbi {}
 /// Marker for types that may be received as `Option<T>` in wasm-bindgen-shaped APIs.
 pub trait OptionFromWasmAbi: FromWasmAbi {}
 
-/// Marker for primitive ABI-shaped values.
-pub trait WasmPrimitive {}
-
 /// Marker for values that have a wasm-bindgen ABI representation.
 pub trait WasmAbi {}
 
@@ -134,13 +131,6 @@ impl<T> OptionIntoWasmAbi for T where T: IntoWasmAbi {}
 impl<T> OptionFromWasmAbi for T where T: FromWasmAbi {}
 impl<T: ?Sized> WasmAbi for T {}
 impl<T: ?Sized> RefFromWasmAbi for T {}
-impl WasmPrimitive for u32 {}
-impl WasmPrimitive for i32 {}
-impl WasmPrimitive for u64 {}
-impl WasmPrimitive for i64 {}
-impl WasmPrimitive for f32 {}
-impl WasmPrimitive for f64 {}
-impl WasmPrimitive for () {}
 
 /// Converts a `JsValue` into a Rust type by checking at runtime.
 pub trait TryFromJsValue: Sized {

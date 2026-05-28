@@ -10,7 +10,7 @@ use core::cell::RefCell;
 use std::boxed::Box;
 
 use crate::encode::{BatchableResult, BinaryDecode};
-use crate::id_allocator::{IdAllocator, InstallIdBatch};
+use crate::id_allocator::{BorrowIds, HeapIds, InstallIdBatch, ObjectHandles};
 use crate::ipc::DecodedData;
 use crate::ipc::{EncodedData, MessageType, OutboundIPCMessage};
 use crate::lazy::ThreadLocalKey;
@@ -37,8 +37,12 @@ pub(crate) struct OperationFreeFrame {
 pub struct Runtime {
     /// The encoder accumulating batched operations
     encoder: EncodedData,
-    /// Allocator for heap and borrow-stack IDs that mirror the JS runtime.
-    id_allocator: IdAllocator,
+    /// Heap IDs that mirror the JS runtime's reference slab.
+    heap_ids: HeapIds,
+    /// Borrow-stack IDs for borrowed references within an operation.
+    borrow_ids: BorrowIds,
+    /// Handles for Rust-owned exported objects.
+    object_handles: ObjectHandles,
     /// Whether we're inside a batch() call
     is_batching: bool,
     /// Function-type definitions JS has been told about.
@@ -64,11 +68,12 @@ pub struct Runtime {
 
 impl Runtime {
     pub(crate) fn new(ipc: WryIPC, webview_id: u64) -> Self {
-        let id_allocator = IdAllocator::new();
         let encoder = Self::new_encoder_for_evaluate();
         Self {
             encoder,
-            id_allocator,
+            heap_ids: HeapIds::new(),
+            borrow_ids: BorrowIds::new(),
+            object_handles: ObjectHandles::new(),
             is_batching: false,
             type_cache: TypeCache::new(),
             // Object store starts empty
@@ -106,44 +111,44 @@ impl Runtime {
 
     /// Record a JS-allocated heap ID from a response.
     pub fn observe_js_heap_id(&mut self, id: u64) {
-        self.id_allocator.observe_js_heap_id(id);
+        self.heap_ids.observe_js_heap_id(id);
     }
 
     /// Get the next heap ID for a return value placeholder.
     pub fn get_next_placeholder_id(&mut self) -> u64 {
-        self.id_allocator.next_placeholder_id()
+        self.heap_ids.next_placeholder_id()
     }
 
     /// Allocate the next ID for a JS object sent without encoding an ID. The ID
     /// joins the pending install batch shipped on the next Rust-to-JS message.
     pub fn get_next_inbound_js_heap_id(&mut self) -> u64 {
-        self.id_allocator.next_inbound_js_heap_id()
+        self.heap_ids.next_inbound_js_heap_id()
     }
 
     /// Get the next borrow ID from the borrow stack (indices 1-127).
     /// The borrow stack grows downward from JSIDX_OFFSET (128) toward 1.
     /// Panics if the borrow stack overflows (more than 127 borrowed refs in one operation).
     pub fn get_next_borrow_id(&mut self) -> u64 {
-        self.id_allocator.next_borrow_id()
+        self.borrow_ids.next_borrow_id()
     }
 
     /// Push a borrow frame before a nested operation that may use borrowed refs.
     /// This saves the current borrow stack pointer so we can restore it later.
     pub fn push_borrow_frame(&mut self) {
-        self.id_allocator.push_borrow_frame();
+        self.borrow_ids.push_frame();
     }
 
     /// Pop a borrow frame after a nested operation completes.
     /// This restores the borrow stack pointer to where it was before the nested operation.
     pub fn pop_borrow_frame(&mut self) {
-        self.id_allocator.pop_borrow_frame();
+        self.borrow_ids.pop_frame();
     }
 
     /// Track a heap ID as released and queue it for JS drop when appropriate.
     /// Returns the ID when there is no open operation frame to batch it into,
     /// signalling the caller to notify JS immediately.
     pub fn release_heap_id(&mut self, id: u64) -> Option<u64> {
-        self.id_allocator.release_heap_slot(id);
+        self.heap_ids.release_heap_slot(id);
         match self.op_free_stack.last_mut() {
             Some(frame) => {
                 frame.heap_ids.push(id);
@@ -154,11 +159,11 @@ impl Runtime {
     }
 
     pub fn recycle_heap_id(&mut self, id: u64) {
-        self.id_allocator.recycle_heap_id(id);
+        self.heap_ids.recycle_heap_id(id);
     }
 
     pub fn recycle_heap_id_if_released(&mut self, id: u64) -> bool {
-        self.id_allocator.recycle_heap_id_if_released(id)
+        self.heap_ids.recycle_heap_id_if_released(id)
     }
 
     pub fn defer_heap_id_recycle_until_flush(&mut self, id: u64) {
@@ -250,12 +255,12 @@ impl Runtime {
 
     /// Take the IDs JS should install for objects it sent to Rust.
     pub(crate) fn take_pending_install_ids(&mut self) -> InstallIdBatch {
-        self.id_allocator.take_pending_install_ids()
+        self.heap_ids.take_pending_install_ids()
     }
 
     /// Take IDs JS should reserve for pending Rust-to-JS return values.
     pub(crate) fn take_reserved_placeholder_ids(&mut self) -> Vec<u64> {
-        self.id_allocator.take_reserved_placeholder_ids()
+        self.heap_ids.take_reserved_placeholder_ids()
     }
 
     pub(crate) fn take_encoder(&mut self) -> EncodedData {
@@ -293,7 +298,7 @@ impl Runtime {
 
     /// Insert an exported object and return its handle.
     pub(crate) fn insert_object<T: 'static>(&mut self, obj: T) -> u32 {
-        let handle = self.id_allocator.next_object_handle();
+        let handle = self.object_handles.next_handle();
         self.objects.insert(handle, Box::new(obj));
         handle
     }
@@ -342,14 +347,14 @@ impl Runtime {
     /// Remove an exported object and return it.
     pub(crate) fn remove_object<T: 'static>(&mut self, handle: u32) -> T {
         let boxed = self.objects.remove(&handle).expect("invalid handle");
-        self.id_allocator.release_object_handle(handle);
+        self.object_handles.release_handle(handle);
         *boxed.downcast::<T>().expect("type mismatch")
     }
 
     pub(crate) fn remove_object_untyped(&mut self, handle: u32) -> Option<Box<dyn Any>> {
         let object = self.objects.remove(&handle);
         if object.is_some() {
-            self.id_allocator.release_object_handle(handle);
+            self.object_handles.release_handle(handle);
         }
         object
     }
@@ -429,6 +434,19 @@ pub fn is_batching() -> bool {
     with_runtime(|state| state.is_batching())
 }
 
+/// Whether the runtime is unavailable — already dropped, inaccessible, or
+/// borrowed elsewhere. Callers treat all of these the same: skip the work.
+fn runtime_already_dropped() -> bool {
+    match RUNTIME.try_with(|state| {
+        state
+            .try_borrow()
+            .map(|runtime_stack| runtime_stack.is_empty())
+    }) {
+        Ok(Ok(value)) => value,
+        Ok(Err(_)) | Err(_) => true,
+    }
+}
+
 /// Queue a JS drop operation for a heap ID.
 /// This is called when a JsValue is dropped.
 pub(crate) fn queue_js_drop(id: u64) {
@@ -437,17 +455,7 @@ pub(crate) fn queue_js_drop(id: u64) {
         "Attempted to drop reserved JS heap ID {id}"
     );
 
-    let runtime_already_dropped = match RUNTIME.try_with(|state| {
-        state
-            .try_borrow()
-            .map(|runtime_stack| runtime_stack.is_empty())
-    }) {
-        Ok(Ok(value)) => value,
-        Ok(Err(_)) => return,
-        Err(_) => return,
-    };
-    // If the runtime has already been dropped, we don't need to drop the JS reference
-    if runtime_already_dropped {
+    if runtime_already_dropped() {
         return;
     }
 
@@ -476,16 +484,7 @@ pub(crate) fn queue_js_dispose_rust_function(id: u64) {
         "Attempted to dispose reserved JS heap ID {id}"
     );
 
-    let runtime_already_dropped = match RUNTIME.try_with(|state| {
-        state
-            .try_borrow()
-            .map(|runtime_stack| runtime_stack.is_empty())
-    }) {
-        Ok(Ok(value)) => value,
-        Ok(Err(_)) => return,
-        Err(_) => return,
-    };
-    if runtime_already_dropped {
+    if runtime_already_dropped() {
         return;
     }
 

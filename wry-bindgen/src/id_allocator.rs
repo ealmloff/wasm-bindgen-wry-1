@@ -37,7 +37,7 @@ impl IdSlab {
         }
 
         let id = self.next_id;
-        self.next_id = next_heap_id_after(self.next_id);
+        self.next_id = self.next_id.checked_add(1).expect("u64 ID space exhausted");
         self.mark_live(id);
         id
     }
@@ -45,7 +45,7 @@ impl IdSlab {
     fn reserve_exact(&mut self, id: u64) {
         self.free_ids.remove(&id);
         if id >= self.next_id {
-            self.next_id = next_heap_id_after(id);
+            self.next_id = id.checked_add(1).expect("u64 ID space exhausted");
         }
         self.mark_live(id);
     }
@@ -90,15 +90,11 @@ impl IdSlab {
     }
 }
 
-fn next_heap_id_after(id: u64) -> u64 {
-    id.checked_add(1).expect("u64 ID space exhausted")
-}
-
 /// Heap IDs Rust allocated for values JS sent without encoding an ID. Sent
 /// back to JS so it can install them into its heap at those slots.
 pub(crate) type InstallIdBatch = Vec<u64>;
 
-struct HeapIds {
+pub(crate) struct HeapIds {
     slab: IdSlab,
     /// IDs allocated while decoding the current inbound message, awaiting the
     /// next outbound's install prelude. Every outbound drains this via
@@ -111,7 +107,7 @@ struct HeapIds {
 }
 
 impl HeapIds {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             slab: IdSlab::new(JSIDX_RESERVED),
             pending_install_ids: Vec::new(),
@@ -123,25 +119,30 @@ impl HeapIds {
         self.slab.alloc()
     }
 
-    fn observe_js_heap_id(&mut self, id: u64) {
+    /// Record a heap ID allocated by JS in a response so future Rust-side
+    /// allocations cannot collide with it.
+    pub(crate) fn observe_js_heap_id(&mut self, id: u64) {
         if id >= JSIDX_RESERVED {
             self.slab.reserve_exact(id);
         }
     }
 
-    fn next_placeholder_id(&mut self) -> u64 {
+    /// Get the next heap ID for a return value placeholder.
+    pub(crate) fn next_placeholder_id(&mut self) -> u64 {
         let id = self.next_heap_id();
         self.reserved_placeholder_ids.push(id);
         id
     }
 
-    fn next_inbound_js_heap_id(&mut self) -> u64 {
+    pub(crate) fn next_inbound_js_heap_id(&mut self) -> u64 {
         let id = self.slab.alloc();
         self.pending_install_ids.push(id);
         id
     }
 
-    fn release_heap_slot(&mut self, id: u64) {
+    /// Release a heap ID's slab slot. Whether JS should be notified now is
+    /// decided by the runtime's operation-free batching, not here.
+    pub(crate) fn release_heap_slot(&mut self, id: u64) {
         if id < JSIDX_RESERVED {
             unreachable!("Attempted to release reserved JS heap ID {}", id);
         }
@@ -149,26 +150,29 @@ impl HeapIds {
         self.slab.release(id);
     }
 
-    fn recycle_heap_id(&mut self, id: u64) {
+    pub(crate) fn recycle_heap_id(&mut self, id: u64) {
         if id >= JSIDX_RESERVED {
             self.slab.recycle(id);
         }
     }
 
-    fn recycle_heap_id_if_released(&mut self, id: u64) -> bool {
+    pub(crate) fn recycle_heap_id_if_released(&mut self, id: u64) -> bool {
         id >= JSIDX_RESERVED && self.slab.recycle_if_released(id)
     }
 
-    fn take_pending_install_ids(&mut self) -> InstallIdBatch {
+    /// Take the IDs JS should install for objects it sent to Rust. Empty when
+    /// the last inbound message carried no heap refs.
+    pub(crate) fn take_pending_install_ids(&mut self) -> InstallIdBatch {
         core::mem::take(&mut self.pending_install_ids)
     }
 
-    fn take_reserved_placeholder_ids(&mut self) -> Vec<u64> {
+    /// Take IDs JS should reserve for pending Rust-to-JS return values.
+    pub(crate) fn take_reserved_placeholder_ids(&mut self) -> Vec<u64> {
         core::mem::take(&mut self.reserved_placeholder_ids)
     }
 }
 
-struct BorrowIds {
+pub(crate) struct BorrowIds {
     /// Borrow stack pointer - uses indices 1-127, growing downward from
     /// JSIDX_OFFSET (128) to 1. Reset after each operation completes.
     stack_pointer: u64,
@@ -177,14 +181,18 @@ struct BorrowIds {
 }
 
 impl BorrowIds {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             stack_pointer: JSIDX_OFFSET,
             frame_stack: Vec::new(),
         }
     }
 
-    fn next_borrow_id(&mut self) -> u64 {
+    /// Get the next borrow ID from the borrow stack (indices 1-127).
+    ///
+    /// The borrow stack grows downward from JSIDX_OFFSET (128) toward 1.
+    /// Panics if the borrow stack overflows.
+    pub(crate) fn next_borrow_id(&mut self) -> u64 {
         if self.stack_pointer <= 1 {
             panic!("Borrow stack overflow: too many borrowed references in a single operation");
         }
@@ -192,11 +200,13 @@ impl BorrowIds {
         self.stack_pointer
     }
 
-    fn push_frame(&mut self) {
+    /// Push a borrow frame before a nested operation that may use borrowed refs.
+    pub(crate) fn push_frame(&mut self) {
         self.frame_stack.push(self.stack_pointer);
     }
 
-    fn pop_frame(&mut self) {
+    /// Pop a borrow frame after a nested operation completes.
+    pub(crate) fn pop_frame(&mut self) {
         if let Some(saved_pointer) = self.frame_stack.pop() {
             self.stack_pointer = saved_pointer;
         } else {
@@ -205,14 +215,14 @@ impl BorrowIds {
     }
 }
 
-struct ObjectHandles {
+pub(crate) struct ObjectHandles {
     live_handles: BTreeSet<u32>,
     free_handles: BTreeSet<u32>,
     next_handle: u32,
 }
 
 impl ObjectHandles {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             live_handles: BTreeSet::new(),
             free_handles: BTreeSet::new(),
@@ -220,7 +230,8 @@ impl ObjectHandles {
         }
     }
 
-    fn next_handle(&mut self) -> u32 {
+    /// Allocate a handle for a Rust-owned exported object.
+    pub(crate) fn next_handle(&mut self) -> u32 {
         if let Some(handle) = self.free_handles.iter().next().copied() {
             self.free_handles.remove(&handle);
             self.mark_live(handle);
@@ -228,12 +239,15 @@ impl ObjectHandles {
         }
 
         let handle = self.next_handle;
-        self.next_handle = next_object_handle_after(self.next_handle);
+        self.next_handle = self
+            .next_handle
+            .checked_add(1)
+            .expect("u32 object handle space exhausted");
         self.mark_live(handle);
         handle
     }
 
-    fn release_handle(&mut self, handle: u32) {
+    pub(crate) fn release_handle(&mut self, handle: u32) {
         assert!(
             self.live_handles.remove(&handle),
             "Attempted to release object handle {handle}, but it is not live"
@@ -246,96 +260,6 @@ impl ObjectHandles {
             self.live_handles.insert(handle),
             "Object handle {handle} is already live"
         );
-    }
-}
-
-fn next_object_handle_after(handle: u32) -> u32 {
-    handle
-        .checked_add(1)
-        .expect("u32 object handle space exhausted")
-}
-
-/// Allocates IDs and handles used by the runtime.
-pub(crate) struct IdAllocator {
-    heap: HeapIds,
-    borrows: BorrowIds,
-    objects: ObjectHandles,
-}
-
-impl IdAllocator {
-    pub(crate) fn new() -> Self {
-        Self {
-            heap: HeapIds::new(),
-            borrows: BorrowIds::new(),
-            objects: ObjectHandles::new(),
-        }
-    }
-
-    /// Record a heap ID allocated by JS in a response so future Rust-side
-    /// allocations cannot collide with it.
-    pub(crate) fn observe_js_heap_id(&mut self, id: u64) {
-        self.heap.observe_js_heap_id(id);
-    }
-
-    /// Get the next heap ID for a return value placeholder.
-    pub(crate) fn next_placeholder_id(&mut self) -> u64 {
-        self.heap.next_placeholder_id()
-    }
-
-    pub(crate) fn next_inbound_js_heap_id(&mut self) -> u64 {
-        self.heap.next_inbound_js_heap_id()
-    }
-
-    /// Get the next borrow ID from the borrow stack (indices 1-127).
-    ///
-    /// The borrow stack grows downward from JSIDX_OFFSET (128) toward 1.
-    /// Panics if the borrow stack overflows.
-    pub(crate) fn next_borrow_id(&mut self) -> u64 {
-        self.borrows.next_borrow_id()
-    }
-
-    /// Push a borrow frame before a nested operation that may use borrowed refs.
-    pub(crate) fn push_borrow_frame(&mut self) {
-        self.borrows.push_frame();
-    }
-
-    /// Pop a borrow frame after a nested operation completes.
-    pub(crate) fn pop_borrow_frame(&mut self) {
-        self.borrows.pop_frame();
-    }
-
-    /// Release a heap ID's slab slot. Whether JS should be notified now is
-    /// decided by the runtime's operation-free batching, not here.
-    pub(crate) fn release_heap_slot(&mut self, id: u64) {
-        self.heap.release_heap_slot(id);
-    }
-
-    pub(crate) fn recycle_heap_id(&mut self, id: u64) {
-        self.heap.recycle_heap_id(id);
-    }
-
-    pub(crate) fn recycle_heap_id_if_released(&mut self, id: u64) -> bool {
-        self.heap.recycle_heap_id_if_released(id)
-    }
-
-    /// Take the IDs JS should install for objects it sent to Rust. Empty when
-    /// the last inbound message carried no heap refs.
-    pub(crate) fn take_pending_install_ids(&mut self) -> InstallIdBatch {
-        self.heap.take_pending_install_ids()
-    }
-
-    /// Take IDs JS should reserve for pending Rust-to-JS return values.
-    pub(crate) fn take_reserved_placeholder_ids(&mut self) -> Vec<u64> {
-        self.heap.take_reserved_placeholder_ids()
-    }
-
-    /// Allocate a handle for a Rust-owned exported object.
-    pub(crate) fn next_object_handle(&mut self) -> u32 {
-        self.objects.next_handle()
-    }
-
-    pub(crate) fn release_object_handle(&mut self, handle: u32) {
-        self.objects.release_handle(handle);
     }
 }
 

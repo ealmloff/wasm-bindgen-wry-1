@@ -389,23 +389,20 @@ class U8ClampedType implements TypeClass {
 const u8ClampedTypeInstance = new U8ClampedType();
 
 // Pre-instantiated numeric type classes
-export const U8Type = new NumericType("u8");
-export const U16Type = new NumericType("u16");
-export const U32Type = new NumericType("u32");
-export const U64Type = new NumericType("u64");
-export const U128Type = new NumericType("u128");
-export const I8Type = new NumericType("i8");
-export const I16Type = new NumericType("i16");
-export const I32Type = new NumericType("i32");
-export const I64Type = new NumericType("i64");
-export const I128Type = new NumericType("i128");
-export const UsizeType = new NumericType("usize");
-export const IsizeType = new NumericType("isize");
-export const F32Type = new NumericType("f32");
-export const F64Type = new NumericType("f64");
-
-// Pre-instantiated string type class
-export const strType = new StringType();
+const U8Type = new NumericType("u8");
+const U16Type = new NumericType("u16");
+const U32Type = new NumericType("u32");
+const U64Type = new NumericType("u64");
+const U128Type = new NumericType("u128");
+const I8Type = new NumericType("i8");
+const I16Type = new NumericType("i16");
+const I32Type = new NumericType("i32");
+const I64Type = new NumericType("i64");
+const I128Type = new NumericType("i128");
+const UsizeType = new NumericType("usize");
+const IsizeType = new NumericType("isize");
+const F32Type = new NumericType("f32");
+const F64Type = new NumericType("f64");
 
 // Pre-instantiated singleton types
 const boolTypeInstance = new BoolType();
@@ -514,18 +511,6 @@ function parseTypeDef(bytes: Uint8Array, offset: { value: number }): TypeClass {
 
 export {
   TypeClass,
-  TypeTag,
-  ArrayType,
-  BoolType,
-  BorrowedRefType,
   HeapRefType,
-  CallbackType,
-  NullType,
-  NumericType,
-  OptionType,
-  StringType,
-  StringEnumType,
-  ResultType,
-  U8ClampedType,
   parseTypeDef,
 };

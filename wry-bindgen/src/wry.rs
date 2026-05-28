@@ -20,9 +20,7 @@ use http::Response;
 
 use crate::batch::{Runtime, in_runtime};
 use crate::function_registry::FUNCTION_REGISTRY;
-use crate::ipc::{
-    DecodedVariant, IPCMessage, InboundIPCMessage, MessageType, OutboundIPCMessage, decode_data,
-};
+use crate::ipc::{DecodedVariant, IPCMessage, MessageType, OutboundIPCMessage, decode_data};
 use crate::runtime::{AppEventVariant, IPCSenders, WryBindgenEvent, WryIPC, handle_callbacks};
 
 pub trait ImplWryBindgenResponder {
@@ -204,7 +202,7 @@ impl WebviewMessageLayer {
             },
         }
 
-        if !self.sender.start_send(InboundIPCMessage::new(msg)) {
+        if !self.sender.start_send(msg) {
             if let Some(responder) = self.current_xhr.take() {
                 responder.respond(error_response());
             }

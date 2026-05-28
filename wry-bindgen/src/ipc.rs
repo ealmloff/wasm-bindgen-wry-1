@@ -100,18 +100,6 @@ pub(crate) enum MessageType {
     Respond = 1,
 }
 
-/// Message sent from JS to Rust.
-#[derive(Debug, Clone)]
-pub(crate) struct InboundIPCMessage {
-    pub(crate) message: IPCMessage,
-}
-
-impl InboundIPCMessage {
-    pub(crate) fn new(message: IPCMessage) -> Self {
-        Self { message }
-    }
-}
-
 /// Message sent from Rust to JS.
 #[derive(Debug, Clone)]
 pub(crate) struct OutboundIPCMessage {

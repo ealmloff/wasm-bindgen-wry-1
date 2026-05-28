@@ -88,7 +88,7 @@ macro_rules! impl_js_function_call {
         }
     };
     // Recursive case: N arguments
-    ($n:expr, $($T:ident $P:ident $arg:ident),+) => {
+    ($n:expr, $($T:ident $arg:ident),+) => {
         impl<$($T: EncodeTypeDef,)+ R: BatchableResult + EncodeTypeDef>
             JSFunction<fn($($T),+) -> R>
         {
@@ -110,38 +110,38 @@ macro_rules! impl_js_function_call {
 }
 
 impl_js_function_call!(0,);
-impl_js_function_call!(1, T1 P1 arg1);
-impl_js_function_call!(2, T1 P1 arg1, T2 P2 arg2);
-impl_js_function_call!(3, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3);
-impl_js_function_call!(4, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4);
-impl_js_function_call!(5, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5);
-impl_js_function_call!(6, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6);
-impl_js_function_call!(7, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7);
-impl_js_function_call!(8, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8);
-impl_js_function_call!(9, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9);
-impl_js_function_call!(10, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10);
-impl_js_function_call!(11, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11);
-impl_js_function_call!(12, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12);
-impl_js_function_call!(13, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13);
-impl_js_function_call!(14, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14);
-impl_js_function_call!(15, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15);
-impl_js_function_call!(16, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16);
-impl_js_function_call!(17, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17);
-impl_js_function_call!(18, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18);
-impl_js_function_call!(19, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19);
-impl_js_function_call!(20, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20);
-impl_js_function_call!(21, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20, T21 P21 arg21);
-impl_js_function_call!(22, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20, T21 P21 arg21, T22 P22 arg22);
-impl_js_function_call!(23, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20, T21 P21 arg21, T22 P22 arg22, T23 P23 arg23);
-impl_js_function_call!(24, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20, T21 P21 arg21, T22 P22 arg22, T23 P23 arg23, T24 P24 arg24);
-impl_js_function_call!(25, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20, T21 P21 arg21, T22 P22 arg22, T23 P23 arg23, T24 P24 arg24, T25 P25 arg25);
-impl_js_function_call!(26, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20, T21 P21 arg21, T22 P22 arg22, T23 P23 arg23, T24 P24 arg24, T25 P25 arg25, T26 P26 arg26);
-impl_js_function_call!(27, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20, T21 P21 arg21, T22 P22 arg22, T23 P23 arg23, T24 P24 arg24, T25 P25 arg25, T26 P26 arg26, T27 P27 arg27);
-impl_js_function_call!(28, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20, T21 P21 arg21, T22 P22 arg22, T23 P23 arg23, T24 P24 arg24, T25 P25 arg25, T26 P26 arg26, T27 P27 arg27, T28 P28 arg28);
-impl_js_function_call!(29, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20, T21 P21 arg21, T22 P22 arg22, T23 P23 arg23, T24 P24 arg24, T25 P25 arg25, T26 P26 arg26, T27 P27 arg27, T28 P28 arg28, T29 P29 arg29);
-impl_js_function_call!(30, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20, T21 P21 arg21, T22 P22 arg22, T23 P23 arg23, T24 P24 arg24, T25 P25 arg25, T26 P26 arg26, T27 P27 arg27, T28 P28 arg28, T29 P29 arg29, T30 P30 arg30);
-impl_js_function_call!(31, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20, T21 P21 arg21, T22 P22 arg22, T23 P23 arg23, T24 P24 arg24, T25 P25 arg25, T26 P26 arg26, T27 P27 arg27, T28 P28 arg28, T29 P29 arg29, T30 P30 arg30, T31 P31 arg31);
-impl_js_function_call!(32, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20, T21 P21 arg21, T22 P22 arg22, T23 P23 arg23, T24 P24 arg24, T25 P25 arg25, T26 P26 arg26, T27 P27 arg27, T28 P28 arg28, T29 P29 arg29, T30 P30 arg30, T31 P31 arg31, T32 P32 arg32);
+impl_js_function_call!(1, T1 arg1);
+impl_js_function_call!(2, T1 arg1, T2 arg2);
+impl_js_function_call!(3, T1 arg1, T2 arg2, T3 arg3);
+impl_js_function_call!(4, T1 arg1, T2 arg2, T3 arg3, T4 arg4);
+impl_js_function_call!(5, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5);
+impl_js_function_call!(6, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6);
+impl_js_function_call!(7, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7);
+impl_js_function_call!(8, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8);
+impl_js_function_call!(9, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9);
+impl_js_function_call!(10, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10);
+impl_js_function_call!(11, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11);
+impl_js_function_call!(12, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12);
+impl_js_function_call!(13, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13);
+impl_js_function_call!(14, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14);
+impl_js_function_call!(15, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15);
+impl_js_function_call!(16, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16);
+impl_js_function_call!(17, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17);
+impl_js_function_call!(18, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18);
+impl_js_function_call!(19, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19);
+impl_js_function_call!(20, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20);
+impl_js_function_call!(21, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20, T21 arg21);
+impl_js_function_call!(22, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20, T21 arg21, T22 arg22);
+impl_js_function_call!(23, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20, T21 arg21, T22 arg22, T23 arg23);
+impl_js_function_call!(24, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20, T21 arg21, T22 arg22, T23 arg23, T24 arg24);
+impl_js_function_call!(25, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20, T21 arg21, T22 arg22, T23 arg23, T24 arg24, T25 arg25);
+impl_js_function_call!(26, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20, T21 arg21, T22 arg22, T23 arg23, T24 arg24, T25 arg25, T26 arg26);
+impl_js_function_call!(27, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20, T21 arg21, T22 arg22, T23 arg23, T24 arg24, T25 arg25, T26 arg26, T27 arg27);
+impl_js_function_call!(28, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20, T21 arg21, T22 arg22, T23 arg23, T24 arg24, T25 arg25, T26 arg26, T27 arg27, T28 arg28);
+impl_js_function_call!(29, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20, T21 arg21, T22 arg22, T23 arg23, T24 arg24, T25 arg25, T26 arg26, T27 arg27, T28 arg28, T29 arg29);
+impl_js_function_call!(30, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20, T21 arg21, T22 arg22, T23 arg23, T24 arg24, T25 arg25, T26 arg26, T27 arg27, T28 arg28, T29 arg29, T30 arg30);
+impl_js_function_call!(31, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20, T21 arg21, T22 arg22, T23 arg23, T24 arg24, T25 arg25, T26 arg26, T27 arg27, T28 arg28, T29 arg29, T30 arg30, T31 arg31);
+impl_js_function_call!(32, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20, T21 arg21, T22 arg22, T23 arg23, T24 arg24, T25 arg25, T26 arg26, T27 arg27, T28 arg28, T29 arg29, T30 arg30, T31 arg31, T32 arg32);
 
 /// Internal type for storing Rust callback functions.
 /// Always stores as `Rc<dyn Fn(...)>` for uniform handling.

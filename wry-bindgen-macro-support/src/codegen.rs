@@ -625,8 +625,8 @@ fn generate_function(
     // Generate argument lists
     let args = generate_args(func, krate)?;
     let fn_params = &args.fn_params;
-    let fn_types = &args.fn_types;
-    let call_values = &args.call_values;
+    let fn_types = &args.fn_type_list;
+    let call_values = &args.call_value_list;
 
     // Generate return type
     let ret_type = match &func.ret {
@@ -638,18 +638,16 @@ fn generate_function(
     // functions with catch, skip the try-catch wrapper since the adapter
     // returns Result.
     if func.is_async {
-        let js_code = generate_js_code(func, vendor_prefixes, prefix, true);
-        let js_code_str = js_code.to_arrow_function();
+        let js_code_str = generate_js_code(func, vendor_prefixes, prefix, true);
         return generate_async_function(func, type_generics, krate, &js_code_str, &args);
     }
 
     // For non-async functions, generate a simple closure that returns a constant string
-    let js_code = generate_js_code(func, vendor_prefixes, prefix, false);
-    let js_code_str = js_code.to_arrow_function();
+    let js_code_str = generate_js_code(func, vendor_prefixes, prefix, false);
 
     // Generate the function body
     let func_body = quote_spanned! {span=>
-        #krate::__wry_call_js_function!(#js_code_str, fn(#fn_types) -> #ret_type, (#call_values))
+        #krate::__wry_call_js_function!(#js_code_str, fn(#(#fn_types),*) -> #ret_type, (#(#call_values),*))
     };
 
     // Get the rust attributes to forward (like #[cfg(...)] and #[doc = "..."])
@@ -719,24 +717,9 @@ fn generate_function(
                 }
             })
         }
-        ImportFunctionKind::Constructor { class } => {
-            let (impl_type, impl_generics, mut method_generics) =
-                class_impl_parts(func, class, type_generics);
-            add_js_call_bounds_to_generics(&mut method_generics, func, krate, true);
-            let (impl_generics, _, impl_where_clause) = impl_generics.split_for_impl();
-            let (method_generics, _, method_where_clause) = method_generics.split_for_impl();
-            // Use the actual return type (may be Result<T, JsValue> for catch constructors)
-            Ok(quote_spanned! {span=>
-                impl #impl_generics #impl_type #impl_where_clause {
-                    #allows
-                    #rust_attrs
-                    #vis fn #rust_name #method_generics (#fn_params) -> #ret_type #method_where_clause {
-                        #func_body
-                    }
-                }
-            })
-        }
-        ImportFunctionKind::StaticMethod { class } => {
+        // Constructors and static methods share an impl block with no receiver.
+        // (Constructor return types may be Result<T, JsValue> for catch constructors.)
+        ImportFunctionKind::Constructor { class } | ImportFunctionKind::StaticMethod { class } => {
             let (impl_type, impl_generics, mut method_generics) =
                 class_impl_parts(func, class, type_generics);
             add_js_call_bounds_to_generics(&mut method_generics, func, krate, true);
@@ -942,23 +925,8 @@ fn generate_async_function(
                 }
             })
         }
-        ImportFunctionKind::Constructor { class } => {
-            let (impl_type, impl_generics, mut method_generics) =
-                class_impl_parts(func, class, type_generics);
-            add_js_call_bounds_to_generics(&mut method_generics, func, krate, false);
-            let (impl_generics, _, impl_where_clause) = impl_generics.split_for_impl();
-            let (method_generics, _, method_where_clause) = method_generics.split_for_impl();
-            Ok(quote_spanned! {span=>
-                impl #impl_generics #impl_type #impl_where_clause {
-                    #allows
-                    #(#rust_attrs)*
-                    #vis async fn #rust_name #method_generics (#fn_params) #ret_clause #method_where_clause {
-                        #async_body #ret_handling
-                    }
-                }
-            })
-        }
-        ImportFunctionKind::StaticMethod { class } => {
+        // Constructors and static methods share an impl block with no receiver.
+        ImportFunctionKind::Constructor { class } | ImportFunctionKind::StaticMethod { class } => {
             let (impl_type, impl_generics, mut method_generics) =
                 class_impl_parts(func, class, type_generics);
             add_js_call_bounds_to_generics(&mut method_generics, func, krate, false);
@@ -1010,24 +978,17 @@ fn generate_js_code(
     vendor_prefixes: &std::collections::HashMap<String, Vec<String>>,
     prefix: &str,
     skip_catch_wrapper: bool,
-) -> JsCode {
+) -> String {
     let js_name = &func.js_name;
 
-    let prefix = if let Some(ns) = &func.js_namespace {
-        if !ns.is_empty() {
-            format!("{prefix}{}.", ns.join("."))
-        } else {
-            prefix.to_string()
-        }
-    } else {
-        prefix.to_string()
-    };
+    let prefix = namespace_prefix(prefix, func.js_namespace.as_deref());
+
+    // Use a{index} naming to avoid conflicts with JS reserved words
+    let args: Vec<_> = (0..func.arguments.len()).map(|i| format!("a{i}")).collect();
+    let args_str = args.join(", ");
 
     let (params, body) = match &func.kind {
         ImportFunctionKind::Normal => {
-            // Use a{index} naming to avoid conflicts with JS reserved words
-            let args: Vec<_> = (0..func.arguments.len()).map(|i| format!("a{i}")).collect();
-            let args_str = args.join(", ");
             let callee = if prefix.is_empty() {
                 js_name.to_string()
             } else {
@@ -1037,9 +998,6 @@ fn generate_js_code(
             (format!("({args_str})"), format!("{callee}({args_str})"))
         }
         ImportFunctionKind::Method { .. } => {
-            // Use a{index} naming to avoid conflicts with JS reserved words
-            let args: Vec<_> = (0..func.arguments.len()).map(|i| format!("a{i}")).collect();
-            let args_str = args.join(", ");
             let method = js_property_access("obj", js_name);
             if args.is_empty() {
                 ("(obj)".to_string(), format!("{method}()"))
@@ -1073,10 +1031,6 @@ fn generate_js_code(
             ("(obj, index)".to_string(), "delete obj[index]".to_string())
         }
         ImportFunctionKind::Constructor { class } => {
-            // Use a{index} naming to avoid conflicts with JS reserved words
-            let args: Vec<_> = (0..func.arguments.len()).map(|i| format!("a{i}")).collect();
-            let args_str = args.join(", ");
-
             // Check if this type has vendor prefixes
             let body = if let Some(prefixes) = vendor_prefixes.get(class) {
                 if !prefixes.is_empty() {
@@ -1094,9 +1048,6 @@ fn generate_js_code(
             (format!("({args_str})"), body)
         }
         ImportFunctionKind::StaticMethod { class } => {
-            // Use a{index} naming to avoid conflicts with JS reserved words
-            let args: Vec<_> = (0..func.arguments.len()).map(|i| format!("a{i}")).collect();
-            let args_str = args.join(", ");
             let class_object = format!("{prefix}{class}");
             let method = js_property_access(&class_object, js_name);
             (format!("({args_str})"), format!("{method}({args_str})"))
@@ -1112,7 +1063,7 @@ fn generate_js_code(
         body
     };
 
-    JsCode { params, body }
+    format!("{params} => {body}")
 }
 
 fn js_property_access(object: &str, property: &str) -> String {
@@ -1150,21 +1101,6 @@ fn wrap_body_with_try_catch(body: &str) -> String {
     )
 }
 
-/// JavaScript function code parts
-struct JsCode {
-    /// Function parameters (e.g., "(arg1, arg2)" or "(obj, arg1, arg2)")
-    params: String,
-    /// Function body (e.g., "obj.method(arg1, arg2)" or "new Class(arg1)")
-    body: String,
-}
-
-impl JsCode {
-    /// Convert to a complete JavaScript arrow function
-    fn to_arrow_function(&self) -> String {
-        format!("{} => {}", self.params, self.body)
-    }
-}
-
 fn params_with_promise_callbacks(params: &str) -> String {
     if params == "()" {
         "(__wryResolve, __wryReject)".to_string()
@@ -1190,13 +1126,9 @@ fn async_promise_attach_js_code(js_code: &str) -> String {
 struct GeneratedArgs {
     /// Function parameter declarations: `arg1: T1, arg2: T2`
     fn_params: TokenStream,
-    /// Just the types for fn pointer: `T1, T2`
-    fn_types: TokenStream,
-    /// Individual fn pointer type tokens.
+    /// Individual fn pointer type tokens (e.g. `&self.obj` slot type then `T1, T2`).
     fn_type_list: Vec<TokenStream>,
-    /// Values to pass to call: `&self.obj, arg1, arg2`
-    call_values: TokenStream,
-    /// Individual values to pass to call.
+    /// Individual values to pass to call (e.g. `&self.obj, arg1, arg2`).
     call_value_list: Vec<TokenStream>,
 }
 
@@ -1236,23 +1168,9 @@ fn generate_args(func: &ImportFunction, krate: &TokenStream) -> syn::Result<Gene
         quote_spanned! {span=> #(#fn_params),* }
     };
 
-    let fn_types_tokens = if fn_types.is_empty() {
-        quote_spanned! {span=>}
-    } else {
-        quote_spanned! {span=> #(#fn_types),* }
-    };
-
-    let call_values_tokens = if call_values.is_empty() {
-        quote_spanned! {span=>}
-    } else {
-        quote_spanned! {span=> #(#call_values),* }
-    };
-
     Ok(GeneratedArgs {
         fn_params: fn_params_tokens,
-        fn_types: fn_types_tokens,
         fn_type_list: fn_types,
-        call_values: call_values_tokens,
         call_value_list: call_values,
     })
 }
@@ -1719,17 +1637,17 @@ fn generate_static_js_code(st: &ImportStatic, prefix: &str) -> String {
     let js_name = &st.js_name;
 
     // Build the prefix with namespace if present
-    let full_prefix = if let Some(ref namespace) = st.js_namespace {
-        if !namespace.is_empty() {
-            format!("{prefix}{}.", namespace.join("."))
-        } else {
-            prefix.to_string()
-        }
-    } else {
-        prefix.to_string()
-    };
+    let full_prefix = namespace_prefix(prefix, st.js_namespace.as_deref());
 
     format!("() => {full_prefix}{js_name}")
+}
+
+/// Build a JS access prefix by appending the dotted namespace (if any) to `prefix`.
+fn namespace_prefix(prefix: &str, namespace: Option<&[String]>) -> String {
+    match namespace {
+        Some(ns) if !ns.is_empty() => format!("{prefix}{}.", ns.join(".")),
+        _ => prefix.to_string(),
+    }
 }
 
 /// Generate code for a string enum
@@ -1934,7 +1852,7 @@ fn generate_export_struct(s: &ExportStruct, krate: &TokenStream) -> syn::Result<
             fn from(val: #rust_name) -> Self {
                 let handle = #krate::object_store::insert_object(val);
                 // Create a JS object wrapper with the handle
-                #krate::object_store::create_js_wrapper::<#rust_name>(handle, #js_name)
+                #krate::object_store::create_js_wrapper(handle, #js_name)
             }
         }
     };
@@ -2357,12 +2275,10 @@ fn generate_export_method(method: &ExportMethod, krate: &TokenStream) -> syn::Re
     let vis = &method.vis;
     let body = &method.body;
     let rust_attrs = method.fn_rust_attrs();
-    let arg_names_idents: Vec<_> = method.arguments.iter().map(|a| &a.name).collect();
-    let arg_types_refs: Vec<_> = method.arguments.iter().map(|a| &a.ty).collect();
 
-    let fn_args: Vec<_> = arg_names_idents
+    let fn_args: Vec<_> = arg_names
         .iter()
-        .zip(arg_types_refs.iter())
+        .zip(arg_types.iter())
         .map(|(name, ty)| quote_spanned! {span=> #name: #ty })
         .collect();
 

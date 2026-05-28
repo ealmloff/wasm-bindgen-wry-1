@@ -109,7 +109,7 @@ pub struct BindgenAttrs {
 }
 
 impl BindgenAttrs {
-    /// Check if this is a method (has `method` or `structural` attribute)
+    /// Check if this is a method (has the `method` attribute)
     pub fn is_method(&self) -> bool {
         self.method.is_some()
     }

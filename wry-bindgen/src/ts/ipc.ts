@@ -32,14 +32,6 @@ const DROP_NATIVE_REF_FN_ID = 0xffffffff;
 // Reserved function ID for calling exported Rust struct methods - must match Rust's CALL_EXPORT_FN_ID
 const CALL_EXPORT_FN_ID = 0xfffffffe;
 
-function pushMessageHeader(encoder: DataEncoder, msgType: MessageType): void {
-  encoder.pushU8(msgType);
-}
-
-function takeMessageType(decoder: DataDecoder): MessageType {
-  return decoder.takeU8();
-}
-
 /**
  * Sends binary data to Rust and receives binary response.
  */
@@ -78,7 +70,7 @@ function sendEvaluateToRust(
 ): DataDecoder | null {
   const pendingHeapRefs = window.jsHeap.deferHeapRefs();
   const encoder = new DataEncoder(pendingHeapRefs);
-  pushMessageHeader(encoder, MessageType.Evaluate);
+  encoder.pushU8(MessageType.Evaluate);
   encodePayload(encoder);
 
   return handleBinaryResponse(
@@ -177,7 +169,7 @@ function handleBinaryResponse(
   }
 
   const decoder = new DataDecoder(response);
-  const msgType = takeMessageType(decoder);
+  const msgType = decoder.takeU8();
 
   if (msgType === MessageType.Respond) {
     installDeferredHeapRefs(decoder);
@@ -191,7 +183,7 @@ function handleBinaryResponse(
 
     const pendingHeapRefs = window.jsHeap.deferHeapRefs();
     const encoder = new DataEncoder(pendingHeapRefs);
-    pushMessageHeader(encoder, MessageType.Respond);
+    encoder.pushU8(MessageType.Respond);
 
     // Push a single borrow frame for this entire Evaluate message.
     // This frame persists across all operations and nested calls.
@@ -250,11 +242,7 @@ function handleBinaryResponse(
 
 export {
   evaluate_from_rust_binary,
-  handleBinaryResponse,
   sendEvaluateToRust,
-  sync_request_binary,
-  MessageType,
   DROP_NATIVE_REF_FN_ID,
   CALL_EXPORT_FN_ID,
-  pushMessageHeader,
 };
