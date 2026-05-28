@@ -230,6 +230,16 @@ fn build_tests() -> Vec<TestCase> {
         deferred_heap_refs::test_nested_js_request_keeps_rust_deferred_heap_ref_frame,
     ));
 
+    tests.push(sync_test(
+        trial_name(
+            "deferred_heap_refs",
+            "test_owned_deferred_heap_ref_can_be_used_before_drop",
+            BatchMode::NonBatched,
+        ),
+        BatchMode::NonBatched,
+        deferred_heap_refs::test_owned_deferred_heap_ref_can_be_used_before_drop,
+    ));
+
     tests.push(async_test_with_timeout(
         trial_name(
             "opaque_id_stress",

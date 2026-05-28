@@ -37,7 +37,6 @@ interface MessageHeader {
 }
 
 let nextJsRequestId = 1;
-const installedDeferredHeapRefRequests: Set<number> = new Set();
 
 function allocateJsRequestId(): number {
   const id = nextJsRequestId;
@@ -195,14 +194,9 @@ function installDeferredHeapRefFrames(decoder: DataDecoder): void {
   for (let i = 0; i < frameCount; i++) {
     const requestId = decoder.takeU32();
     const ids = takeIdList(decoder);
-    const dropAfterInstall = takeIdList(decoder);
     const installed = window.jsHeap.resolveDeferredHeapRefs(requestId, ids);
-    if (!installed && !installedDeferredHeapRefRequests.has(requestId)) {
+    if (!installed) {
       throw new Error(`Unknown deferred heap-ref request ID: ${requestId}`);
-    }
-    installedDeferredHeapRefRequests.add(requestId);
-    for (const id of dropAfterInstall) {
-      window.jsHeap.remove(id);
     }
   }
 }

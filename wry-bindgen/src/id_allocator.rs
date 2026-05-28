@@ -95,10 +95,9 @@ fn next_heap_id_after(id: u64) -> u64 {
 }
 
 #[derive(Clone)]
-pub(crate) struct PendingInstallIds {
+pub(crate) struct InstallIdBatch {
     pub(crate) request_id: u32,
     pub(crate) ids: Vec<u64>,
-    pub(crate) drop_after_install: Vec<u64>,
 }
 
 struct HeapIds {
@@ -107,10 +106,7 @@ struct HeapIds {
     /// after each one is done.
     ids_to_free: Vec<Vec<u64>>,
     /// Heap IDs assigned to objects JS sent to Rust without encoding an ID.
-    pending_install_ids: BTreeMap<u32, Vec<u64>>,
-    /// Pending install IDs whose Rust owner was dropped before JS acknowledged
-    /// installing them.
-    pending_install_drops: BTreeMap<u32, Vec<u64>>,
+    queued_install_ids: BTreeMap<u32, Vec<u64>>,
     /// IDs reserved as placeholders for JS function return values.
     reserved_placeholder_ids: Vec<u64>,
 }
@@ -120,8 +116,7 @@ impl HeapIds {
         Self {
             slab: IdSlab::new(JSIDX_RESERVED),
             ids_to_free: Vec::new(),
-            pending_install_ids: BTreeMap::new(),
-            pending_install_drops: BTreeMap::new(),
+            queued_install_ids: BTreeMap::new(),
             reserved_placeholder_ids: Vec::new(),
         }
     }
@@ -144,7 +139,7 @@ impl HeapIds {
 
     fn next_inbound_js_heap_id(&mut self, request_id: u32) -> u64 {
         let id = self.slab.alloc();
-        self.pending_install_ids
+        self.queued_install_ids
             .entry(request_id)
             .or_default()
             .push(id);
@@ -157,10 +152,6 @@ impl HeapIds {
         }
 
         self.slab.release(id);
-
-        if self.mark_pending_install_dropped(id) {
-            return None;
-        }
 
         match self.ids_to_free.last_mut() {
             Some(ids) => {
@@ -199,46 +190,15 @@ impl HeapIds {
         }
     }
 
-    fn pending_install_id_batches(&self) -> Vec<PendingInstallIds> {
-        self.pending_install_ids
-            .iter()
-            .map(|(&request_id, ids)| PendingInstallIds {
-                request_id,
-                ids: ids.clone(),
-                drop_after_install: self
-                    .pending_install_drops
-                    .get(&request_id)
-                    .cloned()
-                    .unwrap_or_default(),
-            })
+    fn take_queued_install_id_batches(&mut self) -> Vec<InstallIdBatch> {
+        core::mem::take(&mut self.queued_install_ids)
+            .into_iter()
+            .map(|(request_id, ids)| InstallIdBatch { request_id, ids })
             .collect()
-    }
-
-    fn ack_pending_install_id(&mut self, request_id: u32) {
-        self.pending_install_ids.remove(&request_id);
-        if let Some(dropped_ids) = self.pending_install_drops.remove(&request_id) {
-            for dropped_id in dropped_ids {
-                self.recycle_heap_id(dropped_id);
-            }
-        }
     }
 
     fn take_reserved_placeholder_ids(&mut self) -> Vec<u64> {
         core::mem::take(&mut self.reserved_placeholder_ids)
-    }
-
-    fn mark_pending_install_dropped(&mut self, id: u64) -> bool {
-        for (&request_id, ids) in &self.pending_install_ids {
-            if ids.contains(&id) {
-                self.pending_install_drops
-                    .entry(request_id)
-                    .or_default()
-                    .push(id);
-                return true;
-            }
-        }
-
-        false
     }
 }
 
@@ -402,14 +362,9 @@ impl IdAllocator {
         self.heap.pop_and_release_ids()
     }
 
-    /// Get unresolved ID batches JS should install for objects it sent to Rust.
-    pub(crate) fn pending_install_id_batches(&self) -> Vec<PendingInstallIds> {
-        self.heap.pending_install_id_batches()
-    }
-
-    /// Mark deferred JS heap-ref requests as installed by JS.
-    pub(crate) fn ack_pending_install_id(&mut self, request_id: u32) {
-        self.heap.ack_pending_install_id(request_id);
+    /// Take ID batches JS should install for objects it sent to Rust.
+    pub(crate) fn take_queued_install_id_batches(&mut self) -> Vec<InstallIdBatch> {
+        self.heap.take_queued_install_id_batches()
     }
 
     /// Take IDs JS should reserve for pending Rust-to-JS return values.
@@ -492,15 +447,20 @@ mod tests {
     }
 
     #[test]
-    fn pending_install_drop_recycles_only_after_ack() {
+    fn inbound_drop_uses_normal_release_path() {
         let mut heap = HeapIds::new();
         let id = heap.next_inbound_js_heap_id(7);
-        assert_eq!(heap.release_heap_id(id), None);
+        assert_eq!(heap.release_heap_id(id), Some(id));
 
         let next = heap.next_placeholder_id();
         assert_ne!(next, id);
 
-        heap.ack_pending_install_id(7);
+        let batches = heap.take_queued_install_id_batches();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].request_id, 7);
+        assert_eq!(batches[0].ids, vec![id]);
+
+        heap.recycle_heap_id(id);
         assert_eq!(heap.next_placeholder_id(), id);
     }
 
@@ -513,10 +473,11 @@ mod tests {
         ];
         assert_eq!(ids, [JSIDX_RESERVED, JSIDX_RESERVED + 1]);
 
-        let batches = heap.pending_install_id_batches();
+        let batches = heap.take_queued_install_id_batches();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].request_id, 7);
         assert_eq!(batches[0].ids, ids);
+        assert!(heap.take_queued_install_id_batches().is_empty());
     }
 
     #[test]

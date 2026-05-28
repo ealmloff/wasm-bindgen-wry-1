@@ -38,3 +38,22 @@ pub(crate) fn test_nested_js_request_keeps_rust_deferred_heap_ref_frame() {
     );
     assert_eq!(read_deferred_heap_ref_label(&value), 77);
 }
+
+pub(crate) fn test_owned_deferred_heap_ref_can_be_used_before_drop() {
+    #[wasm_bindgen(inline_js = r#"
+        export function make_owned_deferred_heap_ref() {
+            return { label: 91 };
+        }
+
+        export function read_owned_deferred_heap_ref_label(obj) {
+            return obj.label;
+        }
+    "#)]
+    extern "C" {
+        fn make_owned_deferred_heap_ref() -> JsValue;
+        fn read_owned_deferred_heap_ref_label(obj: JsValue) -> u32;
+    }
+
+    let value = make_owned_deferred_heap_ref();
+    assert_eq!(read_owned_deferred_heap_ref_label(value), 91);
+}

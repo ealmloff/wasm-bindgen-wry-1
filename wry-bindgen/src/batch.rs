@@ -10,7 +10,7 @@ use core::cell::RefCell;
 use std::boxed::Box;
 
 use crate::encode::{BatchableResult, BinaryDecode};
-use crate::id_allocator::{IdAllocator, PendingInstallIds};
+use crate::id_allocator::{IdAllocator, InstallIdBatch};
 use crate::ipc::DecodedData;
 use crate::ipc::{EncodedData, JsConsumedAction, MessageType, OutboundIPCMessage};
 use crate::lazy::ThreadLocalKey;
@@ -165,9 +165,9 @@ impl Runtime {
         mut encoder: EncodedData,
         reserved_ids: Option<&[u64]>,
     ) -> OutboundIPCMessage {
-        let install_ids = self.pending_install_id_batches();
+        let install_ids = self.take_queued_install_id_batches();
         prepend_rust_to_js_prelude(&mut encoder, &install_ids, reserved_ids);
-        let actions = take_js_consumed_actions(&mut encoder, &install_ids);
+        let actions = encoder.take_js_consumed_actions();
         OutboundIPCMessage::new(
             crate::ipc::IPCMessage::new(encoder.to_bytes()),
             self.current_js_request_id(),
@@ -221,14 +221,9 @@ impl Runtime {
         self.is_batching
     }
 
-    /// Get unresolved ID batches JS should install for objects it sent to Rust.
-    pub(crate) fn pending_install_id_batches(&self) -> Vec<PendingInstallIds> {
-        self.id_allocator.pending_install_id_batches()
-    }
-
-    /// Mark deferred JS heap-ref requests as installed by JS.
-    pub(crate) fn ack_pending_install_id(&mut self, request_id: u32) {
-        self.id_allocator.ack_pending_install_id(request_id);
+    /// Take ID batches JS should install for objects it sent to Rust.
+    pub(crate) fn take_queued_install_id_batches(&mut self) -> Vec<InstallIdBatch> {
+        self.id_allocator.take_queued_install_id_batches()
     }
 
     /// Take IDs JS should reserve for pending Rust-to-JS return values.
@@ -274,9 +269,6 @@ impl Runtime {
     ) {
         for action in actions {
             match action {
-                JsConsumedAction::HeapRefsInstalled { request_id } => {
-                    self.ack_pending_install_id(request_id);
-                }
                 JsConsumedAction::TypeDefinitionParsed { type_id } => {
                     self.ack_type_id(type_id);
                 }
@@ -366,18 +358,17 @@ fn push_id_list(buf: &mut Vec<u32>, ids: &[u64]) {
     }
 }
 
-fn push_install_batches(buf: &mut Vec<u32>, batches: &[PendingInstallIds]) {
+fn push_install_batches(buf: &mut Vec<u32>, batches: &[InstallIdBatch]) {
     buf.push(batches.len() as u32);
     for batch in batches {
         buf.push(batch.request_id);
         push_id_list(buf, &batch.ids);
-        push_id_list(buf, &batch.drop_after_install);
     }
 }
 
 fn prepend_rust_to_js_prelude(
     encoder: &mut EncodedData,
-    install_ids: &[PendingInstallIds],
+    install_ids: &[InstallIdBatch],
     reserved_ids: Option<&[u64]>,
 ) {
     let mut prelude = Vec::new();
@@ -386,20 +377,6 @@ fn prepend_rust_to_js_prelude(
         push_id_list(&mut prelude, reserved_ids);
     }
     encoder.insert_u32s(1, &prelude);
-}
-
-fn take_js_consumed_actions(
-    encoder: &mut EncodedData,
-    install_ids: &[PendingInstallIds],
-) -> Vec<JsConsumedAction> {
-    let mut actions: Vec<_> = install_ids
-        .iter()
-        .map(|batch| JsConsumedAction::HeapRefsInstalled {
-            request_id: batch.request_id,
-        })
-        .collect();
-    actions.extend(encoder.take_js_consumed_actions());
-    actions
 }
 
 thread_local! {

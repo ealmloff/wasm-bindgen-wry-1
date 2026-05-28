@@ -111,8 +111,6 @@ pub(crate) struct MessageHeader {
 /// Internal action Rust can take once JS has consumed a Rust-to-JS message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JsConsumedAction {
-    /// JS installed heap IDs for values it previously sent without IDs.
-    HeapRefsInstalled { request_id: u32 },
     /// JS parsed a full callback type definition and can now accept its cache ID.
     TypeDefinitionParsed { type_id: u32 },
 }
