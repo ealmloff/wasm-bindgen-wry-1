@@ -84,7 +84,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          pr_number="$(gh api \
+          pr_number="$(gh api -X GET \
             "/repos/$GITHUB_REPOSITORY/pulls" \
             -f state=open \
             -f head="$GITHUB_REPOSITORY_OWNER:$UPDATE_BRANCH" \
