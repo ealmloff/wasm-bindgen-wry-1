@@ -131,7 +131,7 @@ jobs:
           existing_patch_count=0
           patch_count=0
 
-          mkdir -p "$log_dir"
+          mkdir -p "$log_dir" patches/wasm-bindgen
           rm -f "$failure_file"
           existing_patch_count="$(find patches/wasm-bindgen -name '*.patch' -type f 2>/dev/null | wc -l | tr -d ' ')"
 
