@@ -210,10 +210,10 @@ impl AuxReceiverKind {
 
 #[derive(Debug)]
 pub struct AuxEnum {
-    /// The name of this enum
+    /// The JS name of this enum. The flat namespace-qualified form used
+    /// for wasm-symbol generation is computed on demand from
+    /// `(js_namespace, name)` via [`wasm_bindgen_shared::qualified_name`].
     pub name: String,
-    /// The namespace-qualified name (used for wasm symbol generation)
-    pub qualified_name: String,
     /// The copied Rust comments to forward to JS
     pub comments: String,
     /// A list of variants with their name, value and comments
@@ -282,12 +282,11 @@ pub enum AuxDynamicUnionVariant {
 
 #[derive(Debug)]
 pub struct AuxStruct {
-    /// The JS name of this struct (used for JS output)
+    /// The JS name of this struct (used for JS output).
+    /// The flat namespace-qualified form used for wasm-symbol generation
+    /// and as the `exported_classes` key is computed on demand from
+    /// `(js_namespace, name)` via [`wasm_bindgen_shared::qualified_name`].
     pub name: String,
-    /// The Rust name of this struct (used as internal key, matches js_class on exports)
-    pub rust_name: String,
-    /// The namespace-qualified name (used for wasm symbol generation)
-    pub qualified_name: String,
     /// The copied Rust comments to forward to JS
     pub comments: String,
     /// Whether to generate helper methods for inspecting the class
@@ -298,10 +297,19 @@ pub struct AuxStruct {
     pub private: bool,
     /// The namespace to export the struct through, if any
     pub js_namespace: Option<Vec<String>>,
-    /// The JS name of the parent class this struct extends, if any.
-    /// Populated when the source `#[wasm_bindgen(extends = Parent)]`
-    /// attribute was set on the exported struct.
+    /// The Rust ident (last segment) of the parent type this struct
+    /// extends, if any. Populated from `#[wasm_bindgen(extends = Parent)]`
+    /// on the exported struct.
     pub extends: Option<String>,
+    /// The parent class's JS-side `js_name`, declared on the child via
+    /// `extends_js_class = "..."`. Required when the parent struct uses
+    /// `js_name`. Defaults to the last segment of the `extends` Rust path
+    /// at parse time so the no-rename case works without user action.
+    pub extends_js_class: Option<String>,
+    /// The parent class's JS-side `js_namespace`, declared on the child
+    /// via `extends_js_namespace = ...`. Required when the parent struct
+    /// uses `js_namespace`.
+    pub extends_js_namespace: Option<Vec<String>>,
 }
 
 /// All possible types of imports that can be imported by a Wasm module.

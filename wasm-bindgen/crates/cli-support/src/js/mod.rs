@@ -71,6 +71,16 @@ impl ImportDefinition {
     }
 }
 
+/// Files produced by `Context::finalize`.
+pub struct FinalizedOutput {
+    pub js: String,
+    pub ts: String,
+    pub start: Option<String>,
+    /// Content to write alongside the main JS as a sidecar that emcc loads
+    /// with `--extern-pre-js`. Empty for non-emscripten output modes.
+    pub emscripten_extern_pre_js: String,
+}
+
 pub struct Context<'a> {
     globals: String,
     /// ES module `import` statements collected during codegen, emitted at the
@@ -79,6 +89,13 @@ pub struct Context<'a> {
     es_module_imports: String,
     intrinsics: Option<BTreeMap<Cow<'static, str>, Cow<'static, str>>>,
     emscripten_library: String,
+    /// ESM `import { ... } from "..."` statements collected for the
+    /// emscripten output mode. Written to a sidecar `library_bindgen.extern-pre.js`
+    /// that emcc loads via `--extern-pre-js` so the imports land at module
+    /// top-level (where ESM imports are legal) instead of inside emcc's
+    /// modularize wrapper. The library functions inlined by `--js-library`
+    /// reference these bindings via lexical closure.
+    emscripten_extern_pre_js: String,
     imports_post: String,
     export_name_list: Vec<String>,
     typescript: String,
@@ -149,20 +166,33 @@ pub struct Context<'a> {
     /// `__wbg_reset_state` function.
     generate_reinit: bool,
 
-    /// Mapping from qualified name (used in WasmDescribe) to rust_name (used as exported_classes key).
-    pub(crate) qualified_to_rust_name: HashMap<String, String>,
-
     /// Mapping from qualified name (used in WasmDescribe) to the unique declaration identifier.
     pub(crate) qualified_to_identifier: HashMap<String, String>,
-    /// Tracks dependencies (Emscripten imports) for the current adapter being generated.
-    /// Must be cleared at the start of `generate_adapter`.
+    /// Cumulative set of every emscripten library symbol that any generated
+    /// adapter (import, export, or standalone) has referenced. Populated by
+    /// `intrinsic()` and by direct `.insert()` calls in `expose_*` helpers.
+    ///
+    /// Used to derive:
+    ///   - per-import `__deps` entries (via snapshot/diff during
+    ///     `generate_adapter` for the `Import` kind, stored in
+    ///     `emscripten_import_deps`).
+    ///   - `$initBindgen__deps` (read directly — every Export/Adapter body is
+    ///     inlined into `$initBindgen`, so the cumulative set is exactly what
+    ///     emcc needs to keep alive).
+    ///
+    /// Effectively only meaningful in `OutputMode::Emscripten`; inserts on
+    /// other modes are harmless but unused.
     adapter_deps: BTreeSet<String>,
 
-    /// Tracks global emscripten dependencies as opposed to adapter-level dependencies.
+    /// Global library symbols that wasm-bindgen unconditionally *creates* in
+    /// the emscripten library file (e.g. `$heap`, `$WASM_VECTOR_LEN`,
+    /// `$HEAP_DATA_VIEW`). Drives the top-of-library `addToLibrary({...})`
+    /// block in `generate_emscripten_imports` and is unioned into
+    /// `extraLibraryFuncs` so emcc keeps them.
     emscripten_global_deps: BTreeSet<String>,
 
-    /// Tracks the specific Emscripten dependencies for each individual Wasm import.
-    /// These are gathered from `adapter_deps` during adapter generation.
+    /// Per-import `__deps` arrays, computed by snapshotting `adapter_deps`
+    /// before generating each import and diffing afterwards.
     emscripten_import_deps: BTreeMap<ImportId, BTreeSet<String>>,
 
     /// `true` when the module's memory is a memory64 (wasm64) memory.
@@ -241,8 +271,6 @@ struct ExportedClass {
     js_namespace: Option<Vec<String>>,
     /// The JS-facing name of this class (used for JS output)
     js_name: Option<String>,
-    /// The namespace-qualified name (used for wasm symbol references)
-    qualified_name: Option<String>,
     /// The JS name of the parent class this class extends, if any.
     /// Sourced from `AuxStruct.extends` via the `#[wasm_bindgen(extends)]`
     /// attribute on an exported Rust struct. The parent class is expected
@@ -253,10 +281,11 @@ struct ExportedClass {
     /// `populate_inheritance_chains` before any JS emission so that
     /// constructor, `__wrap`, `free`, and method-body emitters all see a
     /// consistent per-class view of the chain. Each entry is
-    /// `(js_name, qualified_name)` — js_name is used for the JS instance
-    /// field (`this.__wbg_ptr_<JsName>`), qualified_name keys the wasm
-    /// symbol names for `upcast_function` / `free_function`.
-    ancestors: Vec<(String, String, String)>,
+    /// `(identifier, qualified_name)` — `identifier` is the class's
+    /// auto-sanitized JS ident (used as the `__wbg_ptr_<Ident>` field
+    /// suffix), `qualified_name` is the `exported_classes` key (used for
+    /// `upcast_function` / `free_function` symbol names).
+    ancestors: Vec<(String, String)>,
     /// True if this class either declares `extends` or is extended by some
     /// other class. Non-participating classes keep the single-pointer
     /// `this.__wbg_ptr` representation for backward compatibility.
@@ -323,9 +352,9 @@ impl<'a> Context<'a> {
             memories: Default::default(),
             table_indices: Default::default(),
             stack_pointer_shim_injected: false,
-            qualified_to_rust_name: Default::default(),
             qualified_to_identifier: Default::default(),
             emscripten_library: String::new(),
+            emscripten_extern_pre_js: String::new(),
             adapter_deps: Default::default(),
             emscripten_global_deps: Default::default(),
             emscripten_import_deps: Default::default(),
@@ -377,27 +406,83 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// A helper function to add any necessary addToLibrary wrappings for Emscripten
-    fn export_to_emscripten(&mut self, js_name: &str, raw_js: &str) {
-        let content = raw_js.trim().to_string();
-
+    /// Emit a wasm-bindgen-generated JS snippet as an entry in the emscripten
+    /// JS library, with explicit dependency tracking via `__deps`.
+    ///
+    /// Three input shapes are accepted:
+    ///
+    /// 1. **Already an `addToLibrary({...})` call** — passed through verbatim.
+    ///    The caller has full control over the registration shape (multiple
+    ///    keys, postsets, etc.). `deps` is ignored in this case.
+    /// 2. **Function declaration** `function name(args) { body }` — converted
+    ///    to `addToLibrary({ $name: function(args) { body }, $name__deps: [...] })`.
+    ///    This avoids leaving a file-scope copy of the function in the library
+    ///    file that would be evaluated outside of any library symbol scope.
+    /// 3. **Anything else** — wrapped as `addToLibrary({ $name: "expr",
+    ///    $name__deps: [...] })`, treating the snippet as a value initializer.
+    fn export_to_emscripten(&mut self, js_name: &str, raw_js: &str, deps: &[&str]) {
+        let content = raw_js.trim();
         if content.is_empty() {
             return;
         }
 
-        self.emscripten_library(&content);
-
-        if !content.contains("addToLibrary") {
-            self.emscripten_library(&format!("addToLibrary({{ '${js_name}': {js_name} }});"));
+        // Pre-formatted `addToLibrary({...})` block — pass through unchanged.
+        if content.contains("addToLibrary") {
+            self.emscripten_library(content);
+            return;
         }
+
+        let deps_str = if deps.is_empty() {
+            String::new()
+        } else {
+            let formatted: Vec<String> = deps.iter().map(|d| format!("'${d}'")).collect();
+            format!(",\n    ${js_name}__deps: [{}]", formatted.join(", "))
+        };
+
+        // Function declaration of the form `function js_name(args) { body }`.
+        // We strip the leading name so the function body becomes a value
+        // inside the addToLibrary literal.
+        let prefix = format!("function {js_name}");
+        if let Some(after_name) = content.strip_prefix(&prefix) {
+            let after_name = after_name.trim_start();
+            if after_name.starts_with('(') {
+                self.emscripten_library(&format!(
+                    "addToLibrary({{\n    ${js_name}: function{after_name}{deps_str}\n}});"
+                ));
+                return;
+            }
+        }
+
+        // Otherwise treat as a value expression.
+        self.emscripten_library(&format!(
+            "addToLibrary({{\n    ${js_name}: \"{}\"{deps_str}\n}});",
+            content.replace('\\', "\\\\").replace('"', "\\\""),
+        ));
     }
 
+    /// Register a wasm-bindgen-internal helper as an intrinsic.
+    ///
+    /// `deps` lists library symbols the intrinsic body itself references by
+    /// bare name (e.g. `addHeapObject` references `heap` and `heap_next`).
+    /// In emscripten mode these become the `$name__deps` array on the
+    /// emitted library entry; in other modes they're unused. Pass `&[]` for
+    /// helpers that only reference other JS values.
     fn intrinsic(
         &mut self,
         name: Cow<'static, str>,
         js_name: Option<&str>,
         val: Cow<'static, str>,
+        deps: &[&str],
     ) {
+        // On emscripten, always register the dep on the current adapter even
+        // if the intrinsic itself has already been emitted by a previous
+        // adapter. The `__deps` accounting needs every caller -> callee edge,
+        // not just the first-discovered one.
+        if matches!(self.config.mode, OutputMode::Emscripten) && !val.trim().is_empty() {
+            let actual_js_name: &str = js_name.unwrap_or(&name);
+            self.adapter_deps.insert(actual_js_name.to_string());
+        }
+
         if self.intrinsics.as_ref().unwrap().contains_key(&name) {
             return;
         }
@@ -405,13 +490,11 @@ impl<'a> Context<'a> {
         if matches!(self.config.mode, OutputMode::Emscripten) {
             let actual_js_name: &str = js_name.unwrap_or(&name);
 
-            // Only add as a dependency and export if there's actual content.
-            // Empty content means the intrinsic is handled elsewhere (e.g. via
-            // emscripten_global_deps), so registering a dep here would create a
-            // reference to a non-existent library variable.
+            // Only emit the library entry if there's actual content. Empty
+            // content means the intrinsic is handled elsewhere (e.g. via
+            // emscripten_global_deps).
             if !val.trim().is_empty() {
-                self.adapter_deps.insert(actual_js_name.to_string());
-                self.export_to_emscripten(actual_js_name, &val);
+                self.export_to_emscripten(actual_js_name, &val, deps);
             }
 
             // Register empty string so standard generation skips this key
@@ -499,18 +582,12 @@ impl<'a> Context<'a> {
                     if let Some(c) = comments {
                         self.globals.push_str(c);
                     }
+                    self.globals.push_str(decl);
 
-                    if decl.trim_start().starts_with("const") {
-                        self.globals.push_str("export ");
-                        self.globals.push_str(decl);
+                    if export_name == id {
+                        self.global(&format!("Module.{export_name} = {id};\n"));
                     } else {
-                        self.globals.push_str(decl);
-
-                        if export_name == id {
-                            self.global(&format!("Module.{export_name} = {id};\n"));
-                        } else {
-                            self.global(&format!("export {{ {id} as {export_name} }};\n"));
-                        }
+                        self.global(&format!("export {{ {id} as {export_name} }};\n"));
                     }
                 }
             }
@@ -533,10 +610,7 @@ impl<'a> Context<'a> {
         }
     }
 
-    pub fn finalize(
-        &mut self,
-        module_name: &str,
-    ) -> Result<(String, String, Option<String>), Error> {
+    pub fn finalize(&mut self, module_name: &str) -> Result<FinalizedOutput, Error> {
         // Finalize all bindings for JS classes. This is where we'll generate JS
         // glue for all classes as well as finish up a few final imports like
         // `__wrap` and such.
@@ -755,6 +829,16 @@ impl<'a> Context<'a> {
                 ts.push('\n');
             }
             ts.push_str("}\n\n");
+            // Make the file an ES module so the preceding `declare class
+            // <mangled>` / `declare enum <mangled>` / `declare function
+            // <mangled>` declarations are module-scoped, not global. In a
+            // script-context .d.ts these would otherwise leak into the
+            // global type namespace, allowing consumers to write
+            // `const x: app__math__Calc = ...` and depend on the mangled
+            // identifier — which is exactly what Bug 1 is about. The
+            // `BindgenModule` interface is exported so the factory's
+            // return type stays nameable from consumer code.
+            ts.push_str("export { BindgenModule };\n");
         } else {
             ts.push_str(&self.typescript);
         }
@@ -780,7 +864,12 @@ impl<'a> Context<'a> {
             ts.push_str(&node_atomics_ts);
         }
 
-        Ok((self.globals.to_owned(), ts, start))
+        Ok(FinalizedOutput {
+            js: self.globals.to_owned(),
+            ts,
+            start,
+            emscripten_extern_pre_js: std::mem::take(&mut self.emscripten_extern_pre_js),
+        })
     }
 
     fn generate_esm_cjs_imports(&mut self, module_name: &str, has_memory: bool) -> String {
@@ -919,6 +1008,17 @@ impl<'a> Context<'a> {
                 imports.push_str("$heap_next: '0',\n");
             } else if global_dep == "stack_pointer" {
                 imports.push_str(&format!("$stack_pointer : \"{INITIAL_HEAP_OFFSET}\",\n"));
+            } else if global_dep == "HEAP_DATA_VIEW" {
+                // wasm-bindgen reads/writes the wasm heap as a `DataView` for
+                // unaligned/typed accesses. Upstream emscripten only declares
+                // `HEAP_DATA_VIEW` when `SUPPORT_BIG_ENDIAN` is enabled, so
+                // for the common little-endian case we declare it ourselves
+                // and wrap `updateMemoryViews` so it is (re)created at module
+                // startup and whenever wasm memory grows.
+                imports.push_str(
+                    "$HEAP_DATA_VIEW: 'undefined',\n\
+                     $HEAP_DATA_VIEW__postset: \"var __wbg_origUpdateMemoryViews = updateMemoryViews; updateMemoryViews = function () { __wbg_origUpdateMemoryViews(); HEAP_DATA_VIEW = new DataView(wasmMemory.buffer); };\",\n",
+                );
             }
         }
         imports.push_str("});\n\n");
@@ -1000,8 +1100,16 @@ impl<'a> Context<'a> {
             }
 
             OutputMode::Emscripten => {
+                // ESM `import` statements must be at module top-level — they
+                // can't live inside emcc's modularize wrapper (which is where
+                // `library_bindgen.js` content gets inlined). Collect them in
+                // a separate buffer that we write to `library_bindgen.extern-pre.js`;
+                // emcc's `--extern-pre-js` prepends that verbatim before the
+                // wrapper. The library functions inside the wrapper close over
+                // these top-level bindings lexically, so `__wbg_foo` can call
+                // an imported `bar()` directly.
                 for (module, items) in crate::sorted_iter(&self.js_imports) {
-                    write_es_import(&mut self.globals, module, items);
+                    write_es_import(&mut self.emscripten_extern_pre_js, module, items);
                 }
             }
 
@@ -1558,7 +1666,21 @@ if (require('worker_threads').isMainThread) {{
         needs_manual_start: bool,
         classes_and_exports: &str,
     ) -> String {
-        let formatted_deps: Vec<String> = self
+        // `$initBindgen` inlines every Export/Adapter body, so its `__deps`
+        // must list every library symbol any adapter referenced (Imports'
+        // deps are handled separately via per-import `__deps`). Emcc's
+        // library tree-shaker doesn't trace bare-name references inside
+        // function bodies, so we have to enumerate explicitly. We union
+        // `adapter_deps` with `emscripten_global_deps` so symbols that are
+        // *only* declared globally (e.g. `$heap`) are also pulled in.
+        let init_deps: BTreeSet<&str> = std::iter::once("addOnInit")
+            .chain(std::iter::once("wasm"))
+            .chain(self.adapter_deps.iter().map(String::as_str))
+            .chain(self.emscripten_global_deps.iter().map(String::as_str))
+            .collect();
+        let init_dep_refs: Vec<String> = init_deps.iter().map(|d| format!("'${d}'")).collect();
+
+        let global_dep_refs: Vec<String> = self
             .emscripten_global_deps
             .iter()
             .map(|dep| format!("'${dep}'"))
@@ -1573,7 +1695,7 @@ if (require('worker_threads').isMainThread) {{
         format!(
             r#"
             addToLibrary({{
-                $initBindgen__deps: ['$addOnInit'],
+                $initBindgen__deps: [{init_deps}],
                 $initBindgen__postset: 'addOnInit(initBindgen);',
                 $initBindgen: () => {{
                     wasm = wasmExports;
@@ -1587,9 +1709,10 @@ if (require('worker_threads').isMainThread) {{
                 }}
             }});
 
-            extraLibraryFuncs.push('$initBindgen', '$addOnInit', '$wasm', {formatted_deps});
+            extraLibraryFuncs.push('$initBindgen', '$addOnInit', '$wasm', {global_deps});
             "#,
-            formatted_deps = formatted_deps.join(", ")
+            init_deps = init_dep_refs.join(", "),
+            global_deps = global_dep_refs.join(", "),
         )
     }
 
@@ -1645,16 +1768,12 @@ if (require('worker_threads').isMainThread) {{
         }
     }
 
-    /// Resolve a class name to the key used in `exported_classes`.
-    /// The name could be a `rust_name` (direct key) or a `qualified_name`
-    /// (from WasmDescribe), which needs to be mapped to the `rust_name`.
+    /// Resolve a class name to the key used in `exported_classes`. Classes are
+    /// keyed by their qualified JS identity, which is exactly what callers
+    /// already hold (from WasmDescribe / `js_class`), so this is a direct
+    /// passthrough. Kept as a single named choke point in case key
+    /// normalization is needed again.
     pub(crate) fn resolve_class_name<'b>(&'b self, name: &'b str) -> &'b str {
-        if self.exported_classes.contains_key(name) {
-            return name;
-        }
-        if let Some(rust_name) = self.qualified_to_rust_name.get(name) {
-            return rust_name;
-        }
         name
     }
 
@@ -1664,8 +1783,9 @@ if (require('worker_threads').isMainThread) {{
     /// chain is truncated there (the missing-parent error is reported later
     /// during `write_class` with better span info).
     fn populate_inheritance_chains(&mut self) {
-        // Resolve a chain of rust_name keys first (so cycle detection works),
-        // then translate to (js_name, qualified_name) pairs for emission.
+        // Resolve a chain of `exported_classes` keys first (so cycle
+        // detection works), then translate to `(identifier, qualified_name)`
+        // pairs for emission in `resolved_chain` below.
         let mut updates: Vec<(String, Vec<String>)> = Vec::new();
         let keys: Vec<String> = self.exported_classes.keys().cloned().collect();
         for key in &keys {
@@ -1679,9 +1799,11 @@ if (require('worker_threads').isMainThread) {{
                 None => continue,
             };
             loop {
-                // Resolve via the same rules `write_class` uses: key may be
-                // either the parent's rust_name or its js_name. Fall back to
-                // scanning by js_name if the direct key lookup fails.
+                // `extends` is stored as the parent's qualified JS identity
+                // (the `exported_classes` key). Direct lookup hits the
+                // parent's entry. The `js_name` fallback covers the edge
+                // case where a parent was registered under a key that
+                // differs from its current `js_name` (rare, defensive).
                 let resolved_key = if self.exported_classes.contains_key(&cursor) {
                     cursor.clone()
                 } else {
@@ -1716,28 +1838,20 @@ if (require('worker_threads').isMainThread) {{
         // Mark every subclass with its chain and flag participation on both
         // sides of every edge.
         for (child, chain) in &updates {
-            // For each ancestor we keep three names:
+            // For each ancestor we keep two names:
             //   0. `identifier`: the class's auto-sanitized JS identifier,
             //      used as a `__wbg_ptr_<Ident>` property suffix and as a
             //      JS-side reference (always a valid JS ident).
-            //   1. `rust_name`: the parent's Rust struct identifier (== the
-            //      key in `exported_classes`). Used to derive the upcast
-            //      wasm symbol so the name matches what the macro emits —
-            //      the macro derives the parent half of `upcast_function`
-            //      from `parent_path.segments.last().ident`, which is the
-            //      Rust identifier, NOT the (potentially renamed/namespaced)
-            //      qualified name.
-            //   2. `qualified_name`: used for `__wbg_<...>_free` etc., where
-            //      the macro itself emits the symbol from qualified_name.
-            let resolved_chain: Vec<(String, String, String)> = chain
+            //   1. `qualified_name`: the `exported_classes` key, used for
+            //      `__wbg_<...>_free` and `upcast_function` symbol names.
+            //      Post-keying refactor (#5154) the map key *is* the
+            //      qualified name, so `k` is used directly.
+            let resolved_chain: Vec<(String, String)> = chain
                 .iter()
                 .map(|k| {
                     let c = self.exported_classes.get(k);
                     let id = c.map(|c| c.identifier.clone()).unwrap_or_else(|| k.clone());
-                    let q = c
-                        .and_then(|c| c.qualified_name.clone())
-                        .unwrap_or_else(|| id.clone());
-                    (id, k.clone(), q)
+                    (id, k.clone())
                 })
                 .collect();
             if let Some(c) = self.exported_classes.get_mut(child) {
@@ -1753,27 +1867,104 @@ if (require('worker_threads').isMainThread) {{
     }
 
     fn require_class<'b>(&'b mut self, name: &str) -> &'b mut ExportedClass {
-        // Resolve qualified_name to rust_name if needed
-        let key = if let Some(rust_name) = self.qualified_to_rust_name.get(name) {
-            rust_name.clone()
-        } else {
-            name.to_string()
-        };
+        // `name` is the qualified JS identity (`<ns>__<js_name>`). Both the
+        // struct registration and impl-block exports key `exported_classes`
+        // by qualified_name, so the name is used directly as the key.
+        let key = name.to_string();
         if self
             .exported_classes
             .get(&key)
             .is_none_or(|cls| cls.identifier.is_empty())
         {
-            let identifier_name = self
-                .exported_classes
-                .get(&key)
-                .and_then(|cls| cls.qualified_name.clone().or_else(|| cls.js_name.clone()))
-                .unwrap_or_else(|| key.clone());
-            let identifier = self.generate_identifier(&identifier_name);
+            // The key is the qualified JS identity; use it directly to
+            // seed the class's JS-side identifier.
+            let identifier = self.generate_identifier(&key);
             let class = self.exported_classes.entry(key.clone()).or_default();
-            class.identifier = identifier.clone();
+            class.identifier = identifier;
         }
         self.exported_classes.get_mut(&key).unwrap()
+    }
+
+    /// Verify that every impl-block class reference resolves to a
+    /// registered struct. The encoded `class` string on each export is
+    /// the qualified JS identity (`<ns>__<js_class>`), built from the
+    /// impl block's own `js_class` + `js_namespace`. The struct
+    /// registration produces the same qualified form from its `js_name`
+    /// + `js_namespace`. Both must agree exactly.
+    ///
+    /// On mismatch we produce a targeted hint:
+    ///
+    ///   1. A struct exists with matching bare `js_name` but in a
+    ///      different `js_namespace` — the user almost certainly forgot
+    ///      to repeat `js_namespace` on the impl (or got it wrong).
+    ///   2. No exact `js_name` match — fall back to fuzzy ranking across
+    ///      all registered class identities. Catches typos in `js_class`
+    ///      and surfaces the closest plausible candidate.
+    ///
+    /// Without this check the failure mode is silent: `require_class`
+    /// would mint a fresh empty entry, the namespace export would
+    /// resolve to a stub class, and the user only discovers the problem
+    /// at runtime when `new wasm.ns.Foo(...)` throws.
+    fn validate_impl_class_references(&self) -> Result<(), Error> {
+        for aux in self.aux.export_map.values() {
+            let class = match &aux.kind {
+                AuxExportKind::Constructor(c) => c,
+                AuxExportKind::Method { class, .. } => class,
+                _ => continue,
+            };
+            if self.exported_classes.contains_key(class) {
+                continue;
+            }
+            // Targeted hint: same `js_name`, different namespace. This is
+            // the most common cause: impl missed `js_namespace` (or set
+            // it to the wrong value), so its qualified identity differs
+            // from the struct's. Strip the leading namespace from the
+            // claimed `class` string before comparing against bare struct
+            // `js_name`s.
+            let bare = class.rsplit_once("__").map(|(_, n)| n).unwrap_or(class);
+            let mismatched: Vec<(&AuxStruct, String)> = self
+                .aux
+                .structs
+                .iter()
+                .filter_map(|s| {
+                    if s.name != bare {
+                        return None;
+                    }
+                    let q = wasm_bindgen_shared::qualified_name(s.js_namespace.as_deref(), &s.name);
+                    (q != *class).then_some((s, q))
+                })
+                .collect();
+            if !mismatched.is_empty() {
+                let hints = mismatched
+                    .iter()
+                    .map(|(s, q)| match &s.js_namespace {
+                        Some(ns) => {
+                            let ns = ns.join(", ");
+                            format!("  - `js_namespace = {ns}` (matches struct `{q}`)")
+                        }
+                        None => format!("  - no `js_namespace` (matches struct `{}`)", s.name),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                bail!(
+                    "class `{class}` referenced by an impl block does not \
+                     match any exported struct.\nhelp: a struct with the \
+                     same `js_name` exists in a different namespace. The \
+                     impl block must declare the matching `js_namespace` \
+                     (the impl macro cannot see the struct's attributes \
+                     cross-invocation):\n{hints}"
+                );
+            }
+            // General fuzzy fallback: rank against all registered class
+            // qualified names.
+            let candidates: Vec<&str> = self.exported_classes.keys().map(|s| s.as_str()).collect();
+            let hint = crate::suggest::suggest(class, candidates);
+            bail!(
+                "class `{class}` referenced by an impl block does not \
+                 match any exported struct{hint}"
+            );
+        }
+        Ok(())
     }
 
     fn write_classes(&mut self) -> Result<(), Error> {
@@ -1783,9 +1974,10 @@ if (require('worker_threads').isMainThread) {{
         // also tell whether the parent's `.d.ts` declaration was suppressed
         // via `skip_typescript` (in which case the child's `.d.ts` must NOT
         // emit `extends Parent` — that would dangle on an undeclared base).
-        // Both the map key (rust_name) and the js_name are indexed, since
-        // `#[wasm_bindgen(extends = Path)]` stores the last segment of the
-        // Rust path, which matches the js_name when no rename is in play.
+        // Both the map key (qualified name) and the js_name are indexed,
+        // since `#[wasm_bindgen(extends = Path)]` stores the last segment
+        // of the Rust path, which matches the js_name when no rename is
+        // in play.
         let class_identifiers: HashMap<String, (String, bool)> = exported_classes
             .iter()
             .flat_map(|(key, cls)| {
@@ -1812,17 +2004,19 @@ if (require('worker_threads').isMainThread) {{
         class_identifiers: &HashMap<String, (String, bool)>,
     ) -> Result<(), Error> {
         let identifier = &class.identifier;
-        // Use js_name for JS output, falling back to the key name
+        // Use js_name for JS output, falling back to the key name.
         let js_name = class.js_name.as_deref().unwrap_or(name);
-        // Use qualified_name for wasm symbol references, falling back to js_name
-        let qualified = class.qualified_name.as_deref().unwrap_or(js_name);
+        // `exported_classes` is keyed by the qualified JS identity, so the
+        // map key (`name`) is the qualified name used for wasm symbol
+        // references.
+        let qualified = name;
         // For every class in an `extends` chain we emit per-class
         // `__wbg_ptr_<Class>` fields alongside the unqualified `__wbg_ptr`
         // alias, so parent-method prototype dispatch can route through
         // the correct ancestor pointer. Resolve the ancestors' js_names
         // (field name) and qualified_names (wasm symbol base) once here.
         let participates = class.participates_in_inheritance;
-        let ancestors: Vec<(String, String, String)> = class.ancestors.clone();
+        let ancestors: Vec<(String, String)> = class.ancestors.clone();
         // Resolve the parent class identifier for `extends`, if any. Also
         // capture whether the parent emits TypeScript: a parent with
         // `skip_typescript` has no `.d.ts` declaration, so the child's TS
@@ -1834,10 +2028,16 @@ if (require('worker_threads').isMainThread) {{
         let parent_meta = match &class.extends {
             Some(parent_name) => {
                 let meta = class_identifiers.get(parent_name).cloned().ok_or_else(|| {
+                    // Fuzzy-rank against the set of registered class
+                    // identifiers so the user gets a "did you mean ...?"
+                    // hint when the parent name is misspelled or absent.
+                    let candidates: Vec<&str> =
+                        class_identifiers.keys().map(|s| s.as_str()).collect();
+                    let hint = crate::suggest::suggest(parent_name, candidates);
                     anyhow::anyhow!(
                         "class `{identifier}` extends `{parent_name}`, but no \
                          exported Rust struct named `{parent_name}` was found \
-                         in this module",
+                         in this module{hint}",
                     )
                 })?;
                 Some(meta)
@@ -1882,11 +2082,14 @@ if (require('worker_threads').isMainThread) {{
                 }
                 let mut prev_expr = String::from("ptr");
                 let mut from_qualified = qualified.to_string();
-                for (idx, (anc_id, anc_rust, anc_qualified)) in ancestors.iter().enumerate() {
+                for (idx, (anc_id, anc_qualified)) in ancestors.iter().enumerate() {
                     // The macro emits the upcast symbol as
-                    // `upcast_function(child_qualified_name, parent_rust_name)`,
-                    // so use the parent's rust_name (NOT qualified_name) here.
-                    let sym = wasm_bindgen_shared::upcast_function(&from_qualified, anc_rust);
+                    // `upcast_function(child_qualified_name, parent_qualified_name)`,
+                    // matching the qualified_name keying of
+                    // `exported_classes`. Both sides derive the parent
+                    // half from `extends_js_class` + `extends_js_namespace`
+                    // (or the defaulted-from-Rust-path equivalents).
+                    let sym = wasm_bindgen_shared::upcast_function(&from_qualified, anc_qualified);
                     let tmp = format!("__wbg_anc_{idx}");
                     body.push_str(&format!("const {tmp} = wasm.{sym}({prev_expr}) >>> 0;\n"));
                     body.push_str(&format!("obj.__wbg_ptr_{anc_id} = {tmp};\n"));
@@ -1905,7 +2108,7 @@ if (require('worker_threads').isMainThread) {{
                 parts.push(format!(
                     "__wbg_ptr_{identifier}: obj.__wbg_ptr_{identifier}"
                 ));
-                for (anc_id, _, _) in ancestors.iter() {
+                for (anc_id, _) in ancestors.iter() {
                     parts.push(format!("__wbg_ptr_{anc_id}: obj.__wbg_ptr_{anc_id}"));
                 }
                 if self.generate_reinit {
@@ -1964,7 +2167,7 @@ if (require('worker_threads').isMainThread) {{
                 "wasm.{}(tok.__wbg_ptr_{identifier} >>> 0, 1);\n",
                 wasm_bindgen_shared::free_function(qualified)
             ));
-            for (anc_id, _, anc_q) in ancestors.iter() {
+            for (anc_id, anc_q) in ancestors.iter() {
                 body.push_str(&format!(
                     "wasm.{}(tok.__wbg_ptr_{anc_id} >>> 0, 1);\n",
                     wasm_bindgen_shared::free_function(anc_q)
@@ -2073,7 +2276,7 @@ if (require('worker_threads').isMainThread) {{
             // Release JS-held ancestor Rc clones (allow_delayed=1 — the
             // child's Rc<Parent> field may still be alive). Order doesn't
             // matter because refcounts commute.
-            for (anc_id, _, anc_q) in ancestors.iter() {
+            for (anc_id, anc_q) in ancestors.iter() {
                 let anc_free = wasm_bindgen_shared::free_function(anc_q);
                 body.push_str(&format!(
                     "const __anc_{anc_id} = this.__wbg_ptr_{anc_id};\n"
@@ -2138,12 +2341,25 @@ if (require('worker_threads').isMainThread) {{
         let ts_definition = if class.generate_typescript {
             if matches!(self.config.mode, OutputMode::Emscripten) {
                 self.typescript_emscripten_classes.push_str(&class.comments);
-                self.typescript_emscripten_classes.push_str("export ");
+                // `declare` keeps the mangled identifier module-internal: it
+                // remains reachable for `typeof <mangled>` references inside
+                // the same .d.ts (used by the BindgenModule shape) but isn't
+                // re-exported to consumers, who would otherwise see e.g.
+                // `app__math__Calc` as a public type and depend on an
+                // implementation detail.
+                self.typescript_emscripten_classes.push_str("declare ");
                 self.typescript_emscripten_classes.push_str(&ts_dst);
                 self.typescript_emscripten_classes.push('\n');
 
-                self.typescript
-                    .push_str(&format!("{js_name}: typeof {identifier};\n"));
+                // A namespaced class is reachable only via the namespace
+                // (e.g. `m.app.math.Calc`), so its js_name does NOT belong
+                // as a direct BindgenModule property — that property lies
+                // about the runtime shape (`m.Calc` is undefined) and
+                // duplicates the namespace entry.
+                if class.js_namespace.is_none() {
+                    self.typescript
+                        .push_str(&format!("{js_name}: typeof {identifier};\n"));
+                }
 
                 String::new()
             } else {
@@ -2324,19 +2540,50 @@ if (require('worker_threads').isMainThread) {{
                         Some(id) => (id, true),
                         None => (self.generate_identifier(export_name), false),
                     };
-                    let ns_dst = self.write_namespace(&identifier, &ns.ns, existing)?;
+                    // For emscripten output, the root namespace target is the
+                    // module-wide `Module` object. We always treat it as
+                    // existing so `write_namespace` emits `||=` for every
+                    // nested segment — that way multiple top-level exports
+                    // sharing the same root segment (e.g. `app.x` and `app.y`)
+                    // don't clobber each other.
+                    let emit_existing =
+                        existing || matches!(self.config.mode, OutputMode::Emscripten);
+                    let ns_dst = self.write_namespace(&identifier, &ns.ns, emit_existing)?;
                     let ts_dst = if self.config.typescript {
                         Self::write_namespace_ts(&ns.ns, "")?
                     } else {
                         String::new()
                     };
-                    let definition = if !existing {
+                    let definition = if matches!(self.config.mode, OutputMode::Emscripten) {
+                        // Attach to `Module.<identifier>` and bind a local
+                        // `const` in one expression so the `ns_dst` lines
+                        // below can write unqualified `identifier.foo.bar`.
+                        format!(
+                            "const {identifier} = Module.{identifier} = Module.{identifier} || {{}};\n{ns_dst}"
+                        )
+                    } else if !existing {
                         format!("const {identifier} = {{}};\n{ns_dst}")
                     } else {
                         self.global(&ns_dst);
                         "".to_string()
                     };
-                    let ts_definition = format!("let {identifier}: {ts_dst};\n");
+                    // Emscripten splices `self.typescript` line-by-line into
+                    // `interface BindgenModule { ... }`. The module-scope
+                    // `export let foo: { ... };` form `export_def` would
+                    // produce is invalid inside an interface body (TS1131),
+                    // so push the namespace shape as a plain interface
+                    // member (`foo: { ... };`) directly and hand
+                    // `export_def` an empty `ts_definition` to skip its TS
+                    // emission path.
+                    let ts_definition = if matches!(self.config.mode, OutputMode::Emscripten) {
+                        if self.config.typescript {
+                            self.typescript
+                                .push_str(&format!("{identifier}: {ts_dst};\n"));
+                        }
+                        String::new()
+                    } else {
+                        format!("let {identifier}: {ts_dst};\n")
+                    };
                     self.export_def(
                         Some(export_name),
                         &ExportDefinition {
@@ -2431,6 +2678,7 @@ if (require('worker_threads').isMainThread) {{
                 INITIAL_HEAP_OFFSET + INITIAL_HEAP_VALUES.len(),
             )
             .into(),
+            &["heap", "heap_next"],
         );
     }
 
@@ -2451,6 +2699,7 @@ if (require('worker_threads').isMainThread) {{
                 INITIAL_HEAP_VALUES.join(", ")
             )
             .into(),
+            &[],
         );
     }
 
@@ -2464,6 +2713,7 @@ if (require('worker_threads').isMainThread) {{
             "heap_next".into(),
             None,
             "\nlet heap_next = heap.length;\n".into(),
+            &["heap"],
         );
     }
 
@@ -2475,12 +2725,14 @@ if (require('worker_threads').isMainThread) {{
             "get_object".into(),
             "getObject".into(),
             "\nfunction getObject(idx) { return heap[idx]; }\n".into(),
+            &["heap"],
         );
     }
 
     fn expose_not_defined(&mut self) {
         self.intrinsic("not_defined".into(), "notDefined".into(),
-            "\nfunction notDefined(what) { return () => { throw new Error(`${what} is not defined`); }; }\n".into()
+            "\nfunction notDefined(what) { return () => { throw new Error(`${what} is not defined`); }; }\n".into(),
+            &[],
         );
     }
 
@@ -2490,7 +2742,8 @@ if (require('worker_threads').isMainThread) {{
             function _assertNum(n) {
                 if (typeof(n) !== 'number') throw new Error(`expected a number argument, found ${typeof(n)}`);
             }
-            ".into()
+            ".into(),
+            &[],
         );
     }
 
@@ -2500,7 +2753,8 @@ if (require('worker_threads').isMainThread) {{
             function _assertBigInt(n) {
                 if (typeof(n) !== 'bigint') throw new Error(`expected a bigint argument, found ${typeof(n)}`);
             }
-            ".into()
+            ".into(),
+            &[],
         );
     }
 
@@ -2516,6 +2770,7 @@ if (require('worker_threads').isMainThread) {{
             }
             "
             .into(),
+            &[],
         );
     }
 
@@ -2529,12 +2784,14 @@ if (require('worker_threads').isMainThread) {{
                 "wasm_vector_len".into(),
                 "WASM_VECTOR_LEN".into(),
                 "".into(),
+                &[],
             );
         } else {
             self.intrinsic(
                 "wasm_vector_len".into(),
                 None,
                 "\nlet WASM_VECTOR_LEN = 0;\n".into(),
+                &[],
             );
         }
     }
@@ -2551,13 +2808,7 @@ if (require('worker_threads').isMainThread) {{
         // Ensure the encoder and its polyfills are registered
         self.expose_text_encoder(memory);
 
-        self.intrinsic(
-        ret.to_string().into(),
-        None,
-
-        {
         let is_emscripten = matches!(self.config.mode, OutputMode::Emscripten);
-
         let mem_formatted = mem.access(is_emscripten);
 
         let debug = if self.config.debug {
@@ -2607,7 +2858,7 @@ if (require('worker_threads').isMainThread) {{
         );
 
         let func_decl = format!(
-                "
+            "
                 function {ret}(arg, malloc, realloc) {{
                     {debug}{encode_as_ascii}if (offset !== len) {{
                         if (offset !== 0) {{
@@ -2625,22 +2876,14 @@ if (require('worker_threads').isMainThread) {{
                     return ptr;
                 }}
                 ",
-            );
+        );
 
-
-        if is_emscripten {
-            format!(
-                "{func_decl}
-                addToLibrary({{
-                    '${ret}': {ret},
-                    '${ret}__deps': ['$cachedTextEncoder', '$WASM_VECTOR_LEN']
-                }});\n"
-            ).into()
-        } else {
-            func_decl.into()
-        }
-        },
-    );
+        self.intrinsic(
+            ret.to_string().into(),
+            None,
+            func_decl.into(),
+            &["cachedTextEncoder", "WASM_VECTOR_LEN"],
+        );
 
         ret
     }
@@ -2694,7 +2937,10 @@ if (require('worker_threads').isMainThread) {{
                     self.adapter_deps.insert(add.to_string());
                 }
 
-                self.intrinsic(ret.to_string().into(), None, {
+                let add_name = add.to_string();
+                self.intrinsic(
+                    ret.to_string().into(),
+                    None,
                     format!(
                         "
                         function {ret}(array, malloc) {{
@@ -2708,14 +2954,18 @@ if (require('worker_threads').isMainThread) {{
                         }}
                     "
                     )
-                    .into()
-                });
+                    .into(),
+                    &[&add_name, "HEAP_DATA_VIEW", "WASM_VECTOR_LEN"],
+                );
             }
             _ => {
                 self.expose_add_heap_object();
-                self.intrinsic(ret.to_string().into(), None, {
-                    format!(
-                        "
+                self.intrinsic(
+                    ret.to_string().into(),
+                    None,
+                    {
+                        format!(
+                            "
                         function {ret}(array, malloc) {{
                             const ptr = malloc(array.length * 4, 4){ptr_coerce};
                             const mem = {mem_formatted};
@@ -2726,9 +2976,15 @@ if (require('worker_threads').isMainThread) {{
                             return ptr;
                         }}
                     "
-                    )
-                    .into()
-                });
+                        )
+                        .into()
+                    },
+                    if self.config.mode.emscripten() {
+                        &["addHeapObject", "HEAP_DATA_VIEW", "WASM_VECTOR_LEN"]
+                    } else {
+                        &[]
+                    },
+                );
             }
         }
         ret
@@ -2741,19 +2997,27 @@ if (require('worker_threads').isMainThread) {{
         };
         self.expose_wasm_vector_len();
         let ptr_coerce = self.coerce_ptr_suffix();
-        self.intrinsic(ret.to_string().into(), None, {
-            format!(
-                "
+        let is_emscripten = matches!(self.config.mode, OutputMode::Emscripten);
+        // On emscripten, heap views are global identifiers (`HEAP8`, `HEAPF64`,
+        // `HEAP_DATA_VIEW`, …) refreshed by `updateMemoryViews`. On other
+        // targets they're cache-helper functions (`getUint8Memory0()`).
+        let view_access = view.access(is_emscripten);
+        let func_decl = format!(
+            "
                 function {ret}(arg, malloc) {{
                     const ptr = malloc(arg.length * {size}, {size}){ptr_coerce};
-                    {view}().set(arg, ptr / {size});
+                    {view_access}.set(arg, ptr / {size});
                     WASM_VECTOR_LEN = arg.length;
                     return ptr;
                 }}
                 "
-            )
-            .into()
-        });
+        );
+        self.intrinsic(
+            ret.to_string().into(),
+            None,
+            func_decl.into(),
+            &[view.name.as_ref(), "WASM_VECTOR_LEN"],
+        );
         ret
     }
 
@@ -2764,21 +3028,25 @@ if (require('worker_threads').isMainThread) {{
                 .insert("cachedTextEncoder".to_string());
             self.adapter_deps.insert("cachedTextEncoder".to_string());
         }
-        self.intrinsic("text_encoder".into(), "textEncoder".into(), {
-            if is_emscripten {
-                "".into()
-            } else {
-                let mut dst = Self::write_text_processor(
-                    self.module,
-                    memory,
-                    "const",
-                    "TextEncoder",
-                    "()",
-                    None,
-                    self.config.mode.clone(),
-                );
+        self.intrinsic(
+            "text_encoder".into(),
+            "textEncoder".into(),
+            {
+                if is_emscripten {
+                    "".into()
+                } else {
+                    let mut dst = Self::write_text_processor(
+                        self.module,
+                        memory,
+                        "const",
+                        "TextEncoder",
+                        "()",
+                        None,
+                        self.config.mode.clone(),
+                    );
 
-                let polyfill_encode_into = "cachedTextEncoder.encodeInto = function (arg, view) {
+                    let polyfill_encode_into =
+                        "cachedTextEncoder.encodeInto = function (arg, view) {
                 const buf = cachedTextEncoder.encode(arg);
                 view.set(buf);
                 return {
@@ -2787,41 +3055,43 @@ if (require('worker_threads').isMainThread) {{
                 };
             };";
 
-                // `encodeInto` doesn't currently work in any browsers when the memory passed
-                // in is backed by a `SharedArrayBuffer`, so force usage of `encode` if
-                // a `SharedArrayBuffer` is in use.
-                let shared = self.module.memories.get(memory).shared;
+                    // `encodeInto` doesn't currently work in any browsers when the memory passed
+                    // in is backed by a `SharedArrayBuffer`, so force usage of `encode` if
+                    // a `SharedArrayBuffer` is in use.
+                    let shared = self.module.memories.get(memory).shared;
 
-                match self.config.encode_into {
-                    EncodeInto::Always if !shared => {}
-                    EncodeInto::Test if !shared => {
-                        dst.push_str(&format!(
-                            "
+                    match self.config.encode_into {
+                        EncodeInto::Always if !shared => {}
+                        EncodeInto::Test if !shared => {
+                            dst.push_str(&format!(
+                                "
                         if (!('encodeInto' in cachedTextEncoder)) {{
                             {polyfill_encode_into}
                         }}
                         "
-                        ));
-                    }
-                    _ => {
-                        // Support audio worklets when able to spawn them.
-                        if shared {
-                            dst.push_str(&format!(
-                                "
+                            ));
+                        }
+                        _ => {
+                            // Support audio worklets when able to spawn them.
+                            if shared {
+                                dst.push_str(&format!(
+                                    "
                             if (cachedTextEncoder) {{
                                 {polyfill_encode_into}
                             }}
                             "
-                            ));
-                        } else {
-                            dst.push_str(polyfill_encode_into);
+                                ));
+                            } else {
+                                dst.push_str(polyfill_encode_into);
+                            }
                         }
                     }
-                }
 
-                dst.into()
-            }
-        });
+                    dst.into()
+                }
+            },
+            &[],
+        );
     }
 
     fn expose_text_decoder(&mut self, mem: &MemView, memory: MemoryId) {
@@ -2911,7 +3181,7 @@ if (require('worker_threads').isMainThread) {{
             }
 
             dst.into()
-        })
+        }, &["cachedTextDecoder"])
     }
 
     fn write_text_processor(
@@ -2957,16 +3227,21 @@ if (require('worker_threads').isMainThread) {{
             num: mem.num,
         };
         let ptr_coerce = self.coerce_ptr_suffix();
-        self.intrinsic(ret.to_string().into(), None, {
-            format!(
-                "
+        self.intrinsic(
+            ret.to_string().into(),
+            None,
+            {
+                format!(
+                    "
                 function {ret}(ptr, len) {{
                     return decodeText(ptr{ptr_coerce}, len);
                 }}
                 ",
-            )
-            .into()
-        });
+                )
+                .into()
+            },
+            &["decodeText"],
+        );
         ret
     }
 
@@ -2994,9 +3269,12 @@ if (require('worker_threads').isMainThread) {{
         //
         // If `ptr` and `len` are both `0` then that means it's `None`, in that case we rely upon
         // the fact that `getObject(0)` is guaranteed to be `undefined`.
-        self.intrinsic(ret.to_string().into(), None, {
-            format!(
-                "
+        self.intrinsic(
+            ret.to_string().into(),
+            None,
+            {
+                format!(
+                    "
                 function {ret}(ptr, len) {{
                     if (ptr === 0) {{
                         return {get_object}(len);
@@ -3005,9 +3283,11 @@ if (require('worker_threads').isMainThread) {{
                     }}
                 }}
                 "
-            )
-            .into()
-        });
+                )
+                .into()
+            },
+            &[&get_object, &get_string.to_string()],
+        );
         ret
     }
 
@@ -3017,17 +3297,28 @@ if (require('worker_threads').isMainThread) {{
             name: "getArrayJsValueFromWasm".into(),
             num: mem.num,
         };
+        let is_emscripten = self.config.mode.emscripten();
+        // Emscripten exposes the DataView heap as the global `HEAP_DATA_VIEW`;
+        // other targets emit a per-instance cache function (`getDataViewMemory0()`).
+        let mem_access = if is_emscripten {
+            mem.name.to_string()
+        } else {
+            format!("{mem}()")
+        };
         match (self.aux.externref_table, self.aux.externref_drop_slice) {
             (Some(table), Some(drop)) => {
                 let table = self.export_name_of(table);
                 let drop = self.export_name_of(drop);
                 let ptr_fixup = self.coerce_ptr_assign("ptr");
-                self.intrinsic(ret.to_string().into(), None, {
-                    format!(
-                        "
+                self.intrinsic(
+                    ret.to_string().into(),
+                    None,
+                    {
+                        format!(
+                            "
                         function {ret}(ptr, len) {{
                             {ptr_fixup}
-                            const mem = {mem}();
+                            const mem = {mem_access};
                             const result = [];
                             for (let i = ptr; i < ptr + 4 * len; i += 4) {{
                                 result.push(wasm.{table}.get(mem.getUint32(i, true)));
@@ -3036,19 +3327,24 @@ if (require('worker_threads').isMainThread) {{
                             return result;
                         }}
                         ",
-                    )
-                    .into()
-                });
+                        )
+                        .into()
+                    },
+                    &["HEAP_DATA_VIEW"],
+                );
             }
             _ => {
                 self.expose_take_object();
                 let ptr_fixup = self.coerce_ptr_assign("ptr");
-                self.intrinsic(ret.to_string().into(), None, {
-                    format!(
-                        "
+                self.intrinsic(
+                    ret.to_string().into(),
+                    None,
+                    {
+                        format!(
+                            "
                         function {ret}(ptr, len) {{
                             {ptr_fixup}
-                            const mem = {mem}();
+                            const mem = {mem_access};
                             const result = [];
                             for (let i = ptr; i < ptr + 4 * len; i += 4) {{
                                 result.push(takeObject(mem.getUint32(i, true)));
@@ -3056,9 +3352,11 @@ if (require('worker_threads').isMainThread) {{
                             return result;
                         }}
                         ",
-                    )
-                    .into()
-                });
+                        )
+                        .into()
+                    },
+                    &["takeObject", "HEAP_DATA_VIEW"],
+                );
             }
         }
         ret
@@ -3072,16 +3370,25 @@ if (require('worker_threads').isMainThread) {{
             name: "getArrayJsValueViewFromWasm".into(),
             num: mem.num,
         };
+        let is_emscripten = self.config.mode.emscripten();
+        let mem_access = if is_emscripten {
+            mem.name.to_string()
+        } else {
+            format!("{mem}()")
+        };
         match self.aux.externref_table {
             Some(table) => {
                 let table = self.export_name_of(table);
                 let ptr_fixup = self.coerce_ptr_assign("ptr");
-                self.intrinsic(ret.to_string().into(), None, {
-                    format!(
-                        "
+                self.intrinsic(
+                    ret.to_string().into(),
+                    None,
+                    {
+                        format!(
+                            "
                         function {ret}(ptr, len) {{
                             {ptr_fixup}
-                            const mem = {mem}();
+                            const mem = {mem_access};
                             const result = [];
                             for (let i = ptr; i < ptr + 4 * len; i += 4) {{
                                 result.push(wasm.{table}.get(mem.getUint32(i, true)));
@@ -3089,19 +3396,24 @@ if (require('worker_threads').isMainThread) {{
                             return result;
                         }}
                         ",
-                    )
-                    .into()
-                });
+                        )
+                        .into()
+                    },
+                    &["HEAP_DATA_VIEW"],
+                );
             }
             _ => {
                 self.expose_get_object();
                 let ptr_fixup = self.coerce_ptr_assign("ptr");
-                self.intrinsic(ret.to_string().into(), None, {
-                    format!(
-                        "
+                self.intrinsic(
+                    ret.to_string().into(),
+                    None,
+                    {
+                        format!(
+                            "
                         function {ret}(ptr, len) {{
                             {ptr_fixup}
-                            const mem = {mem}();
+                            const mem = {mem_access};
                             const result = [];
                             for (let i = ptr; i < ptr + 4 * len; i += 4) {{
                                 result.push(getObject(mem.getUint32(i, true)));
@@ -3109,9 +3421,11 @@ if (require('worker_threads').isMainThread) {{
                             return result;
                         }}
                         ",
-                    )
-                    .into()
-                });
+                        )
+                        .into()
+                    },
+                    &["getObject", "HEAP_DATA_VIEW"],
+                );
             }
         }
         ret
@@ -3179,7 +3493,10 @@ if (require('worker_threads').isMainThread) {{
         };
         let heap_view = view.access(self.config.mode.emscripten());
         let ptr_fixup = self.coerce_ptr_assign("ptr");
-        self.intrinsic(name.into(), Some(&ret.to_string()), {
+        let view_name = view.name.to_string();
+        self.intrinsic(
+            name.into(),
+            Some(&ret.to_string()),
             format!(
                 "
                 function {ret}(ptr, len) {{
@@ -3188,8 +3505,9 @@ if (require('worker_threads').isMainThread) {{
                 }}
                 ",
             )
-            .into()
-        });
+            .into(),
+            &[&view_name],
+        );
         ret
     }
 
@@ -3259,6 +3577,14 @@ if (require('worker_threads').isMainThread) {{
                 "DataView" => "HEAP_DATA_VIEW",
                 _ => "HEAPU8",
             };
+            // Emscripten only declares `HEAP_DATA_VIEW` when SUPPORT_BIG_ENDIAN
+            // is enabled. For the common (little-endian) case we need to
+            // declare it ourselves and ensure it is (re)created whenever the
+            // memory views are refreshed (i.e. on every wasm memory growth).
+            if emscripten_heap == "HEAP_DATA_VIEW" {
+                self.emscripten_global_deps
+                    .insert("HEAP_DATA_VIEW".to_string());
+            }
             let view = self.memview_memory(emscripten_heap, memory);
             return view;
         }
@@ -3293,7 +3619,7 @@ if (require('worker_threads').isMainThread) {{
                 ",
             )
             .into()
-        });
+        }, &[]);
         view
     }
 
@@ -3327,16 +3653,21 @@ if (require('worker_threads').isMainThread) {{
     }
 
     fn expose_assert_class(&mut self) {
-        self.intrinsic("assert_class".into(), "_assertClass".into(), {
-            "
+        self.intrinsic(
+            "assert_class".into(),
+            "_assertClass".into(),
+            {
+                "
             function _assertClass(instance, klass) {
                 if (!(instance instanceof klass)) {
                     throw new Error(`expected instance of ${klass.name}`);
                 }
             }
             "
-            .into()
-        });
+                .into()
+            },
+            &[],
+        );
     }
 
     fn expose_global_stack_pointer(&mut self) {
@@ -3345,9 +3676,12 @@ if (require('worker_threads').isMainThread) {{
                 .insert("stack_pointer".to_string());
             return;
         }
-        self.intrinsic("stack_pointer".into(), None, {
-            format!("\nlet stack_pointer = {INITIAL_HEAP_OFFSET};\n").into()
-        });
+        self.intrinsic(
+            "stack_pointer".into(),
+            None,
+            format!("\nlet stack_pointer = {INITIAL_HEAP_OFFSET};\n").into(),
+            &[],
+        );
     }
 
     fn expose_borrowed_objects(&mut self) {
@@ -3358,31 +3692,41 @@ if (require('worker_threads').isMainThread) {{
         // after executing this. Once we've reserved stack space we write the
         // value. Eventually underflow will throw an exception, but JS sort of
         // just handles it today...
-        self.intrinsic("borrowed_objects".into(), "addBorrowedObject".into(), {
-            "
+        self.intrinsic(
+            "borrowed_objects".into(),
+            "addBorrowedObject".into(),
+            {
+                "
             function addBorrowedObject(obj) {
                 if (stack_pointer == 1) throw new Error('out of js stack');
                 heap[--stack_pointer] = obj;
                 return stack_pointer;
             }
             "
-            .into()
-        });
+                .into()
+            },
+            &["stack_pointer", "heap"],
+        );
     }
 
     fn expose_take_object(&mut self) {
         self.expose_get_object();
         self.expose_drop_ref();
-        self.intrinsic("take_object".into(), "takeObject".into(), {
-            "
+        self.intrinsic(
+            "take_object".into(),
+            "takeObject".into(),
+            {
+                "
             function takeObject(idx) {
                 const ret = getObject(idx);
                 dropObject(idx);
                 return ret;
             }
             "
-            .into()
-        });
+                .into()
+            },
+            &["getObject", "dropObject"],
+        );
     }
 
     fn expose_add_heap_object(&mut self) {
@@ -3393,9 +3737,12 @@ if (require('worker_threads').isMainThread) {{
         // (starting at `heap_next`). Once that linked list is exhausted we'll
         // be pointing beyond the end of the array, at which point we'll reserve
         // one more slot and use that.
-        self.intrinsic("add_heap_object".into(), "addHeapObject".into(), {
-            format!(
-                "
+        self.intrinsic(
+            "add_heap_object".into(),
+            "addHeapObject".into(),
+            {
+                format!(
+                    "
                 function addHeapObject(obj) {{
                     if (heap_next === heap.length) heap.push(heap.length + 1);
                     const idx = heap_next;
@@ -3405,14 +3752,16 @@ if (require('worker_threads').isMainThread) {{
                     return idx;
                 }}
                 ",
-                if self.config.debug {
-                    "if (typeof(heap_next) !== 'number') throw new Error('corrupt heap');"
-                } else {
-                    ""
-                }
-            )
-            .into()
-        });
+                    if self.config.debug {
+                        "if (typeof(heap_next) !== 'number') throw new Error('corrupt heap');"
+                    } else {
+                        ""
+                    }
+                )
+                .into()
+            },
+            &["heap", "heap_next"],
+        );
     }
 
     fn expose_handle_error(&mut self) -> Result<(), Error> {
@@ -3432,10 +3781,14 @@ if (require('worker_threads').isMainThread) {{
         match (self.aux.externref_table, self.aux.externref_alloc) {
             (Some(table), Some(alloc)) => {
                 let add = self.expose_add_to_externref_table(table, alloc);
+                let add_name = add.to_string();
 
-                self.intrinsic("handle_error".into(), "handleError".into(), {
-                    format!(
-                        "
+                self.intrinsic(
+                    "handle_error".into(),
+                    "handleError".into(),
+                    {
+                        format!(
+                            "
                         function handleError(f, args) {{
                             try {{
                                 return f.apply(this, args);
@@ -3445,18 +3798,23 @@ if (require('worker_threads').isMainThread) {{
                             }}
                         }}
                         "
-                    )
-                    .into()
-                });
+                        )
+                        .into()
+                    },
+                    &[&add_name],
+                );
             }
             _ => {
                 self.expose_add_heap_object();
                 if self.config.mode.emscripten() {
                     self.adapter_deps.insert("addHeapObject".to_string());
                 }
-                self.intrinsic("handle_error".into(), "handleError".into(), {
-                    format!(
-                        "
+                self.intrinsic(
+                    "handle_error".into(),
+                    "handleError".into(),
+                    {
+                        format!(
+                            "
                         function handleError(f, args) {{
                             try {{
                                 return f.apply(this, args);
@@ -3465,17 +3823,22 @@ if (require('worker_threads').isMainThread) {{
                             }}
                         }}
                         "
-                    )
-                    .into()
-                });
+                        )
+                        .into()
+                    },
+                    &["addHeapObject"],
+                );
             }
         }
         Ok(())
     }
 
     fn expose_log_error(&mut self) {
-        self.intrinsic("log_error".into(), "logError".into(), {
-            "
+        self.intrinsic(
+            "log_error".into(),
+            "logError".into(),
+            {
+                "
             function logError(f, args) {
                 try {
                     return f.apply(this, args);
@@ -3496,8 +3859,10 @@ if (require('worker_threads').isMainThread) {{
                 }
             }
             "
-            .into()
-        });
+                .into()
+            },
+            &[],
+        );
     }
 
     fn pass_to_wasm_function(&mut self, t: VectorKind, memory: MemoryId) -> MemView {
@@ -3561,18 +3926,24 @@ if (require('worker_threads').isMainThread) {{
                 "
                 .into()
             },
+            &[],
         );
     }
 
     fn expose_is_like_none(&mut self) {
-        self.intrinsic("is_like_none".into(), "isLikeNone".into(), {
-            "
+        self.intrinsic(
+            "is_like_none".into(),
+            "isLikeNone".into(),
+            {
+                "
             function isLikeNone(x) {
                 return x === undefined || x === null;
             }
             "
-            .into()
-        });
+                .into()
+            },
+            &[],
+        );
     }
 
     fn expose_assert_non_null(&mut self) {
@@ -3582,7 +3953,7 @@ if (require('worker_threads').isMainThread) {{
                 if (typeof(n) !== 'number' || n === 0) throw new Error(`expected a number argument that is not 0, found ${n}`);
             }
             ".into()
-        });
+        }, &[]);
     }
 
     fn expose_assert_char(&mut self) {
@@ -3592,7 +3963,7 @@ if (require('worker_threads').isMainThread) {{
                 if (typeof(c) === 'number' && (c >= 0x110000 || (c >= 0xD800 && c < 0xE000))) throw new Error(`expected a valid Unicode scalar value, found ${c}`);
             }
             ".into()
-        });
+        }, &[]);
     }
 
     fn expose_make_mut_closure(&mut self) {
@@ -3607,21 +3978,24 @@ if (require('worker_threads').isMainThread) {{
         // while we invoke it. If we finish and the closure wasn't
         // destroyed, then we put back the pointer so a future
         // invocation can succeed.
-        self.intrinsic("make_mut_closure".into(), "makeMutClosure".into(), {
-            let (state_init, instance_check) = if self.generate_reinit {
-                (
-                    "const state = { a: arg0, b: arg1, cnt: 1, instance: __wbg_instance_id };",
-                    "
+        self.intrinsic(
+            "make_mut_closure".into(),
+            Some("makeMutClosure"),
+            {
+                let (state_init, instance_check) = if self.generate_reinit {
+                    (
+                        "const state = { a: arg0, b: arg1, cnt: 1, instance: __wbg_instance_id };",
+                        "
                     if (state.instance !== __wbg_instance_id) {
                         throw new Error('Cannot invoke closure from previous WASM instance');
                     }
                     ",
-                )
-            } else {
-                ("const state = { a: arg0, b: arg1, cnt: 1 };", "")
-            };
-            let mut js = format!(
-                "
+                    )
+                } else {
+                    ("const state = { a: arg0, b: arg1, cnt: 1 };", "")
+                };
+                format!(
+                    "
                 function makeMutClosure(arg0, arg1, f) {{
                     {state_init}
                     const real = (...args) => {{
@@ -3650,21 +4024,11 @@ if (require('worker_threads').isMainThread) {{
                     return real;
                 }}
                 "
-            );
-
-            if matches!(self.config.mode, OutputMode::Emscripten) {
-                js.push_str(
-                    r"
-                addToLibrary({
-                    $makeMutClosure: makeMutClosure,
-                    $makeMutClosure__deps: ['$CLOSURE_DTORS']
-                });
-                ",
-                );
-            };
-
-            js.into()
-        });
+                )
+                .into()
+            },
+            &["CLOSURE_DTORS"],
+        );
     }
 
     fn expose_make_closure(&mut self) {
@@ -3679,21 +4043,24 @@ if (require('worker_threads').isMainThread) {{
         // executing the destructor, however, we clear out the
         // `this.a` pointer to prevent it being used again the
         // future.
-        self.intrinsic("make_closure".into(), "makeClosure".into(), {
-            let (state_init, instance_check) = if self.generate_reinit {
-                (
-                    "const state = { a: arg0, b: arg1, cnt: 1, instance: __wbg_instance_id };",
-                    "
+        self.intrinsic(
+            "make_closure".into(),
+            Some("makeClosure"),
+            {
+                let (state_init, instance_check) = if self.generate_reinit {
+                    (
+                        "const state = { a: arg0, b: arg1, cnt: 1, instance: __wbg_instance_id };",
+                        "
                     if (state.instance !== __wbg_instance_id) {
                         throw new Error('Cannot invoke closure from previous WASM instance');
                     }
                     ",
-                )
-            } else {
-                ("const state = { a: arg0, b: arg1, cnt: 1 };", "")
-            };
-            let mut js = format!(
-                "
+                    )
+                } else {
+                    ("const state = { a: arg0, b: arg1, cnt: 1 };", "")
+                };
+                format!(
+                    "
                 function makeClosure(arg0, arg1, f) {{
                     {state_init}
                     const real = (...args) => {{
@@ -3719,21 +4086,11 @@ if (require('worker_threads').isMainThread) {{
                     return real;
                 }}
                 "
-            );
-
-            if matches!(self.config.mode, OutputMode::Emscripten) {
-                js.push_str(
-                    "
-                addToLibrary({
-                    $makeClosure: makeClosure,
-                    $makeClosure__deps: ['$CLOSURE_DTORS']
-                });
-                ",
-                );
-            };
-
-            js.into()
-        });
+                )
+                .into()
+            },
+            &["CLOSURE_DTORS"],
+        );
     }
 
     /// Exposes the `CLOSURE_DTORS` finalization registry and returns a JS
@@ -3766,7 +4123,7 @@ if (require('worker_threads').isMainThread) {{
                         $CLOSURE_DTORS__postset: \"CLOSURE_DTORS = (typeof FinalizationRegistry === 'undefined') ? {{ register: () => {{}}, unregister: () => {{}} }} : new FinalizationRegistry({prevent_stale});\"
                     }});\n"
                 )
-            } else {
+            }             else {
                 format!(
                     "
                     const CLOSURE_DTORS = (typeof FinalizationRegistry === 'undefined')
@@ -3776,15 +4133,18 @@ if (require('worker_threads').isMainThread) {{
                 )
             }
             .into()
-        });
+        }, &[]);
 
         destroy_state
     }
 
     fn expose_panic_error(&mut self) {
-        self.intrinsic("panic_error".into(), "PanicError".into(), {
-            if matches!(self.config.mode, OutputMode::Emscripten) {
-                "addToLibrary({
+        self.intrinsic(
+            "panic_error".into(),
+            "PanicError".into(),
+            {
+                if matches!(self.config.mode, OutputMode::Emscripten) {
+                    "addToLibrary({
                     $PanicError: function(message) {
                         class PanicError extends Error {}
                         Object.defineProperty(PanicError.prototype, 'name', {
@@ -3793,16 +4153,18 @@ if (require('worker_threads').isMainThread) {{
                         return new PanicError(message);
                     }
                 });\n"
-                    .into()
-            } else {
-                "class PanicError extends Error {}
+                        .into()
+                } else {
+                    "class PanicError extends Error {}
                 Object.defineProperty(PanicError.prototype, 'name', {
                     value: PanicError.name,
                 });
                 "
-                .into()
-            }
-        });
+                    .into()
+                }
+            },
+            &[],
+        );
     }
 
     fn expose_reinit_scheduled(&mut self) {
@@ -3813,6 +4175,7 @@ if (require('worker_threads').isMainThread) {{
             let __wbg_reinit_scheduled = false;
             "
             .into(),
+            &[],
         );
     }
 
@@ -4095,9 +4458,12 @@ if (require('worker_threads').isMainThread) {{
         let view = self.memview_table("getFromExternrefTable", table);
         assert!(self.config.externref);
         let table = self.export_name_of(table);
-        self.intrinsic(view.to_string().into(), None, {
-            format!("\nfunction {view}(idx) {{ return wasm.{table}.get(idx); }}\n").into()
-        });
+        self.intrinsic(
+            view.to_string().into(),
+            None,
+            format!("\nfunction {view}(idx) {{ return wasm.{table}.get(idx); }}\n").into(),
+            &[],
+        );
         view
     }
 
@@ -4106,18 +4472,23 @@ if (require('worker_threads').isMainThread) {{
         assert!(self.config.externref);
         let drop = self.export_name_of(drop);
         let table = self.export_name_of(table);
-        self.intrinsic(view.to_string().into(), None, {
-            format!(
-                "
+        self.intrinsic(
+            view.to_string().into(),
+            None,
+            {
+                format!(
+                    "
                 function {view}(idx) {{
                     const value = wasm.{table}.get(idx);
                     wasm.{drop}(idx);
                     return value;
                 }}
             ",
-            )
-            .into()
-        });
+                )
+                .into()
+            },
+            &[],
+        );
 
         view
     }
@@ -4128,18 +4499,23 @@ if (require('worker_threads').isMainThread) {{
         let alloc = self.export_name_of(alloc);
         let table = self.export_name_of(table);
 
-        self.intrinsic(view.to_string().into(), None, {
-            format!(
-                "
+        self.intrinsic(
+            view.to_string().into(),
+            None,
+            {
+                format!(
+                    "
                 function {view}(obj) {{
                     const idx = wasm.{alloc}();
                     wasm.{table}.set(idx, obj);
                     return idx;
                 }}
                 ",
-            )
-            .into()
-        });
+                )
+                .into()
+            },
+            &[],
+        );
         view
     }
 
@@ -4149,31 +4525,41 @@ if (require('worker_threads').isMainThread) {{
         // Set up qualified-name mappings before processing adapters, so that
         // WasmDescribe lookups can resolve to the right exported class and TS
         // declaration identifier.
+        // `exported_classes` is keyed by `qualified_name` — the struct's
+        // JS-side identity (namespace-qualified `js_name`). Both struct
+        // registration and impl-block exports must agree on this key, and
+        // both derive it locally from `(js_namespace, js_name)` /
+        // `(js_namespace, js_class)`, defaulting to the Rust ident when
+        // unset so the no-rename case lines up without cross-invocation
+        // knowledge. Keying by `rust_name` would let two structs sharing
+        // a Rust ident in different modules (with distinct `js_name`s)
+        // clobber each other.
         let mut any_class_has_parent = false;
         for s in self.aux.structs.iter() {
-            self.qualified_to_rust_name
-                .insert(s.qualified_name.clone(), s.rust_name.clone());
+            let qualified_name =
+                wasm_bindgen_shared::qualified_name(s.js_namespace.as_deref(), &s.name);
             let needs_identifier = self
                 .exported_classes
-                .get(&s.rust_name)
+                .get(&qualified_name)
                 .is_none_or(|class| class.identifier.is_empty());
             let identifier = if needs_identifier {
-                Some(self.generate_identifier(&s.qualified_name))
+                Some(self.generate_identifier(&qualified_name))
             } else {
                 None
             };
             let class = self
                 .exported_classes
-                .entry(s.rust_name.clone())
+                .entry(qualified_name.clone())
                 .or_default();
             class.js_name = Some(s.name.clone());
-            class.qualified_name = Some(s.qualified_name.clone());
             // Pre-populate extends so the constructor binding (emitted while
             // processing adapters below) can tell whether a class is a
             // subclass and needs `super(__wbgSuperSkip)`. The same field is
             // repopulated later by `generate_struct` for the JS `extends`
-            // clause, but that runs after adapter processing.
-            class.extends = s.extends.clone();
+            // clause, but that runs after adapter processing. Store the
+            // parent's qualified JS identity so downstream lookups against
+            // `exported_classes` (keyed by qualified_name) resolve.
+            class.extends = parent_qualified_name(s);
             if s.extends.is_some() {
                 any_class_has_parent = true;
             }
@@ -4181,8 +4567,26 @@ if (require('worker_threads').isMainThread) {{
                 class.identifier = identifier;
             }
             self.qualified_to_identifier
-                .insert(s.qualified_name.clone(), class.identifier.clone());
+                .insert(qualified_name, class.identifier.clone());
         }
+        // Validate that every impl-block export references a class that
+        // was registered by a struct macro. The qualified form of `class`
+        // (built from the impl's `js_namespace` + `js_class`) must match a
+        // struct's `qualified_name`. The common ways this fails:
+        //
+        //   * impl block forgets `js_namespace` that the struct declares
+        //     — the symptoms used to be silent (stub class, no methods)
+        //     because `require_class` would mint a fresh empty entry
+        //   * impl block declares a different `js_namespace` than the
+        //     struct — same outcome
+        //   * typo in `js_class` value
+        //
+        // We surface a targeted hint for the namespace-mismatch case
+        // (matching `name` in a different namespace) and fall back to a
+        // fuzzy "did you mean" search across all registered struct
+        // qualified names.
+        self.validate_impl_class_references()?;
+
         // Emit the super-skip sentinel once up front if any class in this
         // module extends another. Every user-defined constructor then checks
         // for the sentinel as the first thing in its body so that a
@@ -4198,7 +4602,9 @@ if (require('worker_threads').isMainThread) {{
         // (direct parent at index 0).
         self.populate_inheritance_chains();
         for e in self.aux.enums.values() {
-            self.get_or_create_identifier(&e.qualified_name);
+            let qualified_name =
+                wasm_bindgen_shared::qualified_name(e.js_namespace.as_deref(), &e.name);
+            self.get_or_create_identifier(&qualified_name);
         }
 
         self.generate_jstag_import();
@@ -4487,7 +4893,13 @@ addToLibrary({
         instrs: &[InstructionData],
         kind: ContextAdapterKind,
     ) -> Result<(), Error> {
-        self.adapter_deps.clear();
+        // For emscripten output we keep `adapter_deps` as a cumulative
+        // union — every insert is permanent — and snapshot it here so we can
+        // compute the per-adapter delta after generation. The cumulative set
+        // is later read directly for `$initBindgen__deps`. Non-emscripten
+        // modes don't read `adapter_deps`, so the snapshot is just no-op work
+        // (a clone of an empty set).
+        let adapter_deps_before = self.adapter_deps.clone();
         let catch = self.aux.imports_with_catch.contains(&id);
         if let ContextAdapterKind::Import(core) = kind {
             if !catch && self.attempt_direct_import(core, instrs)? {
@@ -4607,13 +5019,32 @@ addToLibrary({
                             name,
                         );
                         let identifier = self.get_or_create_identifier(&qualified_name);
+                        let is_namespaced = export.js_namespace.is_some();
                         let (ts_definition, ts_comments) = if let Some(ts_sig) = ts_sig {
                             if matches!(self.config.mode, OutputMode::Emscripten) {
-                                // Emscripten: Write "name(args): ret;" directly to buffer
-                                self.typescript.push_str(&ts_docs);
-                                self.typescript.push_str(&identifier); // No "function" prefix
-                                self.typescript.push_str(ts_sig);
-                                self.typescript.push_str(";\n");
+                                if is_namespaced {
+                                    // Namespaced function: reachable only via
+                                    // the namespace shape (e.g. `m.app.math.pi`).
+                                    // Emit a module-internal `declare function
+                                    // <mangled>(...): ...;` before BindgenModule
+                                    // so the namespace shape's `typeof <mangled>`
+                                    // reference resolves, and skip the
+                                    // top-level interface-member emission
+                                    // (`<mangled>(...): ...;`) that would
+                                    // duplicate the namespace entry under the
+                                    // mangled name.
+                                    self.typescript_emscripten_classes.push_str(&ts_docs);
+                                    self.typescript_emscripten_classes.push_str(&format!(
+                                        "declare function {identifier}{ts_sig};\n\n"
+                                    ));
+                                } else {
+                                    // Non-namespaced: write "name(args): ret;"
+                                    // directly to the BindgenModule body.
+                                    self.typescript.push_str(&ts_docs);
+                                    self.typescript.push_str(&identifier); // No "function" prefix
+                                    self.typescript.push_str(ts_sig);
+                                    self.typescript.push_str(";\n");
+                                }
 
                                 (String::new(), None)
                             } else {
@@ -4737,11 +5168,15 @@ addToLibrary({
                     code
                 };
 
-                if matches!(self.config.mode, OutputMode::Emscripten)
-                    && !self.adapter_deps.is_empty()
-                {
-                    self.emscripten_import_deps
-                        .insert(core, self.adapter_deps.clone());
+                if matches!(self.config.mode, OutputMode::Emscripten) {
+                    let new_deps: BTreeSet<String> = self
+                        .adapter_deps
+                        .difference(&adapter_deps_before)
+                        .cloned()
+                        .collect();
+                    if !new_deps.is_empty() {
+                        self.emscripten_import_deps.insert(core, new_deps);
+                    }
                 }
 
                 self.wasm_import_definitions
@@ -4752,8 +5187,15 @@ addToLibrary({
                 assert!(!log_error);
 
                 if matches!(self.config.mode, OutputMode::Emscripten) {
-                    let code = format!("function {}{code}", &self.export_adapter_name(id));
-                    self.export_to_emscripten(&self.export_adapter_name(id), &code);
+                    let name = self.export_adapter_name(id);
+                    let code = format!("function {name}{code}");
+                    let new_deps: Vec<String> = self
+                        .adapter_deps
+                        .difference(&adapter_deps_before)
+                        .cloned()
+                        .collect();
+                    let dep_refs: Vec<&str> = new_deps.iter().map(String::as_str).collect();
+                    self.export_to_emscripten(&name, &code, &dep_refs);
                 } else {
                     self.globals.push_str("function ");
                     self.globals.push_str(&self.export_adapter_name(id));
@@ -4762,6 +5204,7 @@ addToLibrary({
                 }
             }
         }
+
         Ok(())
     }
 
@@ -5690,7 +6133,9 @@ addToLibrary({
     }
 
     fn generate_enum(&mut self, enum_: &AuxEnum) -> Result<(), Error> {
-        let identifier = self.get_or_create_identifier(&enum_.qualified_name);
+        let qualified_name =
+            wasm_bindgen_shared::qualified_name(enum_.js_namespace.as_deref(), &enum_.name);
+        let identifier = self.get_or_create_identifier(&qualified_name);
         let ts_comments = format_doc_comments(&enum_.comments, None);
         let mut typescript = String::new();
         if enum_.generate_typescript {
@@ -5736,6 +6181,26 @@ addToLibrary({
 
         let definition = format!("const {identifier} = Object.freeze({{\n{variants}}});\n");
 
+        // Emscripten lifts namespaced enums into the pre-BindgenModule
+        // region as `declare enum <mangled>` (module-internal), the same
+        // pattern used for namespaced classes. Without lifting, the enum
+        // declaration body ends up textually spliced into the interface
+        // body — `enum X { ... }` inside an `interface` block is invalid
+        // TS. The namespace shape (`Op: typeof <mangled>`) keeps the
+        // typed access path working.
+        let ts_definition = if matches!(self.config.mode, OutputMode::Emscripten)
+            && enum_.js_namespace.is_some()
+            && enum_.generate_typescript
+        {
+            self.typescript_emscripten_classes.push_str(&ts_comments);
+            self.typescript_emscripten_classes.push_str("declare ");
+            self.typescript_emscripten_classes.push_str(&typescript);
+            self.typescript_emscripten_classes.push('\n');
+            String::new()
+        } else {
+            typescript
+        };
+
         define_export(
             &mut self.exports,
             &enum_.name,
@@ -5744,7 +6209,7 @@ addToLibrary({
                 identifier: identifier.clone(),
                 comments: Some(docs),
                 definition,
-                ts_definition: typescript,
+                ts_definition,
                 ts_comments: Some(ts_comments),
                 private: enum_.private,
                 parent_identifier: None,
@@ -5880,15 +6345,17 @@ addToLibrary({
     }
 
     fn generate_struct(&mut self, struct_: &AuxStruct) -> Result<(), Error> {
-        let class = self.require_class(&struct_.rust_name);
+        let qualified_name =
+            wasm_bindgen_shared::qualified_name(struct_.js_namespace.as_deref(), &struct_.name);
+        let parent_qualified = parent_qualified_name(struct_);
+        let class = self.require_class(&qualified_name);
         class.comments = format_doc_comments(&struct_.comments, None);
         class.is_inspectable = struct_.is_inspectable;
         class.generate_typescript = struct_.generate_typescript;
         class.private = struct_.private;
         class.js_namespace = struct_.js_namespace.as_ref().map(|ns| ns.to_vec());
         class.js_name = Some(struct_.name.clone());
-        class.qualified_name = Some(struct_.qualified_name.clone());
-        class.extends = struct_.extends.clone();
+        class.extends = parent_qualified;
         Ok(())
     }
 
@@ -5957,8 +6424,11 @@ addToLibrary({
     }
 
     fn expose_debug_string(&mut self) {
-        self.intrinsic("debug_string".into(), "debugString".into(), {
-            "
+        self.intrinsic(
+            "debug_string".into(),
+            "debugString".into(),
+            {
+                "
             function debugString(val) {
                 // primitive types
                 const type = typeof val;
@@ -6024,8 +6494,10 @@ addToLibrary({
                 return className;
             }
             "
-            .into()
-        });
+                .into()
+            },
+            &[],
+        );
     }
 
     fn export_function_table(&mut self) -> Result<String, Error> {
@@ -6196,6 +6668,34 @@ impl<'a> ContextAdapterKind<'a> {
             }
         }
     }
+}
+
+/// Compute the qualified JS identity (`<ns>__<name>`) of a child
+/// struct's parent class, used as the key into `exported_classes` when
+/// resolving the parent for `class Child extends Parent` codegen.
+///
+/// Sources, in order:
+///   * `extends_js_class` + `extends_js_namespace` if the user declared
+///     them on the child (required when the parent uses `js_name` /
+///     `js_namespace`).
+///   * Otherwise the last segment of the `extends` Rust path as a
+///     fall-back, which matches the no-rename / no-namespace case where
+///     the parent's `js_name` defaults to its Rust ident and
+///     `js_namespace` is `None`.
+///
+/// Returns `None` when the child has no `extends` at all.
+fn parent_qualified_name(struct_: &AuxStruct) -> Option<String> {
+    if struct_.extends.is_none() && struct_.extends_js_class.is_none() {
+        return None;
+    }
+    let bare = struct_
+        .extends_js_class
+        .clone()
+        .or_else(|| struct_.extends.clone())?;
+    Some(wasm_bindgen_shared::qualified_name(
+        struct_.extends_js_namespace.as_deref(),
+        &bare,
+    ))
 }
 
 /// Iterate over the adapters in a deterministic order.

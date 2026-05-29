@@ -13,7 +13,7 @@ pub mod tys;
 // This gets changed whenever our schema changes.
 // At this time versions of wasm-bindgen and wasm-bindgen-cli are required to have the exact same
 // SCHEMA_VERSION in order to work together.
-pub const SCHEMA_VERSION: &str = "0.2.121";
+pub const SCHEMA_VERSION: &str = "0.2.122";
 
 #[macro_export]
 macro_rules! shared_api {
@@ -187,7 +187,6 @@ macro_rules! shared_api {
 
         struct Struct<'a> {
             name: &'a str,
-            rust_name: &'a str,
             fields: Vec<StructField<'a>>,
             comments: Vec<&'a str>,
             is_inspectable: bool,
@@ -195,6 +194,8 @@ macro_rules! shared_api {
             js_namespace: Option<Vec<&'a str>>,
             private: bool,
             extends: Option<&'a str>,
+            extends_js_class: Option<&'a str>,
+            extends_js_namespace: Option<Vec<&'a str>>,
         }
 
         struct StructField<'a> {

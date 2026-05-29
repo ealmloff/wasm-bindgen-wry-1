@@ -453,7 +453,6 @@ fn shared_import_dynamic_union<'a>(
 fn shared_struct<'a>(s: &'a ast::Struct, intern: &'a Interner) -> Struct<'a> {
     Struct {
         name: &s.js_name,
-        rust_name: intern.intern(&s.rust_name),
         fields: s
             .fields
             .iter()
@@ -473,6 +472,11 @@ fn shared_struct<'a>(s: &'a ast::Struct, intern: &'a Interner) -> Struct<'a> {
             .as_ref()
             .and_then(|p| p.segments.last())
             .map(|seg| intern.intern_str(&seg.ident.to_string())),
+        extends_js_class: s.extends_js_class.as_deref().map(|s| intern.intern_str(s)),
+        extends_js_namespace: s
+            .extends_js_namespace
+            .as_ref()
+            .map(|ns| ns.iter().map(|s| &**s).collect()),
     }
 }
 
