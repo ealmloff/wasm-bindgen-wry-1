@@ -30,6 +30,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@1.88.0
 
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@9d36bebae244fb1a7fd7831d3c5a4bc8f1cab230 # main
+
       - name: Check upstream releases
         id: release
         shell: bash
@@ -281,7 +284,7 @@ jobs:
 
           if [[ "$failed" == "false" ]]; then
             install_api_tool_log="$log_dir/install-api-check-tool.log"
-            if cargo install cargo-semver-checks --version 0.44.0 --locked >"$install_api_tool_log" 2>&1; then
+            if cargo binstall cargo-semver-checks -y --force --version 0.44.0 >"$install_api_tool_log" 2>&1; then
               api_check_log="$log_dir/api-compatibility.log"
               if ./scripts/check-wasm-bindgen-api.rs "$latest" >"$api_check_log" 2>&1; then
                 write_api_check_comments \
@@ -304,7 +307,7 @@ jobs:
             else
               api_check_failed=true
               write_api_check_comments \
-                "Failed to install cargo-semver-checks 0.44.0; the API compatibility check did not run." \
+                "Failed to install cargo-semver-checks 0.44.0 with cargo-binstall; the API compatibility check did not run." \
                 "failed" \
                 "$install_api_tool_log"
             fi

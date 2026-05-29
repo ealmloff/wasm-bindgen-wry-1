@@ -43,8 +43,11 @@ jobs:
         with:
           cache-all-crates: "true"
 
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@9d36bebae244fb1a7fd7831d3c5a4bc8f1cab230 # main
+
       - name: Install cargo-semver-checks
-        run: cargo install cargo-semver-checks --version 0.44.0 --locked
+        run: cargo binstall cargo-semver-checks -y --force --version 0.44.0
 
       - name: Run public API diff
         id: public_api
