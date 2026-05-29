@@ -110,255 +110,39 @@ jobs:
 
           current="${{ steps.release.outputs.current }}"
           latest="${{ steps.release.outputs.latest }}"
-          upstream_url="https://github.com/wasm-bindgen/wasm-bindgen.git"
-          upstream_dir="$RUNNER_TEMP/upstream-wasm-bindgen"
           report="$RUNNER_TEMP/wasm-bindgen-upgrade-report.md"
           log_dir="$RUNNER_TEMP/wasm-bindgen-upgrade-logs"
           failure_file="patches/wasm-bindgen/UPGRADE_FAILURE.md"
-          failed=false
-          api_check_failed=false
-          failure_step=""
+          status_file="$RUNNER_TEMP/wasm-bindgen-upgrade-status.env"
 
-          mkdir -p "$log_dir" patches/wasm-bindgen
-          rm -f "$failure_file"
+          set +e
+          ./scripts/update-wasm-bindgen.sh "$latest" \
+            --current "$current" \
+            --report "$report" \
+            --log-dir "$log_dir" \
+            --failure-file "$failure_file" \
+            --status-file "$status_file" \
+            --install-api-tool
+          update_status=$?
+          set -e
 
-          append_log() {
-            local title="$1"
-            local file="$2"
-            {
-              echo
-              echo "### $title"
-              echo
-              echo '```text'
-              cat "$file"
-              echo '```'
-            } >>"$report"
+          read_status() {
+            local key="$1"
+            sed -n "s/^${key}=//p" "$status_file" | tail -n 1
           }
 
-          fail_step() {
-            local title="$1"
-            local file="$2"
-            failed=true
-            failure_step="$title"
-            append_log "$title" "$file"
-          }
-
-          read_package_version_at() {
-            local repo="$1"
-            local commit="$2"
-            local manifest="$3"
-            git -C "$repo" show "$commit:$manifest" 2>/dev/null | awk '
-              $0 == "[package]" { in_package = 1; next }
-              /^\[/ { in_package = 0 }
-              in_package && $1 == "version" {
-                gsub(/"/, "", $3)
-                print $3
-                exit
-              }
-            '
-          }
-
-          replace_literal_in_patch() {
-            local patch_file="$1"
-            local from="$2"
-            local to="$3"
-            if [[ -n "$from" && -n "$to" && "$from" != "$to" ]]; then
-              FROM="$from" TO="$to" perl -0pi -e 's/\Q$ENV{FROM}\E/$ENV{TO}/g' "$patch_file"
-            fi
-          }
-
-          normalize_patch_versions() {
-            local source_commit="$1"
-            local target_commit="$2"
-            shift 2
-            local patch_files=("$@")
-            local manifest from to
-
-            local manifests=(
-              Cargo.toml
-              crates/futures/Cargo.toml
-              crates/js-sys/Cargo.toml
-              crates/shared/Cargo.toml
-              crates/web-sys/Cargo.toml
-            )
-
-            for manifest in "${manifests[@]}"; do
-              from="$(read_package_version_at "$upstream_dir" "$source_commit" "$manifest")"
-              to="$(read_package_version_at "$upstream_dir" "$target_commit" "$manifest")"
-              if [[ -z "$from" || -z "$to" ]]; then
-                continue
-              fi
-              for patch_file in "${patch_files[@]}"; do
-                replace_literal_in_patch "$patch_file" "$from" "$to"
-              done
-            done
-          }
-
-          {
-            echo "# wasm-bindgen upgrade to $latest"
-            echo
-            echo "- Current vendored version: $current"
-            echo "- Latest upstream release: $latest"
-            echo "- Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-            echo
-            echo "## Result"
-            echo
-            echo "The workflow applies patches/wasm-bindgen onto the new upstream release, replaces the tracked wasm-bindgen directory with the patched result, regenerates patches against the new upstream base, and bumps local crate versions."
-          } >"$report"
-
-          clone_log="$log_dir/clone-upstream.log"
-          if git clone --no-checkout "$upstream_url" "$upstream_dir" >"$clone_log" 2>&1; then
-            append_log "Cloned upstream wasm-bindgen" "$clone_log"
-          else
-            fail_step "Failed to clone upstream wasm-bindgen" "$clone_log"
+          if [[ ! -f "$status_file" ]]; then
+            echo "update-wasm-bindgen.sh did not write $status_file" >&2
+            exit "${update_status:-1}"
           fi
 
-          if [[ "$failed" == "false" ]]; then
-            checkout_log="$log_dir/checkout-latest.log"
-            if git -C "$upstream_dir" checkout "$latest" >"$checkout_log" 2>&1; then
-              append_log "Checked out upstream $latest" "$checkout_log"
-            else
-              fail_step "Failed to check out upstream $latest" "$checkout_log"
-            fi
-          fi
+          pr_title="$(read_status pr_title)"
+          failed="$(read_status failed)"
+          api_check_failed="$(read_status api_check_failed)"
 
-          shopt -s nullglob
-          patches=(patches/wasm-bindgen/*.patch)
-          shopt -u nullglob
-          normalized_patches=()
-          for patch in "${patches[@]}"; do
-            normalized_patch="$RUNNER_TEMP/normalized-wasm-bindgen-patches/$(basename "$patch")"
-            mkdir -p "$(dirname "$normalized_patch")"
-            cp "$patch" "$normalized_patch"
-            normalized_patches+=("$normalized_patch")
-          done
-
-          if [[ "$failed" == "false" && "${#patches[@]}" -gt 0 ]]; then
-            normalize_log="$log_dir/normalize-patches.log"
-            base_commit=""
-            if [[ -f patches/wasm-bindgen/BASE ]]; then
-              base_commit="$(tr -d '[:space:]' <patches/wasm-bindgen/BASE)"
-            fi
-            if [[ -z "$base_commit" ]]; then
-              base_commit="$current"
-            fi
-            latest_commit="$(git -C "$upstream_dir" rev-parse "$latest^{commit}")"
-            if normalize_patch_versions "$base_commit" "$latest_commit" "${normalized_patches[@]}" >"$normalize_log" 2>&1; then
-              {
-                echo "Normalized ${#normalized_patches[@]} patch file(s) from base $base_commit to $latest_commit."
-                echo "Committed patch files were not modified before patch application."
-              } >>"$normalize_log"
-              append_log "Normalized wasm-bindgen patch versions" "$normalize_log"
-            else
-              fail_step "Failed to normalize wasm-bindgen patch versions" "$normalize_log"
-            fi
-          fi
-
-          if [[ "$failed" == "false" && "${#patches[@]}" -gt 0 ]]; then
-            patch_log="$log_dir/apply-patches.log"
-            if git -C "$upstream_dir" am -3 "${normalized_patches[@]}" >"$patch_log" 2>&1; then
-              append_log "Applied wasm-bindgen patch stack" "$patch_log"
-            else
-              {
-                cat "$patch_log"
-                echo
-                echo "Upstream worktree status:"
-                git -C "$upstream_dir" status --short || true
-              } >"$log_dir/apply-patches-with-status.log"
-              fail_step "Failed to apply wasm-bindgen patch stack" "$log_dir/apply-patches-with-status.log"
-            fi
-          elif [[ "$failed" == "false" ]]; then
-            echo "No patch files found; vendoring clean upstream $latest." >"$log_dir/apply-patches.log"
-            append_log "No wasm-bindgen patches to apply" "$log_dir/apply-patches.log"
-          fi
-
-          if [[ "$failed" == "false" ]]; then
-            replace_log="$log_dir/replace-vendored-tree.log"
-            if rsync -a --delete --exclude .git "$upstream_dir/" wasm-bindgen/ >"$replace_log" 2>&1; then
-              append_log "Replaced vendored wasm-bindgen tree" "$replace_log"
-            else
-              fail_step "Failed to replace vendored wasm-bindgen tree" "$replace_log"
-            fi
-          fi
-
-          if [[ "$failed" == "false" ]]; then
-            refresh_log="$log_dir/refresh-patches.log"
-            rm -f patches/wasm-bindgen/*.patch patches/wasm-bindgen/BASE
-            if git -C "$upstream_dir" format-patch --output-directory "$GITHUB_WORKSPACE/patches/wasm-bindgen" "$latest..HEAD" >"$refresh_log" 2>&1; then
-              git -C "$upstream_dir" rev-parse "$latest^{commit}" >patches/wasm-bindgen/BASE
-              append_log "Regenerated wasm-bindgen patches" "$refresh_log"
-            else
-              fail_step "Failed to regenerate wasm-bindgen patches" "$refresh_log"
-            fi
-          fi
-
-          if [[ "$failed" == "false" ]]; then
-            version_log="$log_dir/bump-local-versions.log"
-            if ./scripts/bump-wasm-bindgen-version.rs >"$version_log" 2>&1; then
-              append_log "Bumped local crate versions" "$version_log"
-            else
-              fail_step "Failed to bump local crate versions" "$version_log"
-            fi
-          fi
-
-          if [[ "$failed" == "false" ]]; then
-            metadata_log="$log_dir/cargo-metadata.log"
-            metadata_output="$log_dir/cargo-metadata.json"
-            if cargo metadata --no-deps --format-version 1 >"$metadata_output" 2>"$metadata_log"; then
-              metadata_bytes="$(wc -c <"$metadata_output" | tr -d ' ')"
-              echo "cargo metadata --no-deps --format-version 1 completed successfully ($metadata_bytes output bytes)." >"$metadata_log"
-              append_log "Verified cargo metadata" "$metadata_log"
-            else
-              fail_step "Cargo metadata failed after upgrade" "$metadata_log"
-            fi
-          fi
-
-          if [[ "$failed" == "false" ]]; then
-            install_api_tool_log="$log_dir/install-api-check-tool.log"
-            if cargo binstall cargo-semver-checks -y --force --version 0.44.0 >"$install_api_tool_log" 2>&1; then
-              append_log "Installed cargo-semver-checks" "$install_api_tool_log"
-              api_check_log="$log_dir/api-compatibility.log"
-              if ./scripts/check-wasm-bindgen-api.rs "$latest" >"$api_check_log" 2>&1; then
-                append_log "API compatibility check passed" "$api_check_log"
-              else
-                api_check_status=$?
-                api_check_failed=true
-                {
-                  echo "check-wasm-bindgen-api.rs failed with status $api_check_status"
-                  echo
-                  cat "$api_check_log"
-                } >"$log_dir/api-compatibility-with-status.log"
-                append_log "API compatibility check failed" "$log_dir/api-compatibility-with-status.log"
-              fi
-            else
-              api_check_failed=true
-              append_log "Failed to install cargo-semver-checks" "$install_api_tool_log"
-            fi
-          fi
-
-          if [[ "$failed" == "true" ]]; then
-            mkdir -p "$(dirname "$failure_file")"
-            {
-              echo
-              echo "## Manual work required"
-              echo
-              echo "Failed step: $failure_step"
-              echo
-              echo "The tracked wasm-bindgen directory was left at the current committed version. See this report for logs."
-            } >>"$report"
-            cp "$report" "$failure_file"
-            echo "pr_title=Attempt wasm-bindgen update to $latest (manual fix needed)" >>"$GITHUB_OUTPUT"
-            echo "failed=true" >>"$GITHUB_OUTPUT"
-          else
-            {
-              echo
-              echo "## Upgrade completed"
-              echo
-              echo "The vendored wasm-bindgen tree, patch stack, and local bindgen crate versions were updated successfully."
-            } >>"$report"
-            echo "pr_title=Update wasm-bindgen to $latest" >>"$GITHUB_OUTPUT"
-            echo "failed=false" >>"$GITHUB_OUTPUT"
-          fi
+          echo "pr_title=$pr_title" >>"$GITHUB_OUTPUT"
+          echo "failed=$failed" >>"$GITHUB_OUTPUT"
+          echo "api_check_failed=$api_check_failed" >>"$GITHUB_OUTPUT"
 
           {
             echo "pr_body<<PR_BODY_EOF"
@@ -366,7 +150,6 @@ jobs:
             echo "PR_BODY_EOF"
           } >>"$GITHUB_OUTPUT"
 
-          echo "api_check_failed=$api_check_failed" >>"$GITHUB_OUTPUT"
           cat "$report" >>"$GITHUB_STEP_SUMMARY"
 
       - name: Open pull request
