@@ -9,8 +9,20 @@ repository = "https://github.com/DioxusLabs/wasm-bindgen-wry"
 [features]
 default = ["std"]
 std = []
-enable-interning = []
+# Mirror upstream wasm-bindgen's feature surface so the public-API diff (which runs
+# against this crate) matches and downstream feature flags resolve. `serde`/`serde_json`
+# enable the optional deps used by `JsValue::{from,into}_serde`; `gg-alloc`/`strict-macro`
+# exist to match upstream's feature names.
+enable-interning = ["std"]
+serde-serialize = ["serde", "serde_json", "std"]
+serde = ["dep:serde"]
+serde_json = ["dep:serde_json"]
+spans = []
+strict-macro = []
+gg-alloc = []
 msrv = []
+rustversion = []
+xxx_debug_only_print_generated_code = []
 
 [dependencies]
 base64 = "0.22"
@@ -26,6 +38,8 @@ futures-channel = "0.3.31"
 futures-util = "0.3.31"
 async-channel = "2.5.0"
 http = "1.4.0"
+serde = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
 
 [build-dependencies]
 lazy-js-bundle = "0.7.2"

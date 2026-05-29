@@ -6739,6 +6739,8 @@ dependencies = [
  "lazy-js-bundle 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "once_cell",
  "pollster",
+ "serde",
+ "serde_json",
  "spin 0.10.0",
  "wry-bindgen-macro",
 ]
