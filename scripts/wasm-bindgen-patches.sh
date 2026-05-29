@@ -57,6 +57,57 @@ resolve_commit() {
     git -C "$submodule_dir" rev-parse --verify "$ref^{commit}"
 }
 
+read_package_version_at() {
+    local commit="$1"
+    local manifest="$2"
+
+    git -C "$submodule_dir" show "$commit:$manifest" 2>/dev/null | awk '
+        $0 == "[package]" {
+            in_package = 1
+            next
+        }
+        /^\[/ && in_package {
+            exit
+        }
+        in_package && $1 == "version" && $2 == "=" {
+            version = $3
+            gsub(/"/, "", version)
+            print version
+            exit
+        }
+    '
+}
+
+replace_literal_in_patches() {
+    local from="$1"
+    local to="$2"
+    shift 2
+
+    [[ -n "$from" && -n "$to" && "$from" != "$to" ]] || return 0
+    FROM="$from" TO="$to" perl -0pi -e 's/\Q$ENV{FROM}\E/$ENV{TO}/g' "$@"
+}
+
+normalize_patch_versions() {
+    local source_commit="$1"
+    local target_commit="$2"
+    shift 2
+
+    local manifests=(
+        "Cargo.toml"
+        "crates/shared/Cargo.toml"
+        "crates/js-sys/Cargo.toml"
+        "crates/web-sys/Cargo.toml"
+        "crates/futures/Cargo.toml"
+    )
+
+    local manifest from to
+    for manifest in "${manifests[@]}"; do
+        from="$(read_package_version_at "$source_commit" "$manifest")"
+        to="$(read_package_version_at "$target_commit" "$manifest")"
+        replace_literal_in_patches "$from" "$to" "$@"
+    done
+}
+
 regen() {
     local base_ref base_commit head_commit
     base_ref="$(resolve_base_ref "${1:-}")"
@@ -77,7 +128,7 @@ regen() {
 }
 
 apply_patches() {
-    local base_ref base_commit
+    local base_ref base_commit patch_base_commit
     base_ref="$(resolve_base_ref "${1:-}")"
 
     ensure_submodule
@@ -88,6 +139,11 @@ apply_patches() {
     local patches=("$patch_dir"/*.patch)
     shopt -u nullglob
     ((${#patches[@]} > 0)) || die "no patchfiles found in $patch_dir"
+
+    if [[ -f "$patch_dir/BASE" ]]; then
+        patch_base_commit="$(head -n 1 "$patch_dir/BASE")"
+        normalize_patch_versions "$patch_base_commit" "$base_commit" "${patches[@]}"
+    fi
 
     git -C "$submodule_dir" reset --hard "$base_commit"
     git -C "$submodule_dir" am -3 "${patches[@]}"
