@@ -151,12 +151,14 @@ jobs:
             } >"$summary_file"
 
             if [[ -n "$file" && -f "$file" && "$byte_count" -le "$chunk_limit" ]]; then
+              local comment_file="$api_check_comment_dir/01-output.md"
               {
+                echo "## wasm-bindgen API compatibility output"
                 echo
                 echo "```text"
                 cat "$file"
                 echo "```"
-              } >>"$summary_file"
+              } >"$comment_file"
               return
             fi
 
@@ -275,7 +277,10 @@ jobs:
 
           if [[ "$failed" == "false" ]]; then
             metadata_log="$log_dir/cargo-metadata.log"
-            if cargo metadata --no-deps --format-version 1 >"$metadata_log" 2>&1; then
+            metadata_output="$log_dir/cargo-metadata.json"
+            if cargo metadata --no-deps --format-version 1 >"$metadata_output" 2>"$metadata_log"; then
+              metadata_bytes="$(wc -c <"$metadata_output" | tr -d ' ')"
+              echo "cargo metadata --no-deps --format-version 1 completed successfully ($metadata_bytes output bytes)." >"$metadata_log"
               append_log "Verified cargo metadata" "$metadata_log"
             else
               fail_step "Cargo metadata failed after upgrade" "$metadata_log"
