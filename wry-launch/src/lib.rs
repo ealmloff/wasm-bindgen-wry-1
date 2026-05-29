@@ -20,7 +20,7 @@ pub use bindings::{set_on_error, set_on_log};
 
 // Re-export prelude items that apps need
 pub use wasm_bindgen::JsValue;
-pub use wasm_bindgen::prelude::batch;
+pub use wasm_bindgen::batch::batch;
 
 // Re-export tao and wry for users to configure builders
 pub use tao;

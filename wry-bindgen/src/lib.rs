@@ -19,7 +19,7 @@ pub extern crate alloc;
 #[macro_use]
 extern crate std;
 
-mod batch;
+pub mod batch;
 mod cast;
 mod clamped;
 pub mod closure;
@@ -64,7 +64,6 @@ pub use value::JsValue;
 pub use crate::__rt::{Ref, RefMut};
 pub use parent::Parent;
 
-pub use batch::{batch, batch_async};
 pub use convert::{IntoJsGeneric, JsGeneric};
 pub use encode::{BatchableResult, BinaryDecode, BinaryEncode, EncodeTypeDef};
 pub use function::JSFunction;
@@ -229,8 +228,6 @@ pub mod prelude {
     pub use crate::JsValue;
     pub use crate::UnwrapThrowExt;
     pub use crate::WasmClosure;
-    pub use crate::batch::batch;
-    pub use crate::batch_async;
     pub use crate::closure::{Closure, ScopedClosure};
     pub use crate::convert::Upcast;
     pub use crate::convert::{IntoJsGeneric, JsGeneric, UpcastFrom};

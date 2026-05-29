@@ -1,4 +1,5 @@
 use wasm_bindgen::{batch, wasm_bindgen};
+use wry_launch::batch;
 
 #[wasm_bindgen(inline_js = r#"
 let thunkCalls = 0;
