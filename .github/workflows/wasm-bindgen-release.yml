@@ -209,6 +209,8 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C wasm-bindgen config user.name "github-actions[bot]"
+          git -C wasm-bindgen config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           fetch_log="$log_dir/fetch-tags.log"
           if git -C wasm-bindgen fetch --tags https://github.com/wasm-bindgen/wasm-bindgen.git \
