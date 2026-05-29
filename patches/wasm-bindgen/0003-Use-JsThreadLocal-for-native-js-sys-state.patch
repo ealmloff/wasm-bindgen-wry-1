@@ -1,4 +1,4 @@
-From c55b01904059c69e691d20641ef41e544252cbfa Mon Sep 17 00:00:00 2001
+From 73fbe973fbfd20ccc7246e8caf19c6fec8654c5e Mon Sep 17 00:00:00 2001
 From: Evan Almloff <evanalmloff@gmail.com>
 Date: Wed, 27 May 2026 12:06:09 -0500
 Subject: [PATCH 3/4] Use JsThreadLocal for native js-sys state
@@ -79,5 +79,5 @@ index efa25abe3..82a615a8d 100644
      fn get_global_object() -> Object {
          // Accessing the global object is not an easy thing to do, and what we
 -- 
-2.49.0
+2.54.0
 

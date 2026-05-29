@@ -576,8 +576,21 @@ impl<'a> Context<'a> {
     }
 
     fn export(&mut self, export: decode::Export<'_>) -> Result<(), Error> {
+        // The wasm shim symbol emitted by the macro (see
+        // `ast::Export::export_name`) prefixes the `js_namespace` for both
+        // class and free-function exports. Mirror that here so we can find
+        // the descriptor; without the prefix for the class case, two classes
+        // sharing a `js_class` across different `js_namespace`s would
+        // produce identical wasm names and collide at wasm-ld.
         let wasm_name = match &export.class {
-            Some(class) => struct_function_export_name(class, export.function.name),
+            Some(class) => {
+                let base = struct_function_export_name(class, export.function.name);
+                if let Some(ref ns) = export.js_namespace {
+                    format!("{}__{base}", ns.join("__"))
+                } else {
+                    base
+                }
+            }
             None => {
                 let base_name = export.function.name.to_string();
                 if let Some(ref ns) = export.js_namespace {
@@ -616,7 +629,15 @@ impl<'a> Context<'a> {
 
         let kind = match export.class {
             Some(class) => {
-                let class = class.to_string();
+                // Carry the namespaced `qualified_name` form (`ns__Foo`) as
+                // the class identity downstream so it matches the key the
+                // struct registered under in `exported_classes`. With just
+                // the bare `class` string, an impl whose struct lives in a
+                // `js_namespace` would not resolve back to its registered
+                // `exported_classes` entry and the constructor + methods
+                // would land on a fresh empty entry instead.
+                let class =
+                    wasm_bindgen_shared::qualified_name(export.js_namespace.as_deref(), class);
                 match export.method_kind {
                     decode::MethodKind::Constructor => {
                         verify_constructor_return(&class, &descriptor.ret)?;
@@ -1195,7 +1216,6 @@ impl<'a> Context<'a> {
             wasm_bindgen_shared::qualified_name(enum_.js_namespace.as_deref(), enum_.name);
         let aux = AuxEnum {
             name: enum_.name.to_string(),
-            qualified_name: qualified_name.clone(),
             comments: concatenate_comments(&enum_.comments),
             variants: enum_
                 .variants
@@ -1230,7 +1250,6 @@ impl<'a> Context<'a> {
     fn struct_(&mut self, struct_: decode::Struct<'_>) -> Result<(), Error> {
         let qualified_name =
             wasm_bindgen_shared::qualified_name(struct_.js_namespace.as_deref(), struct_.name);
-        let rust_name = struct_.rust_name;
         for field in struct_.fields {
             let getter = wasm_bindgen_shared::struct_field_get(&qualified_name, field.name);
             let setter = wasm_bindgen_shared::struct_field_set(&qualified_name, field.name);
@@ -1256,7 +1275,7 @@ impl<'a> Context<'a> {
                     asyncness: false,
                     comments: concatenate_comments(&field.comments),
                     kind: AuxExportKind::Method {
-                        class: rust_name.to_string(),
+                        class: qualified_name.clone(),
                         name: field.name.to_string(),
                         receiver: AuxReceiverKind::Borrowed,
                         kind: AuxExportedMethodKind::Getter,
@@ -1291,7 +1310,7 @@ impl<'a> Context<'a> {
                     asyncness: false,
                     comments: concatenate_comments(&field.comments),
                     kind: AuxExportKind::Method {
-                        class: rust_name.to_string(),
+                        class: qualified_name.clone(),
                         name: field.name.to_string(),
                         receiver: AuxReceiverKind::Borrowed,
                         kind: AuxExportedMethodKind::Setter,
@@ -1307,8 +1326,6 @@ impl<'a> Context<'a> {
         }
         let aux = AuxStruct {
             name: struct_.name.to_string(),
-            rust_name: rust_name.to_string(),
-            qualified_name: qualified_name.clone(),
             comments: concatenate_comments(&struct_.comments),
             is_inspectable: struct_.is_inspectable,
             generate_typescript: struct_.generate_typescript,
@@ -1318,6 +1335,11 @@ impl<'a> Context<'a> {
                 .map(|ns| ns.iter().map(|s| s.to_string()).collect()),
             private: struct_.private,
             extends: struct_.extends.map(|s| s.to_string()),
+            extends_js_class: struct_.extends_js_class.map(|s| s.to_string()),
+            extends_js_namespace: struct_
+                .extends_js_namespace
+                .as_ref()
+                .map(|ns| ns.iter().map(|s| s.to_string()).collect()),
         };
         self.aux.structs.push(aux);
 
@@ -1332,7 +1354,9 @@ impl<'a> Context<'a> {
             &wrap_constructor,
             vec![ptr_desc.clone()],
             Descriptor::Externref,
-            AuxImport::WrapInExportedClass(rust_name.to_string()),
+            // Class identity downstream must match the `exported_classes`
+            // key, i.e. `qualified_name`.
+            AuxImport::WrapInExportedClass(qualified_name.to_string()),
         )?;
 
         let unwrap_fn = wasm_bindgen_shared::unwrap_function(&qualified_name);
@@ -1340,7 +1364,7 @@ impl<'a> Context<'a> {
             &unwrap_fn,
             vec![Descriptor::Ref(Box::new(Descriptor::Externref))],
             ptr_desc,
-            AuxImport::UnwrapExportedClass(rust_name.to_string()),
+            AuxImport::UnwrapExportedClass(qualified_name.to_string()),
         )?;
 
         Ok(())

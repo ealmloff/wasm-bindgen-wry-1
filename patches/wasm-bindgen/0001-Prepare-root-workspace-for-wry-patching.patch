@@ -1,4 +1,4 @@
-From a7ff0bf8c5e0249889de41d8e9f7a220bb38c432 Mon Sep 17 00:00:00 2001
+From cd8458c1524685ae1c59b4f002a540b08e07b0e6 Mon Sep 17 00:00:00 2001
 From: Evan Almloff <evanalmloff@gmail.com>
 Date: Fri, 29 May 2026 10:56:07 -0500
 Subject: [PATCH 1/4] Prepare root workspace for wry patching
@@ -8,7 +8,7 @@ Subject: [PATCH 1/4] Prepare root workspace for wry patching
  1 file changed, 11 insertions(+), 46 deletions(-)
 
 diff --git a/Cargo.toml b/Cargo.toml
-index 4abdfb945..909453b49 100644
+index cc5ca3aaa..1cd28e0c5 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -9,7 +9,7 @@ edition = "2021"
@@ -90,5 +90,5 @@ index 4abdfb945..909453b49 100644
 -wasm-bindgen-test = { path = 'crates/test' }
 -web-sys = { path = 'crates/web-sys' }
 -- 
-2.49.0
+2.54.0
 

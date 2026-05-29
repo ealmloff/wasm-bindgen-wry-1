@@ -3,6 +3,138 @@
 
 ## Unreleased
 
+### Added
+
+### Changed
+
+### Fixed
+
+### Removed
+
+--------------------------------------------------------------------------------
+
+## [0.2.122](https://github.com/wasm-bindgen/wasm-bindgen/compare/0.2.121...0.2.122)
+
+### Notices
+
+* Threading support now requires `-Clink-arg=--export=__heap_base` to be set
+  in `RUSTFLAGS` for nightly toolchains from 2026-05-06 onward, after
+  [rust-lang/rust#156174](https://github.com/rust-lang/rust/pull/156174)
+  removed the implicit `__heap_base`/`__data_end` exports on `wasm*`
+  targets. Atomics CI, CLI reference tests, and the `nodejs-threads`,
+  `raytrace-parallel`, and `wasm-audio-worklet` examples have been
+  updated to pass `--export=__heap_base` explicitly. The flag is
+  backward-compatible with older nightlies.
+
+* `-Cpanic=unwind` on wasm targets now emits modern (exnref) exception
+  handling by default after
+  [rust-lang/rust#156061](https://github.com/rust-lang/rust/pull/156061),
+  and requires Node.js 22.22.3+ (for `WebAssembly.JSTag`). Legacy EH wasm
+  can still be produced on current nightlies by adding
+  `-Cllvm-args=-wasm-use-legacy-eh` to `RUSTFLAGS`; Node.js 20 may be
+  supported with legacy exception handling, with a tracking issue in
+  [#5151](https://github.com/wasm-bindgen/wasm-bindgen/issues/5151).
+
+### Added
+
+* Implemented `TryFromJsValue` for `Vec<T>` where `T: TryFromJsValue`.
+  A JS value converts when it is a real `Array` (per `Array.isArray`)
+  and every element converts via `T::try_from_js_value`. This composes
+  recursively (`Vec<Vec<String>>`, `Vec<Option<T>>`) and works for any
+  `T` with a `TryFromJsValue` impl, including primitives, `String`,
+  `JsValue`, and `JsCast` types. Array-likes (objects with `length` and
+  numeric indices) are intentionally rejected to mirror the static ABI
+  representation used by `js_value_vector_from_abi`.
+
+* New `extends_js_class` and `extends_js_namespace` attributes on
+  exported structs to allow defining the parent `js_class` name when
+  it has been customized by `js_name` and the parent's own `js_namespace`
+  as well in turn. New validation is added at code generation time that
+  will now catch these cases instead of emitting invalid code. Example:
+
+  ```rust
+  #[wasm_bindgen(js_name = "Animal", js_namespace = zoo)]
+  pub struct AnimalImpl { /* ... */ }
+
+  #[wasm_bindgen(
+      extends = AnimalImpl,
+      extends_js_class = "Animal",
+      extends_js_namespace = zoo,
+  )]
+  pub struct DogImpl { /* ... */ }
+  ```
+  [#5154](https://github.com/wasm-bindgen/wasm-bindgen/pull/5154)
+
+### Changed
+
+* When an exported struct uses `js_namespace`, the corresponding value
+  must now be repeated on every `impl` block. Previously the impl-side
+  defaults silently worked resulting in inconsistent emission. Example:
+
+  ```rust
+  // Before:
+  #[wasm_bindgen(js_namespace = "default")]
+  pub struct Counter { /* ... */ }
+
+  #[wasm_bindgen]              // worked, but fragile
+  impl Counter { /* ... */ }
+
+  // After:
+  #[wasm_bindgen(js_namespace = "default")]
+  pub struct Counter { /* ... */ }
+
+  #[wasm_bindgen(js_namespace = "default")]   // now required
+  impl Counter { /* ... */ }
+  ```
+  To ease this transition for `js_namespace` usage, diagnostic
+  messages now include hints for missing namespaces for easier
+  fixing.
+  
+  [#5154](https://github.com/wasm-bindgen/wasm-bindgen/pull/5154)
+
+### Fixed
+
+* Fixed the descriptor interpreter panicking on `Br` and `BrIf`
+  instructions emitted by recent nightly compilers when building with
+  `panic=unwind`.
+  [#5158](https://github.com/wasm-bindgen/wasm-bindgen/pull/5158)
+
+* Emscripten output now works against vanilla upstream emscripten without
+  requiring a fork. Dependency tracking, `HEAP_DATA_VIEW` setup,
+  function-decl intrinsic inlining, catch-wrapper gating, and imported
+  global handling have all been corrected; ESM imports
+  (`#[wasm_bindgen(module = "...")]` and snippets) are emitted to a
+  sidecar `library_bindgen.extern-pre.js` consumers pass to emcc via
+  `--extern-pre-js`; namespaced exports (`js_namespace = [...]` on a
+  struct/impl) now attach to `Module.<segments>` instead of emitting
+  top-level `export const` (which emcc's library evaluator rejects);
+  the generated `.d.ts` for namespaced exports is now valid TypeScript
+  (mangled identifiers stay module-internal via `declare class` /
+  `declare enum` / `declare function` plus `export { BindgenModule };`
+  to mark the file as a module; no spurious unqualified `Calc:`
+  property on `BindgenModule` for namespaced items; namespace shapes
+  land as plain interface members (`app: { math: { Calc: typeof
+  app__math__Calc } };`) instead of the previously-emitted `export
+  let app: { ... };` which was invalid TS1131 syntax inside an
+  interface body).
+  [#5156](https://github.com/wasm-bindgen/wasm-bindgen/pull/5156)
+
+* Fixed a duplicate phantom class being emitted for an exported struct
+  renamed via `js_name` (Rust ident != JS class name) and/or placed in a
+  `js_namespace`, when the struct crosses the boundary as a `JsValue`
+  (e.g. via `.into()`). The `WrapInExportedClass` / `UnwrapExportedClass`
+  imports were keyed by the Rust ident rather than the qualified JS name
+  that `exported_classes` is keyed by (a regression from #5154), so a
+  fresh empty class entry was minted and emitted alongside the real one,
+  with a `free()` referencing a nonexistent wasm export. Riding the
+  same release's #5154 wire-format bump, the now-vestigial `rust_name`
+  field is dropped from the schema and the namespace-qualified name is
+  no longer cached on `AuxStruct`, `AuxEnum`, or `ExportedClass`
+  (derived on demand from `(name, js_namespace)`), collapsing three
+  fallback chains that only papered over the pre-#5154 keying.
+
+  [#5160](https://github.com/wasm-bindgen/wasm-bindgen/pull/5160)
+
 --------------------------------------------------------------------------------
 
 ## [0.2.121](https://github.com/rustwasm/wasm-bindgen/compare/0.2.120...0.2.121)
@@ -174,6 +306,17 @@
   [#5127](https://github.com/wasm-bindgen/wasm-bindgen/pull/5127)
 
 ### Changed
+
+* `#[wasm_bindgen]` exports now enforce unwind-safety at compile time under
+  `panic = "unwind"`. The generated wrapper for every `&self` / `&mut self`
+  method asserts `Self: RefUnwindSafe`, and reference arguments `&T` / `&mut T`
+  assert `T: RefUnwindSafe`, before the body runs inside `catch_unwind`. This
+  catches at compile time methods whose interior-mutable state could be
+  silently torn by a caught panic (e.g. a `RefCell` left borrowed, a `Cell`
+  updated halfway through restoring an invariant). The check is a no-op
+  outside `panic = "unwind"` builds. Users whose type is genuinely safe can
+  opt in with `impl RefUnwindSafe for MyType {}` or by wrapping interior-
+  mutable fields in `std::panic::AssertUnwindSafe`.
 
 * Simplified generated `web-sys` bindings by omitting redundant
   `#[wasm_bindgen]` attributes when they match wasm-bindgen defaults, including
