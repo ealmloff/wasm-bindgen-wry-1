@@ -155,9 +155,9 @@ jobs:
               {
                 echo "## wasm-bindgen API compatibility output"
                 echo
-                echo "```text"
+                echo '```text'
                 cat "$file"
-                echo "```"
+                echo '```'
               } >"$comment_file"
               return
             fi
@@ -178,10 +178,10 @@ jobs:
                 {
                   echo "## wasm-bindgen API compatibility output ($index/$chunk_count)"
                   echo
-                  echo "```text"
+                  echo '```text'
                   cat "$chunk"
                   echo
-                  echo "```"
+                  echo '```'
                 } >"$comment_file"
                 rm -f "$chunk"
                 index=$((index + 1))
