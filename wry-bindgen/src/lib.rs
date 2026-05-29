@@ -51,6 +51,7 @@ pub mod wry;
 pub use intern::*;
 
 // Re-export core types
+pub use crate::__rt::marker::ErasableGeneric;
 pub use cast::JsCast;
 pub use clamped::Clamped;
 pub use closure::{
