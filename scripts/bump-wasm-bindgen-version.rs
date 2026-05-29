@@ -34,6 +34,15 @@ const LOCAL_CRATES: &[&str] = &[
     "wry-bindgen-macro-support",
 ];
 const UPSTREAM_PACKAGE_NAMES: &[&str] = &["wasm-bindgen", "not-wasm-bindgen"];
+const PATCHED_UPSTREAM_MANIFESTS: &[(&str, &str)] = &[
+    ("wasm-bindgen/crates/js-sys/Cargo.toml", "js-sys"),
+    ("wasm-bindgen/crates/web-sys/Cargo.toml", "web-sys"),
+    (
+        "wasm-bindgen/crates/futures/Cargo.toml",
+        "wasm-bindgen-futures",
+    ),
+];
+const PINNED_UPSTREAM_DEPENDENCY_MANIFESTS: &[&str] = &["wry-launch/Cargo.toml"];
 
 #[derive(Debug)]
 struct Error(String);
@@ -85,12 +94,23 @@ fn run() -> Result<()> {
 
     let base_version = read_package_version(&upstream_manifest, Some(UPSTREAM_PACKAGE_NAMES))?;
     let version = target_version(&base_version, args.suffix.as_deref())?;
+    let patched_upstream_versions = read_patched_upstream_versions(&repo_root)?;
     let mut changes = Vec::new();
 
     for (relative_path, crate_name) in LOCAL_MANIFESTS {
         let path = repo_root.join(relative_path);
         let current = fs::read_to_string(&path)?;
         let updated = update_manifest_text(&path, &current, crate_name, &version)?;
+        if updated != current {
+            changes.push((path, updated));
+        }
+    }
+
+    for relative_path in PINNED_UPSTREAM_DEPENDENCY_MANIFESTS {
+        let path = repo_root.join(relative_path);
+        let current = fs::read_to_string(&path)?;
+        let updated =
+            update_dependency_versions_text(&current, patched_upstream_versions.as_slice());
         if updated != current {
             changes.push((path, updated));
         }
@@ -143,6 +163,16 @@ fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn read_patched_upstream_versions(repo_root: &Path) -> Result<Vec<(&'static str, String)>> {
+    let mut versions = Vec::new();
+    for (relative_path, crate_name) in PATCHED_UPSTREAM_MANIFESTS {
+        let path = repo_root.join(relative_path);
+        let version = read_package_version(&path, Some(&[*crate_name]))?;
+        versions.push((*crate_name, version));
+    }
+    Ok(versions)
 }
 
 fn parse_args() -> Result<Args> {
@@ -307,7 +337,7 @@ fn read_package_version(path: &Path, expected_names: Option<&[&str]>) -> Result<
                 expected_names.join(", ")
             )));
         }
-        if name != "wasm-bindgen" {
+        if expected_names.contains(&"not-wasm-bindgen") && name != "wasm-bindgen" {
             eprintln!(
                 "note: deriving wasm-bindgen version from patched upstream package `{name}` in {}",
                 path.display()
@@ -387,6 +417,34 @@ fn update_manifest_text(
     Ok(lines.into_string())
 }
 
+fn update_dependency_versions_text(text: &str, dependency_versions: &[(&str, String)]) -> String {
+    let mut lines = Lines::from(text);
+    for index in 0..lines.len() {
+        let line = lines.body(index).to_string();
+        if let Some((prefix, key, table_body, suffix)) = split_inline_table(&line) {
+            let dependency_name = inline_table_value(table_body, "package").unwrap_or(key);
+            let Some(version) = dependency_version(dependency_versions, dependency_name) else {
+                continue;
+            };
+            if inline_table_value(table_body, "version").is_none() {
+                continue;
+            }
+
+            let updated_table =
+                replace_inline_table_value(table_body, "version", &format!("={version}"));
+            lines.set_body(index, format!("{prefix}{updated_table}{suffix}"));
+            continue;
+        }
+
+        for (dependency_name, version) in dependency_versions {
+            if lines.replace_field(index, dependency_name, &format!("={version}")) {
+                break;
+            }
+        }
+    }
+    lines.into_string()
+}
+
 fn update_lock_text(path: &Path, text: &str, target_version: &str) -> Result<String> {
     let mut lines = Lines::from(text);
     let mut found = BTreeSet::new();
@@ -413,19 +471,7 @@ fn update_lock_text(path: &Path, text: &str, target_version: &str) -> Result<Str
         }
 
         found.insert(name.to_string());
-        let mut updated = false;
-        for line_index in start..end {
-            if lines.replace_field(line_index, "version", target_version) {
-                updated = true;
-                break;
-            }
-        }
-        if !updated {
-            return Err(Error::new(format!(
-                "{} package `{name}` is missing field `version`",
-                path.display()
-            )));
-        }
+        replace_package_version(&mut lines, path, start, end, name, target_version)?;
     }
 
     let missing: Vec<_> = LOCAL_CRATES
@@ -442,6 +488,34 @@ fn update_lock_text(path: &Path, text: &str, target_version: &str) -> Result<Str
     }
 
     Ok(lines.into_string())
+}
+
+fn dependency_version<'a>(
+    dependency_versions: &'a [(&str, String)],
+    dependency_name: &str,
+) -> Option<&'a str> {
+    dependency_versions
+        .iter()
+        .find_map(|(name, version)| (*name == dependency_name).then_some(version.as_str()))
+}
+
+fn replace_package_version(
+    lines: &mut Lines,
+    path: &Path,
+    start: usize,
+    end: usize,
+    name: &str,
+    version: &str,
+) -> Result<()> {
+    for line_index in start..end {
+        if lines.replace_field(line_index, "version", version) {
+            return Ok(());
+        }
+    }
+    Err(Error::new(format!(
+        "{} package `{name}` is missing field `version`",
+        path.display()
+    )))
 }
 
 fn find_section<'a>(text: &'a str, section: &str) -> Option<&'a str> {
@@ -500,11 +574,7 @@ fn slice_lines(text: &str, start_line: usize, end_line: usize) -> &str {
 fn read_field<'a>(text: &'a str, field: &str) -> Option<&'a str> {
     for line in text.lines() {
         let trimmed = line.trim_start();
-        let Some(rest) = trimmed.strip_prefix(field) else {
-            continue;
-        };
-        let rest = rest.trim_start();
-        let Some(rest) = rest.strip_prefix('=') else {
+        let Some(rest) = strip_toml_field_prefix(trimmed, field) else {
             continue;
         };
         let rest = rest.trim_start();
@@ -515,6 +585,16 @@ fn read_field<'a>(text: &'a str, field: &str) -> Option<&'a str> {
         return Some(&rest[..end]);
     }
     None
+}
+
+fn strip_toml_field_prefix<'a>(trimmed_line: &'a str, field: &str) -> Option<&'a str> {
+    let rest = trimmed_line.strip_prefix(field)?;
+    let next = rest.chars().next();
+    if next.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-') {
+        return None;
+    }
+    let rest = rest.trim_start();
+    rest.strip_prefix('=')
 }
 
 fn split_inline_table(line: &str) -> Option<(&str, &str, &str, &str)> {
@@ -785,6 +865,24 @@ version = "0.2.106-alpha.1"
         assert!(
             output.contains("source = \"registry+https://github.com/rust-lang/crates.io-index\"")
         );
+    }
+
+    #[test]
+    fn dependency_update_pins_patched_upstream_crates() {
+        let input = r#"[dev-dependencies]
+web-sys = { version = "0.3.98", features = ["Window"] }
+wasm-bindgen-futures = "0.4.71"
+serde = "1"
+"#;
+        let versions = vec![
+            ("web-sys", "0.3.99".to_string()),
+            ("wasm-bindgen-futures", "0.4.72".to_string()),
+        ];
+        let output = update_dependency_versions_text(input, &versions);
+
+        assert!(output.contains("web-sys = { version = \"=0.3.99\""));
+        assert!(output.contains("wasm-bindgen-futures = \"=0.4.72\""));
+        assert!(output.contains("serde = \"1\""));
     }
 
     #[test]
