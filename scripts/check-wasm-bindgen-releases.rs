@@ -1,13 +1,6 @@
 #!/bin/sh
 //usr/bin/env rustc --edition=2024 "$0" -o "${TMPDIR:-/tmp}/check-wasm-bindgen-releases" && CHECK_WASM_BINDGEN_RELEASES_SOURCE="$0" "${TMPDIR:-/tmp}/check-wasm-bindgen-releases" "$@"; exit $?
 
-// Run directly with:
-//   ./scripts/check-wasm-bindgen-releases.rs [--check] [--list]
-//
-// Or compile manually with:
-//   rustc --edition=2024 scripts/check-wasm-bindgen-releases.rs -o /tmp/check-wasm-bindgen-releases
-//   /tmp/check-wasm-bindgen-releases [--check] [--list]
-
 use std::env;
 use std::fmt;
 use std::fs;
@@ -110,10 +103,6 @@ fn run() -> Result<i32> {
         println!("new upstream release:       {latest}");
     }
 
-    println!("next steps:");
-    println!("  scripts/wasm-bindgen-patches.sh apply {latest}");
-    println!("  ./scripts/bump-wasm-bindgen-version.rs");
-
     Ok(if args.check { 1 } else { 0 })
 }
 
@@ -175,13 +164,6 @@ The script reads stable release tags from upstream git refs and ignores prerelea
 fn read_current_version() -> Result<Version> {
     let repo_root = repo_root()?;
     let manifest = repo_root.join("wasm-bindgen/Cargo.toml");
-    if !manifest.exists() {
-        return Err(Error::new(format!(
-            "missing {}; initialize or update the wasm-bindgen submodule first",
-            manifest.display()
-        )));
-    }
-
     let text = fs::read_to_string(&manifest)?;
     let package = find_section(&text, "package").ok_or_else(|| {
         Error::new(format!(
@@ -267,60 +249,42 @@ fn fetch_releases(remote: &str) -> Result<Vec<Version>> {
     let output = Command::new("git")
         .args(["ls-remote", "--tags", "--refs", remote, "refs/tags/*"])
         .output()
-        .map_err(|error| Error::new(format!("failed to run git ls-remote: {error}")))?;
-
+        .map_err(|error| Error::new(format!("failed to query {remote}: {error}")))?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(Error::new(format!(
-            "git ls-remote failed for {remote}: {}",
-            stderr.trim()
+            "failed to query {remote}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut releases = parse_releases(&stdout);
+    let mut releases = parse_releases(&String::from_utf8_lossy(&output.stdout));
     releases.sort_unstable();
     releases.dedup();
     Ok(releases)
 }
 
-fn parse_releases(ls_remote_output: &str) -> Vec<Version> {
-    ls_remote_output
+fn parse_releases(output: &str) -> Vec<Version> {
+    output
         .lines()
-        .filter_map(|line| {
-            let ref_name = line.split_whitespace().nth(1)?;
-            let tag = ref_name.strip_prefix("refs/tags/")?;
-            parse_version(tag)
-        })
+        .filter_map(|line| line.split_once("refs/tags/").map(|(_, tag)| tag))
+        .filter_map(parse_version)
         .collect()
 }
 
 fn parse_version(version: &str) -> Option<Version> {
     let version = version.strip_prefix('v').unwrap_or(version);
-    if version.contains('-') || version.contains('+') {
-        return None;
-    }
-
     let mut parts = version.split('.');
-    let major = parse_part(parts.next()?)?;
-    let minor = parse_part(parts.next()?)?;
-    let patch = parse_part(parts.next()?)?;
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
     if parts.next().is_some() {
         return None;
     }
-
     Some(Version {
         major,
         minor,
         patch,
     })
-}
-
-fn parse_part(part: &str) -> Option<u64> {
-    if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    part.parse().ok()
 }
 
 fn find_section<'a>(text: &'a str, section: &str) -> Option<&'a str> {
