@@ -131,6 +131,10 @@ pub struct JsClassMemberSpec {
     export_name: &'static str,
     /// Number of arguments (excluding self/handle)
     arg_count: usize,
+    /// Function that returns type definitions for explicit arguments.
+    arg_types: fn() -> Vec<Vec<u8>>,
+    /// Function that returns the optional return type definition.
+    return_type: fn() -> Option<Vec<u8>>,
     /// Type of member
     kind: JsClassMemberKind,
 }
@@ -141,6 +145,8 @@ impl JsClassMemberSpec {
         member_name: &'static str,
         export_name: &'static str,
         arg_count: usize,
+        arg_types: fn() -> Vec<Vec<u8>>,
+        return_type: fn() -> Option<Vec<u8>>,
         kind: JsClassMemberKind,
     ) -> Self {
         Self {
@@ -148,6 +154,8 @@ impl JsClassMemberSpec {
             member_name,
             export_name,
             arg_count,
+            arg_types,
+            return_type,
             kind,
         }
     }
@@ -170,6 +178,16 @@ impl JsClassMemberSpec {
     /// Get the number of arguments (excluding self/handle)
     pub const fn arg_count(&self) -> usize {
         self.arg_count
+    }
+
+    /// Get type definitions for explicit arguments.
+    pub fn arg_types(&self) -> Vec<Vec<u8>> {
+        (self.arg_types)()
+    }
+
+    /// Get the optional return type definition.
+    pub fn return_type(&self) -> Option<Vec<u8>> {
+        (self.return_type)()
     }
 
     /// Get the type of member
@@ -222,6 +240,54 @@ fn generate_args(count: usize) -> String {
         .map(|i| format!("a{i}"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn object_handle_type_def() -> Vec<u8> {
+    vec![crate::encode::TypeTag::U32 as u8]
+}
+
+fn js_u8_array_literal(bytes: &[u8]) -> String {
+    let mut out = String::from("[");
+    for (i, byte) in bytes.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        write!(&mut out, "{byte}").unwrap();
+    }
+    out.push(']');
+    out
+}
+
+fn js_type_defs_literal(types: &[Vec<u8>]) -> String {
+    let mut out = String::from("[");
+    for (i, ty) in types.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&js_u8_array_literal(ty));
+    }
+    out.push(']');
+    out
+}
+
+fn js_optional_type_def_literal(ty: Option<Vec<u8>>) -> String {
+    ty.map(|ty| js_u8_array_literal(&ty))
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn call_export_expression(
+    export_name: &str,
+    arg_types: &[Vec<u8>],
+    return_type: Option<Vec<u8>>,
+    args_call: &str,
+) -> String {
+    format!(
+        r#"window.__wryCallExport("{}", {}, {}, [{}])"#,
+        export_name,
+        js_type_defs_literal(arg_types),
+        js_optional_type_def_literal(return_type),
+        args_call,
+    )
 }
 
 impl FunctionRegistry {
@@ -285,6 +351,10 @@ impl FunctionRegistry {
 
         // Generate complete class definitions for each exported struct
         for (class_name, members) in &class_members {
+            let drop_export_name = format!("{class_name}::__drop");
+            let drop_arg_types = [object_handle_type_def()];
+            let drop_call =
+                call_export_expression(&drop_export_name, &drop_arg_types, None, "handle");
             // Generate class shell
             writeln!(
                 &mut script,
@@ -304,7 +374,7 @@ impl FunctionRegistry {
     free() {{
       const handle = this.__handle;
       this.__handle = 0;
-      if (handle !== 0) window.__wryCallExport("{class_name}::__drop", handle);
+      if (handle !== 0) {drop_call};
     }}"#
             )
             .unwrap();
@@ -324,13 +394,20 @@ impl FunctionRegistry {
                         } else {
                             "this.__handle".to_string()
                         };
+                        let mut arg_types = vec![object_handle_type_def()];
+                        arg_types.extend(member.arg_types());
+                        let call = call_export_expression(
+                            member.export_name(),
+                            &arg_types,
+                            member.return_type(),
+                            &args_with_handle,
+                        );
                         writeln!(
                             &mut script,
-                            r#"    {}({}) {{ return window.__wryCallExport("{}", {}); }}"#,
+                            r#"    {}({}) {{ return {}; }}"#,
                             member.member_name(),
                             args,
-                            member.export_name(),
-                            args_with_handle
+                            call
                         )
                         .unwrap();
                     }
@@ -350,36 +427,29 @@ impl FunctionRegistry {
             property_names.extend(getters.keys());
             property_names.extend(setters.keys());
 
+            // Build a property-accessor call for a getter (`this.__handle`) or
+            // setter (`this.__handle, v`) member.
+            let accessor_call = |member: &JsClassMemberSpec, args_call: &str| {
+                let mut arg_types = vec![object_handle_type_def()];
+                arg_types.extend(member.arg_types());
+                call_export_expression(
+                    member.export_name(),
+                    &arg_types,
+                    member.return_type(),
+                    args_call,
+                )
+            };
+
             for prop_name in property_names {
                 let getter = getters.get(prop_name);
                 let setter = setters.get(prop_name);
-                match (getter, setter) {
-                    (Some(g), Some(s)) => {
-                        writeln!(
-                            &mut script,
-                            r#"    get {}() {{ return window.__wryCallExport("{}", this.__handle); }}
-    set {}(v) {{ window.__wryCallExport("{}", this.__handle, v); }}"#,
-                            prop_name, g.export_name(), prop_name, s.export_name()
-                        )
-                        .unwrap();
-                    }
-                    (Some(g), None) => {
-                        writeln!(
-                            &mut script,
-                            r#"    get {}() {{ return window.__wryCallExport("{}", this.__handle); }}"#,
-                            prop_name, g.export_name()
-                        )
-                        .unwrap();
-                    }
-                    (None, Some(s)) => {
-                        writeln!(
-                            &mut script,
-                            r#"    set {}(v) {{ window.__wryCallExport("{}", this.__handle, v); }}"#,
-                            prop_name, s.export_name()
-                        )
-                        .unwrap();
-                    }
-                    (None, None) => {}
+                if let Some(g) = getter {
+                    let call = accessor_call(g, "this.__handle");
+                    writeln!(&mut script, r#"    get {prop_name}() {{ return {call}; }}"#).unwrap();
+                }
+                if let Some(s) = setter {
+                    let call = accessor_call(s, "this.__handle, v");
+                    writeln!(&mut script, r#"    set {prop_name}(v) {{ {call}; }}"#).unwrap();
                 }
             }
 
@@ -388,37 +458,32 @@ impl FunctionRegistry {
 
             // Add static methods and constructors outside the class
             for member in members {
-                match member.kind() {
-                    JsClassMemberKind::Constructor => {
-                        let args = generate_args(member.arg_count());
-                        let args_call = if member.arg_count() > 0 { &args } else { "" };
-                        writeln!(
-                            &mut script,
-                            r#"  {class_name}.{method_name} = function({args}) {{ const handle = window.__wryCallExport("{export_name}", {args_call}); return {class_name}.__wrap(handle); }};"#,
-                            class_name = class_name,
-                            method_name = member.member_name(),
-                            args = args,
-                            export_name = member.export_name(),
-                            args_call = args_call
-                        )
-                        .unwrap();
-                    }
-                    JsClassMemberKind::StaticMethod => {
-                        let args = generate_args(member.arg_count());
-                        let args_call = if member.arg_count() > 0 { &args } else { "" };
-                        writeln!(
-                            &mut script,
-                            r#"  {class_name}.{method_name} = function({args}) {{ return window.__wryCallExport("{export_name}", {args_call}); }};"#,
-                            class_name = class_name,
-                            method_name = member.member_name(),
-                            args = args,
-                            export_name = member.export_name(),
-                            args_call = args_call
-                        )
-                        .unwrap();
-                    }
-                    _ => {} // Methods, getters, setters already handled
-                }
+                let is_constructor = match member.kind() {
+                    JsClassMemberKind::Constructor => true,
+                    JsClassMemberKind::StaticMethod => false,
+                    _ => continue, // Methods, getters, setters already handled
+                };
+                let args = generate_args(member.arg_count());
+                let args_call = if member.arg_count() > 0 { &args } else { "" };
+                let call = call_export_expression(
+                    member.export_name(),
+                    &member.arg_types(),
+                    member.return_type(),
+                    args_call,
+                );
+                let method_name = member.member_name();
+                // Constructors wrap the returned handle in a class instance;
+                // static methods return the call result directly.
+                let body = if is_constructor {
+                    format!("const handle = {call}; return {class_name}.__wrap(handle);")
+                } else {
+                    format!("return {call};")
+                };
+                writeln!(
+                    &mut script,
+                    r#"  {class_name}.{method_name} = function({args}) {{ {body} }};"#
+                )
+                .unwrap();
             }
 
             // Register class on window

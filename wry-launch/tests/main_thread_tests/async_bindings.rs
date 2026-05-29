@@ -184,6 +184,35 @@ pub(crate) async fn test_async_static_method() {
     assert_eq!(result.as_string().unwrap(), "data_for_test_key");
 }
 
+pub(crate) async fn test_already_resolved_async() {
+    #[wasm_bindgen(inline_js = "export function resolved_identity(key) {
+        return Promise.resolve(key);
+    }")]
+    extern "C" {
+        #[wasm_bindgen]
+        async fn resolved_identity(key: u32) -> JsValue;
+    }
+
+    for i in 0..100u32 {
+        let result = resolved_identity(i).await;
+        assert_eq!(result.as_f64().unwrap() as u32, i);
+    }
+}
+
+pub(crate) async fn test_already_rejected_async_catch() {
+    #[wasm_bindgen(inline_js = "export function rejected_value(error) {
+        return Promise.reject(error);
+    }")]
+    extern "C" {
+        #[wasm_bindgen(catch)]
+        async fn rejected_value(error: &str) -> Result<(), JsValue>;
+    }
+
+    let result = rejected_value("Test error").await;
+    let err = result.err().unwrap();
+    assert_eq!(err.as_string().unwrap(), "Test error");
+}
+
 pub(crate) async fn test_join_many_async() {
     #[wasm_bindgen(inline_js = "export async function identity(key) {
         return new Promise((resolve) => {

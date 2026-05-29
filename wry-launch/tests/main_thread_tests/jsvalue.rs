@@ -161,10 +161,12 @@ pub(crate) fn test_jsvalue_arithmetic() {
     #[wasm_bindgen(inline_js = r#"
         export function get_num(n) { return n; }
         export function js_to_f64(v) { return +v; }
+        export function is_range_error(v) { return v instanceof RangeError; }
     "#)]
     extern "C" {
         fn get_num(n: f64) -> JsValue;
         fn js_to_f64(v: &JsValue) -> f64;
+        fn is_range_error(v: &JsValue) -> bool;
     }
 
     let a = get_num(10.0);
@@ -189,6 +191,8 @@ pub(crate) fn test_jsvalue_arithmetic() {
     // Checked division
     let result = a.checked_div(&b);
     assert!((js_to_f64(&result) - 3.333333).abs() < 0.001);
+    let result = JsValue::bigint_from_str("0").checked_div(&JsValue::bigint_from_str("0"));
+    assert!(is_range_error(&result));
 
     // Remainder
     let result = a.rem(&b);
@@ -201,6 +205,27 @@ pub(crate) fn test_jsvalue_arithmetic() {
     // Negation
     let result = a.neg();
     assert_eq!(js_to_f64(&result), -10.0);
+}
+
+pub(crate) fn test_jsvalue_bigint_pow_preserves_bigint_semantics() {
+    #[wasm_bindgen(inline_js = r#"
+        export function bigint_to_pow_test_string(value) {
+            return value.toString();
+        }
+    "#)]
+    extern "C" {
+        fn bigint_to_pow_test_string(value: &JsValue) -> String;
+    }
+
+    let base = JsValue::bigint_from_str("2");
+    let exponent = JsValue::bigint_from_str("10");
+    let result = base.pow(&exponent);
+
+    assert!(
+        result.is_bigint(),
+        "BigInt exponentiation should return a BigInt"
+    );
+    assert_eq!(bigint_to_pow_test_string(&result), "1024");
 }
 
 pub(crate) fn test_jsvalue_bitwise() {

@@ -13,6 +13,7 @@ use core::marker::PhantomData;
 
 use crate::batch::{force_flush, run_js_sync, with_runtime};
 use crate::encode::{BatchableResult, BinaryEncode, EncodeTypeDef, TYPE_CACHED, TYPE_FULL};
+use crate::ipc::DecodeError;
 use crate::ipc::DecodedData;
 use crate::ipc::EncodedData;
 
@@ -25,25 +26,24 @@ pub const DROP_NATIVE_REF_FN_ID: u32 = 0xFFFFFFFF;
 pub const CALL_EXPORT_FN_ID: u32 = 0xFFFFFFFE;
 
 /// Encode type definitions for a function call.
-/// On first call for a type signature, sends TYPE_FULL + id + param_count + type defs.
-/// On subsequent calls, sends TYPE_CACHED + id.
+///
+/// On first encounter, emits `TYPE_FULL` + id + inline definition and records
+/// the id on the current encoder's pending-ack list. Once JS has acked the
+/// `TYPE_FULL` (signalled by the matching JS Respond popping the type-cache
+/// frame), subsequent calls emit `TYPE_CACHED` + id.
 fn encode_function_types(encoder: &mut EncodedData, encode_types: impl FnOnce(&mut Vec<u8>)) {
-    // Always encode type definitions to get the bytes
     let mut type_buf = Vec::new();
     encode_types(&mut type_buf);
 
     with_runtime(|state| {
-        let (id, is_cached) = state.get_or_create_type_id(type_buf.clone());
-        if is_cached {
-            // Cached - just send marker + ID
+        let (id, can_use_cached) = state.get_or_create_type_id(&type_buf);
+        if can_use_cached {
             encoder.push_u8(TYPE_CACHED);
             encoder.push_u32(id);
         } else {
-            // First time - send full type def + ID
             encoder.push_u8(TYPE_FULL);
             encoder.push_u32(id);
-
-            // Push the type definition bytes
+            encoder.register_pending_type_id(id);
             for byte in type_buf {
                 encoder.push_u8(byte);
             }
@@ -89,13 +89,13 @@ macro_rules! impl_js_function_call {
         }
     };
     // Recursive case: N arguments
-    ($n:expr, $($T:ident $P:ident $arg:ident),+) => {
+    ($n:expr, $($T:ident $arg:ident),+) => {
         impl<$($T: EncodeTypeDef,)+ R: BatchableResult + EncodeTypeDef>
             JSFunction<fn($($T),+) -> R>
         {
-            pub fn call<$($P),+>(&self, $($arg: $T),+) -> R
+            pub fn call(&self, $($arg: $T),+) -> R
             where
-                $($T: BinaryEncode<$P>,)+
+                $($T: BinaryEncode,)+
             {
                 run_js_sync::<R>(self.id, |encoder| {
                     encode_function_types(encoder, |buf| {
@@ -111,57 +111,63 @@ macro_rules! impl_js_function_call {
 }
 
 impl_js_function_call!(0,);
-impl_js_function_call!(1, T1 P1 arg1);
-impl_js_function_call!(2, T1 P1 arg1, T2 P2 arg2);
-impl_js_function_call!(3, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3);
-impl_js_function_call!(4, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4);
-impl_js_function_call!(5, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5);
-impl_js_function_call!(6, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6);
-impl_js_function_call!(7, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7);
-impl_js_function_call!(8, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8);
-impl_js_function_call!(9, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9);
-impl_js_function_call!(10, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10);
-impl_js_function_call!(11, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11);
-impl_js_function_call!(12, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12);
-impl_js_function_call!(13, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13);
-impl_js_function_call!(14, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14);
-impl_js_function_call!(15, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15);
-impl_js_function_call!(16, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16);
-impl_js_function_call!(17, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17);
-impl_js_function_call!(18, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18);
-impl_js_function_call!(19, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19);
-impl_js_function_call!(20, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20);
-impl_js_function_call!(21, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20, T21 P21 arg21);
-impl_js_function_call!(22, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20, T21 P21 arg21, T22 P22 arg22);
-impl_js_function_call!(23, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20, T21 P21 arg21, T22 P22 arg22, T23 P23 arg23);
-impl_js_function_call!(24, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20, T21 P21 arg21, T22 P22 arg22, T23 P23 arg23, T24 P24 arg24);
-impl_js_function_call!(25, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20, T21 P21 arg21, T22 P22 arg22, T23 P23 arg23, T24 P24 arg24, T25 P25 arg25);
-impl_js_function_call!(26, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20, T21 P21 arg21, T22 P22 arg22, T23 P23 arg23, T24 P24 arg24, T25 P25 arg25, T26 P26 arg26);
-impl_js_function_call!(27, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20, T21 P21 arg21, T22 P22 arg22, T23 P23 arg23, T24 P24 arg24, T25 P25 arg25, T26 P26 arg26, T27 P27 arg27);
-impl_js_function_call!(28, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20, T21 P21 arg21, T22 P22 arg22, T23 P23 arg23, T24 P24 arg24, T25 P25 arg25, T26 P26 arg26, T27 P27 arg27, T28 P28 arg28);
-impl_js_function_call!(29, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20, T21 P21 arg21, T22 P22 arg22, T23 P23 arg23, T24 P24 arg24, T25 P25 arg25, T26 P26 arg26, T27 P27 arg27, T28 P28 arg28, T29 P29 arg29);
-impl_js_function_call!(30, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20, T21 P21 arg21, T22 P22 arg22, T23 P23 arg23, T24 P24 arg24, T25 P25 arg25, T26 P26 arg26, T27 P27 arg27, T28 P28 arg28, T29 P29 arg29, T30 P30 arg30);
-impl_js_function_call!(31, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20, T21 P21 arg21, T22 P22 arg22, T23 P23 arg23, T24 P24 arg24, T25 P25 arg25, T26 P26 arg26, T27 P27 arg27, T28 P28 arg28, T29 P29 arg29, T30 P30 arg30, T31 P31 arg31);
-impl_js_function_call!(32, T1 P1 arg1, T2 P2 arg2, T3 P3 arg3, T4 P4 arg4, T5 P5 arg5, T6 P6 arg6, T7 P7 arg7, T8 P8 arg8, T9 P9 arg9, T10 P10 arg10, T11 P11 arg11, T12 P12 arg12, T13 P13 arg13, T14 P14 arg14, T15 P15 arg15, T16 P16 arg16, T17 P17 arg17, T18 P18 arg18, T19 P19 arg19, T20 P20 arg20, T21 P21 arg21, T22 P22 arg22, T23 P23 arg23, T24 P24 arg24, T25 P25 arg25, T26 P26 arg26, T27 P27 arg27, T28 P28 arg28, T29 P29 arg29, T30 P30 arg30, T31 P31 arg31, T32 P32 arg32);
+impl_js_function_call!(1, T1 arg1);
+impl_js_function_call!(2, T1 arg1, T2 arg2);
+impl_js_function_call!(3, T1 arg1, T2 arg2, T3 arg3);
+impl_js_function_call!(4, T1 arg1, T2 arg2, T3 arg3, T4 arg4);
+impl_js_function_call!(5, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5);
+impl_js_function_call!(6, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6);
+impl_js_function_call!(7, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7);
+impl_js_function_call!(8, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8);
+impl_js_function_call!(9, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9);
+impl_js_function_call!(10, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10);
+impl_js_function_call!(11, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11);
+impl_js_function_call!(12, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12);
+impl_js_function_call!(13, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13);
+impl_js_function_call!(14, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14);
+impl_js_function_call!(15, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15);
+impl_js_function_call!(16, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16);
+impl_js_function_call!(17, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17);
+impl_js_function_call!(18, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18);
+impl_js_function_call!(19, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19);
+impl_js_function_call!(20, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20);
+impl_js_function_call!(21, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20, T21 arg21);
+impl_js_function_call!(22, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20, T21 arg21, T22 arg22);
+impl_js_function_call!(23, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20, T21 arg21, T22 arg22, T23 arg23);
+impl_js_function_call!(24, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20, T21 arg21, T22 arg22, T23 arg23, T24 arg24);
+impl_js_function_call!(25, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20, T21 arg21, T22 arg22, T23 arg23, T24 arg24, T25 arg25);
+impl_js_function_call!(26, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20, T21 arg21, T22 arg22, T23 arg23, T24 arg24, T25 arg25, T26 arg26);
+impl_js_function_call!(27, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20, T21 arg21, T22 arg22, T23 arg23, T24 arg24, T25 arg25, T26 arg26, T27 arg27);
+impl_js_function_call!(28, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20, T21 arg21, T22 arg22, T23 arg23, T24 arg24, T25 arg25, T26 arg26, T27 arg27, T28 arg28);
+impl_js_function_call!(29, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20, T21 arg21, T22 arg22, T23 arg23, T24 arg24, T25 arg25, T26 arg26, T27 arg27, T28 arg28, T29 arg29);
+impl_js_function_call!(30, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20, T21 arg21, T22 arg22, T23 arg23, T24 arg24, T25 arg25, T26 arg26, T27 arg27, T28 arg28, T29 arg29, T30 arg30);
+impl_js_function_call!(31, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20, T21 arg21, T22 arg22, T23 arg23, T24 arg24, T25 arg25, T26 arg26, T27 arg27, T28 arg28, T29 arg29, T30 arg30, T31 arg31);
+impl_js_function_call!(32, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7, T8 arg8, T9 arg9, T10 arg10, T11 arg11, T12 arg12, T13 arg13, T14 arg14, T15 arg15, T16 arg16, T17 arg17, T18 arg18, T19 arg19, T20 arg20, T21 arg21, T22 arg22, T23 arg23, T24 arg24, T25 arg25, T26 arg26, T27 arg27, T28 arg28, T29 arg29, T30 arg30, T31 arg31, T32 arg32);
 
 /// Internal type for storing Rust callback functions.
 /// Always stores as `Rc<dyn Fn(...)>` for uniform handling.
 /// - For `Fn` closures: stored directly, supports reentrant calls
 /// - For `FnMut` closures: wrapped in RefCell internally, panics on reentrant calls
+type CallbackFn = dyn Fn(&mut DecodedData, &mut EncodedData) -> Result<(), DecodeError>;
+
 pub(crate) struct RustCallback {
-    f: alloc::rc::Rc<dyn Fn(&mut DecodedData, &mut EncodedData)>,
+    f: alloc::rc::Rc<CallbackFn>,
 }
 
 impl RustCallback {
-    /// Create a callback from an `Fn` closure (supports reentrant calls)
+    /// Create a callback from an `Fn` closure (supports reentrant calls).
+    ///
+    /// The closure returns `Err` if an argument from JS fails to decode; the
+    /// caller surfaces that instead of letting an `unwrap` panic propagate.
     pub fn new_fn<F>(f: F) -> Self
     where
-        F: Fn(&mut DecodedData, &mut EncodedData) + 'static,
+        F: Fn(&mut DecodedData, &mut EncodedData) -> Result<(), DecodeError> + 'static,
     {
         Self {
             f: alloc::rc::Rc::new(move |data: &mut DecodedData, encoder: &mut EncodedData| {
-                f(data, encoder);
+                let result = f(data, encoder);
                 force_flush();
+                result
             }),
         }
     }
@@ -169,23 +175,24 @@ impl RustCallback {
     /// Create a callback from an `FnMut` closure (panics on reentrant calls)
     pub fn new_fn_mut<F>(f: F) -> Self
     where
-        F: FnMut(&mut DecodedData, &mut EncodedData) + 'static,
+        F: FnMut(&mut DecodedData, &mut EncodedData) -> Result<(), DecodeError> + 'static,
     {
         // Wrap the FnMut in a RefCell, then create an Fn wrapper
         let cell = RefCell::new(f);
         Self {
             f: alloc::rc::Rc::new(move |data: &mut DecodedData, encoder: &mut EncodedData| {
-                {
+                let result = {
                     let mut f = cell.borrow_mut();
-                    f(data, encoder);
-                }
+                    f(data, encoder)
+                };
                 force_flush();
+                result
             }),
         }
     }
 
     /// Get a cloned Rc to the callback
-    pub fn clone_rc(&self) -> alloc::rc::Rc<dyn Fn(&mut DecodedData, &mut EncodedData)> {
+    pub fn clone_rc(&self) -> alloc::rc::Rc<CallbackFn> {
         self.f.clone()
     }
 }

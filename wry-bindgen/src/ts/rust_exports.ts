@@ -1,58 +1,75 @@
-import { DataEncoder } from "./encoding";
-import { handleBinaryResponse, MessageType, sync_request_binary, CALL_EXPORT_FN_ID } from "./ipc";
+import {
+  CALL_EXPORT_FN_ID,
+  sendEvaluateToRust,
+} from "./ipc";
+import { parseTypeDef, TypeClass } from "./types";
+
+function typeFromBytes(bytes: number[]): TypeClass {
+  const offset = { value: 0 };
+  const ty = parseTypeDef(new Uint8Array(bytes), offset);
+  if (offset.value !== bytes.length) {
+    throw new Error(`Unprocessed export type data: ${bytes.length - offset.value} bytes`);
+  }
+  return ty;
+}
+
+const U32_TYPE_DEF = [4];
 
 /**
  * FinalizationRegistry to notify Rust when exported object wrappers are GC'd.
  * The callback sends a drop message to Rust with the object handle.
  */
 const exportRegistry = new FinalizationRegistry<{ handle: number; className: string }>((info) => {
-  // Build Evaluate message to drop the object: call ClassName::__drop with handle
-  const encoder = new DataEncoder();
-  encoder.pushU8(MessageType.Evaluate);
-  encoder.pushU32(CALL_EXPORT_FN_ID);
-  // Encode the export name as a string
-  const dropName = `${info.className}::__drop`;
-  encoder.pushStr(dropName);
-  // Encode the handle as u32
-  encoder.pushU32(info.handle);
-
-  const response = sync_request_binary(`/__wbg__/handler`, encoder.finalize());
-  handleBinaryResponse(response);
+  callExport(`${info.className}::__drop`, [U32_TYPE_DEF], null, [info.handle]);
 });
 
 /**
  * Call an exported Rust method by name.
- * This is exposed as window.__wryCallExport for generated class methods to use.
+ * This is exposed as window.__wryCallExport for generated class methods.
  */
-function callExport(exportName: string, ...args: any[]): any {
+function callExport(
+  exportName: string,
+  argTypeDefs: number[][],
+  returnTypeDef: number[] | null,
+  args: any[],
+): any {
+  if (argTypeDefs.length !== args.length) {
+    throw new Error(
+      `Export ${exportName} expected ${argTypeDefs.length} arguments but got ${args.length}`,
+    );
+  }
+
   window.jsHeap.pushBorrowFrame();
 
-  const encoder = new DataEncoder();
-  encoder.pushU8(MessageType.Evaluate);
-  encoder.pushU32(CALL_EXPORT_FN_ID);
-  // Encode the export name as a string
-  encoder.pushStr(exportName);
-  // Encode arguments - for now, we assume they're already u32 handles or primitives
-  for (const arg of args) {
-    if (typeof arg === "number") {
-      encoder.pushU32(arg);
-    } else {
-      throw new Error(`Unsupported argument type: ${typeof arg}`);
+  try {
+    const decoder = sendEvaluateToRust((encoder) => {
+      encoder.pushU32(CALL_EXPORT_FN_ID);
+      encoder.pushStr(exportName);
+
+      for (let i = 0; i < args.length; i++) {
+        typeFromBytes(argTypeDefs[i]).encode(encoder, args[i]);
+      }
+    });
+
+    if (returnTypeDef === null) {
+      if (decoder && !decoder.isEmpty()) {
+        throw new Error(`Unprocessed data remaining after export ${exportName}`);
+      }
+      return undefined;
     }
+
+    if (!decoder) {
+      throw new Error(`Missing response data for export ${exportName}`);
+    }
+
+    const result = typeFromBytes(returnTypeDef).decode(decoder);
+    if (!decoder.isEmpty()) {
+      throw new Error(`Unprocessed data remaining after export ${exportName}`);
+    }
+    return result;
+  } finally {
+    window.jsHeap.popBorrowFrame();
   }
-
-  const response = sync_request_binary(`/__wbg__/handler`, encoder.finalize());
-  const decoder = handleBinaryResponse(response);
-
-  window.jsHeap.popBorrowFrame();
-
-  // If we have response data, try to decode it
-  // For now, try to decode as i32 if there's u32 data available
-  if (decoder && decoder.hasMoreU32()) {
-    return decoder.takeI32();
-  }
-
-  return undefined;
 }
 
 /**
@@ -79,15 +96,24 @@ function createWrapper(handle: number, className: string): object {
       if (prop === "__handle" || prop === "__className") {
         return target[prop];
       }
+      if (prop === "free") {
+        return () => {
+          const handle = target.__handle;
+          target.__handle = 0;
+          if (handle !== 0) {
+            callExport(`${className}::__drop`, [U32_TYPE_DEF], null, [handle]);
+          }
+        };
+      }
       // Skip Symbol properties and common JS properties
       if (typeof prop === "symbol" || prop === "then" || prop === "toJSON") {
         return undefined;
       }
-      // Return a function that calls the Rust export when invoked
-      return (...args: any[]) => {
+      return () => {
         const exportName = `${className}::${String(prop)}`;
-        // Pass the handle as the first argument (for self methods)
-        return callExport(exportName, handle, ...args);
+        throw new Error(
+          `Cannot call ${exportName} through a fallback wrapper without generated type metadata`,
+        );
       };
     },
   });

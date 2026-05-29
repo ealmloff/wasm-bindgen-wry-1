@@ -1,5 +1,5 @@
 import { DataEncoder, DataDecoder } from "./encoding";
-import { RustFunction } from "./rust_function";
+import { RustFunction, RustFunctionPolicy } from "./rust_function";
 
 /**
  * Type tags for the binary type definition protocol.
@@ -60,12 +60,16 @@ class BoolType implements TypeClass {
  */
 class HeapRefType implements TypeClass {
   encode(encoder: DataEncoder, obj: unknown): void {
-    // Insert into heap but don't encode the id - Rust side is in sync with the slab
-    window.jsHeap.insert(obj);
+    // Rust assigns the ID. JS either stores immediately for responses or defers
+    // request arguments until Rust sends the exact ID to install.
+    encoder.pushHeapRef(obj);
   }
 
   decode(decoder: DataDecoder): unknown {
     const id = decoder.takeU64();
+    if (!window.jsHeap.has(id)) {
+      throw new Error(`Unknown JS heap reference ID: ${id}`);
+    }
     return window.jsHeap.get(id);
   }
 }
@@ -83,6 +87,9 @@ class BorrowedRefType implements TypeClass {
 
   decode(decoder: DataDecoder): unknown {
     const id = decoder.takeU64();
+    if (!window.jsHeap.has(id)) {
+      throw new Error(`Unknown borrowed JS reference ID: ${id}`);
+    }
     // Works for both heap refs (128+) and borrow stack refs (1-127)
     return window.jsHeap.get(id);
   }
@@ -105,7 +112,7 @@ class StringType implements TypeClass {
  * Type class for string enum values with u32 encoding and lookup arrays
  */
 class StringEnumType implements TypeClass {
-  private lookupArray: string[];
+  declare private lookupArray: string[];
 
   constructor(lookupArray: string[]) {
     this.lookupArray = lookupArray;
@@ -128,8 +135,8 @@ class StringEnumType implements TypeClass {
  * Type class for Rust callbacks with encoding/decoding methods
  */
 class CallbackType implements TypeClass {
-  private paramTypes: TypeClass[];
-  private returnType: TypeClass;
+  declare private paramTypes: TypeClass[];
+  declare private returnType: TypeClass;
 
   constructor(paramTypes: TypeClass[], returnType: TypeClass) {
     this.paramTypes = paramTypes;
@@ -142,8 +149,13 @@ class CallbackType implements TypeClass {
 
   decode(decoder: DataDecoder): (...args: any[]) => any {
     const fnId = decoder.takeU32();
-    const f = new RustFunction(fnId, this.paramTypes, this.returnType);
-    return (...args: any[]) => f.call(...args);
+    const policy = decoder.takeU32() as RustFunctionPolicy;
+    const rustFunction = new RustFunction(fnId, this.paramTypes, this.returnType, policy);
+    const callable = (...args: any[]) => rustFunction.call(...args);
+    Object.defineProperty(callable, "__wryRustFunction", {
+      value: rustFunction,
+    });
+    return callable;
   }
 }
 
@@ -166,7 +178,7 @@ type NumberType = "u8" | "u16" | "u32" | "u64" | "u128" | "i8" | "i16" | "i32" |
  * Type class for numeric values (u8, u16, u32, u64, i8, i16, i32, i64, usize, isize, f32, f64) with encoding/decoding methods
  */
 class NumericType implements TypeClass {
-  private size: NumberType;
+  declare private size: NumberType;
 
   constructor(size: NumberType) {
     this.size = size;
@@ -263,7 +275,7 @@ class NumericType implements TypeClass {
 }
 
 class OptionType implements TypeClass {
-  private wrappedType: TypeClass;
+  declare private wrappedType: TypeClass;
 
   constructor(wrappedType: TypeClass) {
     this.wrappedType = wrappedType;
@@ -292,8 +304,8 @@ type Ok = { value: any };
 type Err = { error: any };
 
 class ResultType implements TypeClass {
-  private okType: TypeClass;
-  private errType: TypeClass;
+  declare private okType: TypeClass;
+  declare private errType: TypeClass;
 
   constructor(okType: TypeClass, errType: TypeClass) {
     this.okType = okType;
@@ -329,7 +341,7 @@ class ResultType implements TypeClass {
  * Type class for array/Vec values with encoding/decoding methods
  */
 class ArrayType implements TypeClass {
-  private elementType: TypeClass;
+  declare private elementType: TypeClass;
 
   constructor(elementType: TypeClass) {
     this.elementType = elementType;
@@ -377,23 +389,20 @@ class U8ClampedType implements TypeClass {
 const u8ClampedTypeInstance = new U8ClampedType();
 
 // Pre-instantiated numeric type classes
-export const U8Type = new NumericType("u8");
-export const U16Type = new NumericType("u16");
-export const U32Type = new NumericType("u32");
-export const U64Type = new NumericType("u64");
-export const U128Type = new NumericType("u128");
-export const I8Type = new NumericType("i8");
-export const I16Type = new NumericType("i16");
-export const I32Type = new NumericType("i32");
-export const I64Type = new NumericType("i64");
-export const I128Type = new NumericType("i128");
-export const UsizeType = new NumericType("usize");
-export const IsizeType = new NumericType("isize");
-export const F32Type = new NumericType("f32");
-export const F64Type = new NumericType("f64");
-
-// Pre-instantiated string type class
-export const strType = new StringType();
+const U8Type = new NumericType("u8");
+const U16Type = new NumericType("u16");
+const U32Type = new NumericType("u32");
+const U64Type = new NumericType("u64");
+const U128Type = new NumericType("u128");
+const I8Type = new NumericType("i8");
+const I16Type = new NumericType("i16");
+const I32Type = new NumericType("i32");
+const I64Type = new NumericType("i64");
+const I128Type = new NumericType("i128");
+const UsizeType = new NumericType("usize");
+const IsizeType = new NumericType("isize");
+const F32Type = new NumericType("f32");
+const F64Type = new NumericType("f64");
 
 // Pre-instantiated singleton types
 const boolTypeInstance = new BoolType();
@@ -502,18 +511,6 @@ function parseTypeDef(bytes: Uint8Array, offset: { value: number }): TypeClass {
 
 export {
   TypeClass,
-  TypeTag,
-  ArrayType,
-  BoolType,
-  BorrowedRefType,
   HeapRefType,
-  CallbackType,
-  NullType,
-  NumericType,
-  OptionType,
-  StringType,
-  StringEnumType,
-  ResultType,
-  U8ClampedType,
   parseTypeDef,
 };

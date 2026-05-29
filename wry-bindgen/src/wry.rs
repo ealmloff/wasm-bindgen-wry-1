@@ -20,8 +20,10 @@ use http::Response;
 
 use crate::batch::{Runtime, in_runtime};
 use crate::function_registry::FUNCTION_REGISTRY;
-use crate::ipc::{DecodedVariant, IPCMessage, MessageType, decode_data};
-use crate::runtime::{AppEventVariant, IPCSenders, WryBindgenEvent, WryIPC, handle_callbacks};
+use crate::ipc::{DecodedVariant, IPCMessage, MessageType, OutboundIPCMessage, decode_data};
+use crate::runtime::{AppEventVariant, IPCSenders, WryIPC, handle_callbacks};
+
+pub use crate::runtime::WryBindgenEvent;
 
 pub trait ImplWryBindgenResponder {
     fn respond(self: Box<Self>, response: Response<Vec<u8>>);
@@ -66,6 +68,20 @@ impl WryBindgenResponder {
     fn respond(self, response: Response<Vec<u8>>) {
         self.respond.respond(response);
     }
+
+    fn respond_ipc(self, response: IPCMessage) {
+        let body = response.into_data();
+        // Encode as base64 - sync XMLHttpRequest cannot use responseType="arraybuffer"
+        let engine = base64::engine::general_purpose::STANDARD;
+        let body_base64 = engine.encode(&body);
+        self.respond(
+            http::Response::builder()
+                .status(200)
+                .header("Content-Type", "text/plain")
+                .body(body_base64.into_bytes())
+                .expect("Failed to build response"),
+        );
+    }
 }
 
 /// Decode request data from the dioxus-data header.
@@ -79,7 +95,7 @@ fn decode_request_data(request: &http::Request<Vec<u8>>) -> Option<IPCMessage> {
 /// Tracks the loading state of the webview.
 enum WebviewLoadingState {
     /// Webview is still loading, messages are queued.
-    Pending { queued: Vec<IPCMessage> },
+    Pending { queued: Vec<OutboundIPCMessage> },
     /// Webview is loaded and ready.
     Loaded,
 }
@@ -90,71 +106,153 @@ impl Default for WebviewLoadingState {
     }
 }
 
-/// Shared state for managing async protocol responses.
+/// Shared state for one webview instance.
 struct WebviewState {
-    ongoing_request: Option<WryBindgenResponder>,
-    /// How many responses we are waiting for from JS
-    pending_js_evaluates: usize,
-    /// How many responses JS is waiting for from us
-    pending_rust_evaluates: usize,
-    /// The sender used to send IPC messages to the webview
-    sender: IPCSenders,
+    /// Protocol message routing for this webview.
+    messages: WebviewMessageLayer,
     // The state of the webview. Either loading (with queued messages) or loaded.
     loading_state: WebviewLoadingState,
     // A function that evaluates scripts in the webview
     evaluate_script: Box<dyn FnMut(&str)>,
 }
 
+/// Transport-owned IPC routing state for one webview.
+///
+/// Under strict synchronous ping-pong:
+///
+/// - At most one JS XHR is suspended at any moment (JS blocks on each XHR
+///   before it can send the next one), so the responder lives in a single
+///   `current_xhr` slot.
+/// - The remaining state is the stack of Rust Evaluates currently being
+///   processed by JS. Each frame just remembers whether it was delivered as
+///   the response to a parked JS XHR (nested) or via `evaluate_script`
+///   (top-level), so the matching JS Respond knows whether to hand the new
+///   XHR off as the next wait point or close the chain with a blank reply.
+struct WebviewMessageLayer {
+    current_xhr: Option<WryBindgenResponder>,
+    rust_eval_stack: Vec<RustEvalKind>,
+    /// The sender used to forward decoded IPC messages to the Rust runtime.
+    sender: IPCSenders,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RustEvalKind {
+    /// Delivered via `evaluate_script` — no parent XHR to hand off to when JS
+    /// responds.
+    TopLevel,
+    /// Delivered as the response to a parked JS XHR — when JS responds, the
+    /// new XHR becomes the next wait point.
+    Nested,
+}
+
 impl WebviewState {
     /// Create a new webview state.
     fn new(sender: IPCSenders, evaluate_script: impl FnMut(&str) + 'static) -> Self {
         Self {
-            ongoing_request: None,
-            pending_js_evaluates: 0,
-            pending_rust_evaluates: 0,
-            sender,
+            messages: WebviewMessageLayer::new(sender),
             loading_state: WebviewLoadingState::default(),
             evaluate_script: Box::new(evaluate_script),
         }
     }
 
-    fn set_ongoing_request(&mut self, responder: WryBindgenResponder) {
-        if self.ongoing_request.is_some() {
-            panic!(
-                "WARNING: Overwriting existing ongoing_request! Previous request will never be responded to."
-            );
-        }
-        self.ongoing_request = Some(responder);
-    }
-
-    fn take_ongoing_request(&mut self) -> Option<WryBindgenResponder> {
-        self.ongoing_request.take()
-    }
-
-    fn has_pending_request(&self) -> bool {
-        self.ongoing_request.is_some()
-    }
-
-    fn respond_to_request(&mut self, response: IPCMessage) {
-        if let Some(responder) = self.take_ongoing_request() {
-            let body = response.into_data();
-            // Encode as base64 - sync XMLHttpRequest cannot use responseType="arraybuffer"
-            let engine = base64::engine::general_purpose::STANDARD;
-            let body_base64 = engine.encode(&body);
-            responder.respond(
-                http::Response::builder()
-                    .status(200)
-                    .header("Content-Type", "text/plain")
-                    .body(body_base64.into_bytes())
-                    .expect("Failed to build response"),
-            );
-        } else {
-            panic!("WARNING: respond_to_request called but no pending request! Response dropped.");
-        }
-    }
-
     fn evaluate_script(&mut self, script: &str) {
         (self.evaluate_script)(script);
+    }
+}
+
+impl WebviewMessageLayer {
+    fn new(sender: IPCSenders) -> Self {
+        Self {
+            current_xhr: None,
+            rust_eval_stack: Vec::new(),
+            sender,
+        }
+    }
+
+    fn receive_js_message(&mut self, msg: IPCMessage, responder: WryBindgenResponder) {
+        let msg_type = msg.ty().unwrap();
+
+        // JS can only send a message when it isn't blocked on an existing XHR,
+        // so `current_xhr` must be empty at this point.
+        if self.current_xhr.is_some() {
+            responder.respond(error_response());
+            return;
+        }
+
+        let top_level_responder = match msg_type {
+            // New call from JS — park the XHR. Rust will reply via either a
+            // Respond (the answer) or an Evaluate (a nested Rust→JS call
+            // delivered through the suspended XHR).
+            MessageType::Evaluate => {
+                self.current_xhr = Some(responder);
+                None
+            }
+            // Response from JS closes the most recent Rust Evaluate frame.
+            // Nested frames hand the new XHR off as the next wait point;
+            // top-level frames have no parent so we close the chain with a
+            // blank response after Rust has accepted the Respond.
+            MessageType::Respond => match self.rust_eval_stack.pop() {
+                Some(RustEvalKind::Nested) => {
+                    self.current_xhr = Some(responder);
+                    None
+                }
+                Some(RustEvalKind::TopLevel) => Some(responder),
+                None => {
+                    responder.respond(error_response());
+                    return;
+                }
+            },
+        };
+
+        if self.sender.start_send(msg) {
+            if let Some(responder) = top_level_responder {
+                responder.respond(blank_response());
+            }
+        } else if let Some(responder) = top_level_responder {
+            responder.respond(error_response());
+        } else if let Some(responder) = self.current_xhr.take() {
+            responder.respond(error_response());
+        }
+    }
+
+    fn receive_rust_message(&mut self, ipc_msg: OutboundIPCMessage) -> Option<IPCMessage> {
+        let ty = ipc_msg.message.ty().unwrap();
+        let top_level = ipc_msg.top_level;
+        let message = ipc_msg.message;
+
+        match ty {
+            MessageType::Respond => {
+                let responder = self
+                    .current_xhr
+                    .take()
+                    .expect("Rust Respond with no suspended JS XHR to reply to");
+                responder.respond_ipc(message);
+                None
+            }
+            // The runtime tells us whether this Evaluate is a fresh top-level
+            // call or a nested response inside a callback. We must not infer it
+            // from `current_xhr`: a callback XHR can already be parked (awaiting
+            // the app future to pick it up) when the app future emits an
+            // unrelated top-level eval, which would otherwise be misdelivered as
+            // that callback's response.
+            MessageType::Evaluate if top_level => {
+                // Top-level: caller delivers via `evaluate_script`. JS, if it is
+                // currently blocked on a parked callback XHR, will run this only
+                // once that callback's JS→Rust chain fully resolves.
+                self.rust_eval_stack.push(RustEvalKind::TopLevel);
+                Some(message)
+            }
+            MessageType::Evaluate => {
+                // Nested: deliver as the response to the parked JS XHR.
+                let responder = self
+                    .current_xhr
+                    .take()
+                    .expect("Nested Rust Evaluate with no suspended JS XHR to reply to");
+                responder.respond_ipc(message);
+                self.rust_eval_stack.push(RustEvalKind::Nested);
+                None
+            }
+        }
     }
 }
 
@@ -273,29 +371,7 @@ impl ProtocolHandler {
                 responder.respond(error_response());
                 return None;
             };
-            let msg_type = msg.ty().unwrap();
-            match msg_type {
-                // New call from JS - save responder and wait for the js application thread to respond
-                MessageType::Evaluate => {
-                    webview_state.pending_rust_evaluates += 1;
-                    webview_state.set_ongoing_request(responder);
-                }
-                // Response from JS to a previous Evaluate - decrement pending count and respond accordingly
-                MessageType::Respond => {
-                    webview_state.pending_js_evaluates =
-                        webview_state.pending_js_evaluates.saturating_sub(1);
-                    if webview_state.pending_rust_evaluates > 0
-                        || webview_state.pending_js_evaluates > 0
-                    {
-                        // Still more round-trips expected
-                        webview_state.set_ongoing_request(responder);
-                    } else {
-                        // Conversation is over
-                        responder.respond(blank_response());
-                    }
-                }
-            }
-            webview_state.sender.start_send(msg);
+            webview_state.messages.receive_js_message(msg, responder);
             return None;
         }
 
@@ -407,7 +483,7 @@ impl WryBindgen {
         }
     }
 
-    fn handle_ipc_message(&self, id: u64, ipc_msg: IPCMessage) {
+    fn handle_ipc_message(&self, id: u64, ipc_msg: OutboundIPCMessage) {
         let mut state = self.webview.borrow_mut();
         let Some(webview_state) = state.get_mut(&id) else {
             return;
@@ -423,35 +499,17 @@ impl WryBindgen {
     fn immediately_handle_ipc_message(
         &self,
         webview_state: &mut WebviewState,
-        ipc_msg: IPCMessage,
+        ipc_msg: OutboundIPCMessage,
     ) {
-        let ty = ipc_msg.ty().unwrap();
-        match ty {
-            // Rust wants to evaluate something in js
-            MessageType::Evaluate => {
-                webview_state.pending_js_evaluates += 1;
-            }
-            // Rust is responding to a previous js evaluate
-            MessageType::Respond => {
-                webview_state.pending_rust_evaluates =
-                    webview_state.pending_rust_evaluates.saturating_sub(1);
-            }
-        }
-
-        // If there is an ongoing request, respond to immediately
-        if webview_state.has_pending_request() {
-            webview_state.respond_to_request(ipc_msg);
+        let Some(message) = webview_state.messages.receive_rust_message(ipc_msg) else {
             return;
-        }
-
-        // Otherwise call into js through evaluate_script
-        let decoded = ipc_msg.decoded().unwrap();
-
+        };
+        let decoded = message.decoded().unwrap();
         if let DecodedVariant::Evaluate { .. } = decoded {
             // Encode the binary data as base64 and pass to JS
             // JS will iterate over operations in the buffer
             let engine = base64::engine::general_purpose::STANDARD;
-            let data_base64 = engine.encode(ipc_msg.data());
+            let data_base64 = engine.encode(message.data());
             let code = format!("window.evaluate_from_rust_binary(\"{data_base64}\")");
             webview_state.evaluate_script(&code);
         }
@@ -560,4 +618,95 @@ pub fn not_found_response() -> http::Response<Vec<u8>> {
         .status(404)
         .body(b"Not Found".to_vec())
         .expect("Failed to build not found response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ipc::EncodedData;
+
+    fn ipc_message(message_type: MessageType) -> IPCMessage {
+        let mut data = EncodedData::new();
+        data.push_u8(message_type as u8);
+        IPCMessage::new(data.to_bytes())
+    }
+
+    fn handler_request(message_type: MessageType) -> http::Request<Vec<u8>> {
+        let engine = base64::engine::general_purpose::STANDARD;
+        let body_base64 = engine.encode(ipc_message(message_type).data());
+
+        http::Request::builder()
+            .uri("wry://index.html/__wbg__/handler")
+            .header("dioxus-data", body_base64)
+            .body(Vec::new())
+            .expect("failed to build request")
+    }
+
+    #[test]
+    fn handler_responds_error_when_evaluate_arrives_after_runtime_drop() {
+        let bindgen = WryBindgen::new(|_| {});
+        let app_builder = bindgen.app_builder();
+        let protocol_handler = app_builder.protocol_handler();
+        drop(app_builder);
+
+        let response = Rc::new(RefCell::new(None));
+        let captured_response = response.clone();
+        let request = handler_request(MessageType::Evaluate);
+
+        let unhandled = protocol_handler.handle_request(
+            "wry",
+            |_| {},
+            &request,
+            move |response| *captured_response.borrow_mut() = Some(response),
+        );
+
+        assert!(unhandled.is_none());
+        let response = response
+            .borrow_mut()
+            .take()
+            .expect("closed runtime should receive an error response");
+        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn handler_responds_error_when_top_level_respond_arrives_after_runtime_drop() {
+        let bindgen = WryBindgen::new(|_| {});
+        let app_builder = bindgen.app_builder();
+        let webview_id = app_builder.webview_id;
+        let protocol_handler = app_builder.protocol_handler();
+
+        let evaluated_scripts = Rc::new(RefCell::new(Vec::new()));
+        let captured_scripts = evaluated_scripts.clone();
+        let prepared_app = app_builder.build(
+            || async {},
+            move |script| captured_scripts.borrow_mut().push(script.to_string()),
+        );
+
+        bindgen.handle_user_event(WryBindgenEvent::webview_loaded(webview_id));
+        bindgen.handle_user_event(WryBindgenEvent::ipc(
+            webview_id,
+            OutboundIPCMessage::new(ipc_message(MessageType::Evaluate), true),
+        ));
+        assert_eq!(evaluated_scripts.borrow().len(), 1);
+
+        drop(prepared_app);
+
+        let response = Rc::new(RefCell::new(None));
+        let captured_response = response.clone();
+        let request = handler_request(MessageType::Respond);
+
+        let unhandled = protocol_handler.handle_request(
+            "wry",
+            |_| {},
+            &request,
+            move |response| *captured_response.borrow_mut() = Some(response),
+        );
+
+        assert!(unhandled.is_none());
+        let response = response
+            .borrow_mut()
+            .take()
+            .expect("closed runtime should receive an error response");
+        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+    }
 }

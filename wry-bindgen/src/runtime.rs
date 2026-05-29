@@ -15,9 +15,8 @@ use crate::BinaryDecode;
 use crate::batch::with_runtime;
 use crate::function::{CALL_EXPORT_FN_ID, DROP_NATIVE_REF_FN_ID, RustCallback};
 use crate::ipc::MessageType;
-use crate::ipc::{DecodedData, DecodedVariant, IPCMessage};
+use crate::ipc::{DecodedData, DecodedVariant, IPCMessage, OutboundIPCMessage};
 use crate::object_store::ObjectHandle;
-use crate::object_store::remove_object;
 
 /// Application-level events that can be sent through the event loop.
 ///
@@ -36,7 +35,7 @@ impl WryBindgenEvent {
     }
 
     /// Create a new IPC event.
-    pub(crate) fn ipc(id: u64, msg: IPCMessage) -> Self {
+    pub(crate) fn ipc(id: u64, msg: OutboundIPCMessage) -> Self {
         Self {
             id,
             event: AppEventVariant::Ipc(msg),
@@ -60,7 +59,7 @@ impl WryBindgenEvent {
 #[derive(Debug, Clone)]
 pub(crate) enum AppEventVariant {
     /// An IPC message from JavaScript
-    Ipc(IPCMessage),
+    Ipc(OutboundIPCMessage),
     /// The webview has finished loading
     WebviewLoaded,
 }
@@ -72,18 +71,10 @@ pub(crate) struct IPCSenders {
 }
 
 impl IPCSenders {
-    pub(crate) fn start_send(&self, msg: IPCMessage) {
+    pub(crate) fn start_send(&self, msg: IPCMessage) -> bool {
         match msg.ty().unwrap() {
-            MessageType::Evaluate => {
-                self.eval_sender
-                    .try_send(msg)
-                    .expect("Failed to send evaluate message");
-            }
-            MessageType::Respond => {
-                self.respond_sender
-                    .unbounded_send(msg)
-                    .expect("Failed to send respond message");
-            }
+            MessageType::Evaluate => self.eval_sender.try_send(msg).is_ok(),
+            MessageType::Respond => self.respond_sender.unbounded_send(msg).is_ok(),
         }
     }
 }
@@ -141,38 +132,56 @@ impl WryIPC {
     }
 
     /// Send a response back to JavaScript.
-    pub(crate) fn js_response(&self, id: u64, responder: IPCMessage) {
+    pub(crate) fn js_response(&self, id: u64, responder: OutboundIPCMessage) {
         (self.proxy)(WryBindgenEvent::ipc(id, responder));
     }
 }
 
 pub(crate) fn progress_js_with<O>(
-    with_respond: impl for<'a> Fn(DecodedData<'a>) -> O,
+    mut with_respond: impl for<'a> FnMut(DecodedData<'a>) -> O,
 ) -> Option<O> {
     let response = with_runtime(|runtime| runtime.ipc().receivers.write().recv_blocking())?;
-
-    let decoder = response.decoded().expect("Failed to decode response");
-    match decoder {
-        DecodedVariant::Respond { data } => Some(with_respond(data)),
-        DecodedVariant::Evaluate { mut data } => {
-            handle_rust_callback(&mut data);
-            None
-        }
-    }
+    dispatch_inbound_message(&response, &mut with_respond)
 }
 
 pub async fn handle_callbacks() {
     let receiver = with_runtime(|runtime| runtime.ipc().receivers.read().eval_receiver.clone());
 
     while let Ok(response) = receiver.recv().await {
-        let decoder = response.decoded().expect("Failed to decode response");
-        match decoder {
-            DecodedVariant::Respond { .. } => unreachable!(),
-            DecodedVariant::Evaluate { mut data } => {
-                handle_rust_callback(&mut data);
-            }
+        dispatch_inbound_message(&response, &mut |_| unreachable!());
+    }
+}
+
+fn dispatch_inbound_message<O>(
+    response: &IPCMessage,
+    with_respond: &mut impl for<'a> FnMut(DecodedData<'a>) -> O,
+) -> Option<O> {
+    let decoder = response.decoded().expect("Failed to decode response");
+    match decoder {
+        DecodedVariant::Respond { data } => {
+            with_runtime(|runtime| {
+                // JS has now consumed the Rust→JS Evaluate this Respond
+                // closes, so types it carried can be sent as `TYPE_CACHED`
+                // from here on.
+                runtime.pop_and_ack_type_cache_frame();
+            });
+            let result = with_respond(data);
+            Some(result)
+        }
+        DecodedVariant::Evaluate { data } => {
+            handle_inbound_evaluate(data);
+            None
         }
     }
+}
+
+fn handle_inbound_evaluate(mut data: DecodedData<'_>) {
+    // Mark that we are inside a callback so any Evaluate this callback emits is
+    // routed back through the parked JS XHR instead of a fresh top-level
+    // `evaluate_script`. The guard restores the depth even if the callback
+    // panics.
+    let _eval = InboundEvaluateGuard::new();
+    handle_rust_callback(&mut data);
 }
 
 /// Handle a Rust callback invocation from JavaScript.
@@ -191,28 +200,30 @@ fn handle_rust_callback(data: &mut DecodedData) {
                 rust_callback.clone_rc()
             });
 
-            // Push a borrow frame before calling the callback - nested calls won't clear our borrowed refs
-            with_runtime(|state| state.push_borrow_frame());
+            // Push a borrow frame before calling the callback - nested calls
+            // won't clear our borrowed refs. The guard pops the frame even if
+            // the callback panics.
+            let _frame = BorrowFrameGuard::new();
 
-            // Call through the cloned Rc (uniform Fn interface)
-            let response = IPCMessage::new_respond(|encoder| {
-                (callback)(data, encoder);
-            });
-
-            // Pop the borrow frame after the callback completes
-            with_runtime(|state| state.pop_borrow_frame());
-
-            response
+            let mut encoder = respond_encoder();
+            // Call through the cloned Rc (uniform Fn interface). A decode error
+            // surfaces here with context instead of an opaque `unwrap` panic
+            // inside the callback trampoline (mirrors the export path below).
+            match (callback)(data, &mut encoder) {
+                Ok(()) => finish_respond_message(encoder),
+                Err(err) => {
+                    panic!("Rust callback {key} failed to decode arguments: {err}")
+                }
+            }
         }
         // Drop a native Rust object when JS GC'd the wrapper
         DROP_NATIVE_REF_FN_ID => {
             let key = ObjectHandle::decode(data).expect("Failed to decode object handle");
 
-            // Remove the object from the thread-local encoder
-            remove_object::<RustCallback>(key);
+            // The Rust owner may have dropped this closure before JS GC runs.
+            crate::object_store::drop_object(key);
 
-            // Send empty response
-            IPCMessage::new_respond(|_| {})
+            finish_respond_message(respond_encoder())
         }
         // Call an exported Rust struct method
         CALL_EXPORT_FN_ID => {
@@ -221,7 +232,7 @@ fn handle_rust_callback(data: &mut DecodedData) {
                 crate::encode::BinaryDecode::decode(data).expect("Failed to decode export name");
 
             // Find the export handler
-            let export = crate::inventory::iter::<crate::JsExportSpec>()
+            let export = crate::__rt::inventory::iter::<crate::__rt::JsExportSpec>()
                 .find(|e| e.name == export_name)
                 .unwrap_or_else(|| panic!("Unknown export: {export_name}"));
 
@@ -232,15 +243,61 @@ fn handle_rust_callback(data: &mut DecodedData) {
 
             // Send response
             match result {
-                Ok(encoded) => IPCMessage::new_respond(|encoder| {
+                Ok(encoded) => {
+                    let mut encoder = respond_encoder();
                     encoder.extend(&encoded);
-                }),
+                    finish_respond_message(encoder)
+                }
                 Err(err) => {
                     panic!("Export call failed: {err}");
                 }
             }
         }
-        _ => todo!(),
+        _ => panic!("Unknown Rust callback function ID: {fn_id}"),
     };
     with_runtime(|runtime| runtime.ipc().js_response(runtime.webview_id(), response));
+}
+
+/// Scopes a borrow frame for the duration of a callback. The frame is pushed on
+/// construction and popped on drop, so it survives a panicking callback.
+struct BorrowFrameGuard;
+
+impl BorrowFrameGuard {
+    fn new() -> Self {
+        with_runtime(|state| state.push_borrow_frame());
+        Self
+    }
+}
+
+impl Drop for BorrowFrameGuard {
+    fn drop(&mut self) {
+        with_runtime(|state| state.pop_borrow_frame());
+    }
+}
+
+/// Scopes the inbound-evaluate depth for the duration of a JS→Rust callback. The
+/// depth is incremented on construction and decremented on drop.
+struct InboundEvaluateGuard;
+
+impl InboundEvaluateGuard {
+    fn new() -> Self {
+        with_runtime(|state| state.enter_inbound_evaluate());
+        Self
+    }
+}
+
+impl Drop for InboundEvaluateGuard {
+    fn drop(&mut self) {
+        with_runtime(|state| state.leave_inbound_evaluate());
+    }
+}
+
+fn respond_encoder() -> crate::ipc::EncodedData {
+    let mut encoder = crate::ipc::EncodedData::new();
+    encoder.push_u8(MessageType::Respond as u8);
+    encoder
+}
+
+fn finish_respond_message(encoder: crate::ipc::EncodedData) -> OutboundIPCMessage {
+    with_runtime(|runtime| runtime.finish_respond_message(encoder))
 }

@@ -76,18 +76,22 @@ pub struct ImportType {
     pub vis: Visibility,
     /// Rust type name
     pub rust_name: Ident,
+    /// Generic parameters on the imported Rust type
+    pub generics: syn::Generics,
     /// JavaScript name (may differ from rust_name)
     pub js_name: String,
     /// Parent types (from `extends` attributes)
     pub extends: Vec<Path>,
-    /// TypeScript type override
-    pub typescript_type: Option<String>,
     /// User-provided derive attributes (e.g., Clone, Debug)
     pub derives: Vec<syn::Attribute>,
     /// Vendor prefixes for fallback (e.g., webkit, moz)
     pub vendor_prefixes: Vec<Ident>,
     /// Custom is_type_of expression for type checking
     pub is_type_of: Option<syn::Expr>,
+    /// Whether automatic upcast impls should be suppressed
+    pub no_upcast: bool,
+    /// Whether automatic Promising impls should be suppressed
+    pub no_promising: bool,
 }
 
 /// An imported JavaScript function
@@ -97,10 +101,10 @@ pub struct ImportFunction {
     pub vis: Visibility,
     /// Rust function name
     pub rust_name: Ident,
+    /// Generic parameters on the imported Rust function
+    pub generics: syn::Generics,
     /// JavaScript name (may differ from rust_name)
     pub js_name: String,
-    /// The class this method belongs to (if any)
-    pub js_class: Option<String>,
     /// JavaScript namespace
     pub js_namespace: Option<Vec<String>>,
     /// Function arguments (excluding self for methods)
@@ -111,22 +115,25 @@ pub struct ImportFunction {
     pub kind: ImportFunctionKind,
     /// Whether to catch JS exceptions
     pub catch: bool,
-    /// Whether this uses structural typing
-    pub structural: bool,
-    /// Whether this is variadic
-    pub variadic: bool,
     /// Whether this is an async function
     pub is_async: bool,
     /// User-provided attributes (like #[cfg(...)] and #[doc = "..."])
     pub rust_attrs: Vec<syn::Attribute>,
 }
 
+/// Build the token stream of preserved rust attributes for a generated function,
+/// appending `#[allow(non_snake_case)]`.
+fn fn_rust_attrs(
+    rust_attrs: &[syn::Attribute],
+    span: proc_macro2::Span,
+) -> proc_macro2::TokenStream {
+    quote_spanned! {span=> #(#rust_attrs)* #[allow(non_snake_case)] }
+}
+
 impl ImportFunction {
     /// Get the function rust attributes
     pub fn fn_rust_attrs(&self) -> proc_macro2::TokenStream {
-        let rust_attrs = &self.rust_attrs;
-        let span = self.rust_name.span();
-        quote_spanned! {span=> #(#rust_attrs)* #[allow(non_snake_case)] }
+        fn_rust_attrs(&self.rust_attrs, self.rust_name.span())
     }
 }
 
@@ -243,8 +250,6 @@ pub struct StructField {
     pub readonly: bool,
     /// Whether to clone the value in the getter (for non-Copy types)
     pub getter_with_clone: bool,
-    /// Whether to skip this field entirely
-    pub skip: bool,
 }
 
 /// An exported method from an impl block
@@ -262,8 +267,6 @@ pub struct ExportMethod {
     pub arguments: Vec<FunctionArg>,
     /// Return type
     pub ret: Option<Type>,
-    /// Whether to wrap in try-catch
-    pub catch: bool,
     /// User-provided attributes (like #[cfg(...)] and #[doc = "..."])
     pub rust_attrs: Vec<syn::Attribute>,
     /// Method visibility
@@ -275,9 +278,7 @@ pub struct ExportMethod {
 impl ExportMethod {
     /// Get the function rust attributes
     pub fn fn_rust_attrs(&self) -> proc_macro2::TokenStream {
-        let rust_attrs = &self.rust_attrs;
-        let span = self.rust_name.span();
-        quote_spanned! {span=> #(#rust_attrs)* #[allow(non_snake_case)] }
+        fn_rust_attrs(&self.rust_attrs, self.rust_name.span())
     }
 }
 
@@ -383,7 +384,6 @@ fn parse_struct(s: syn::ItemStruct, attrs: &BindgenAttrs) -> syn::Result<ExportS
                     ty: field.ty.clone(),
                     readonly: field_attrs.readonly.is_some(),
                     getter_with_clone: field_attrs.getter_with_clone.is_some(),
-                    skip: false,
                 });
             }
         }
@@ -572,7 +572,6 @@ fn parse_impl_method(
         kind,
         arguments,
         ret,
-        catch: method_attrs.catch.is_some(),
         rust_attrs,
         vis: method.vis.clone(),
         body: method.block.clone(),
@@ -684,6 +683,12 @@ fn extract_wasm_bindgen_attrs(attrs: &[syn::Attribute]) -> syn::Result<BindgenAt
             if let Some(v) = parsed.is_type_of {
                 combined.is_type_of = Some(v);
             }
+            if let Some(span) = parsed.no_upcast {
+                combined.no_upcast = Some(span);
+            }
+            if let Some(span) = parsed.no_promising {
+                combined.no_promising = Some(span);
+            }
             combined.vendor_prefixes.extend(parsed.vendor_prefixes);
         }
     }
@@ -760,9 +765,9 @@ fn parse_foreign_fn(f: syn::ForeignItemFn, attrs: BindgenAttrs) -> syn::Result<I
             js_class.clone().unwrap_or_else(|| js_name.clone())
         };
         ImportFunctionKind::Constructor { class }
-    } else if let Some((_, ref ident)) = attrs.static_method_of {
+    } else if let Some((_, ref class)) = attrs.static_method_of {
         ImportFunctionKind::StaticMethod {
-            class: ident.to_string(),
+            class: class.clone(),
         }
     } else if attrs.is_getter() {
         let receiver = receiver.ok_or_else(|| {
@@ -822,15 +827,13 @@ fn parse_foreign_fn(f: syn::ForeignItemFn, attrs: BindgenAttrs) -> syn::Result<I
     Ok(ImportFunction {
         vis: f.vis,
         rust_name,
+        generics: f.sig.generics,
         js_name,
-        js_class,
         js_namespace,
         arguments,
         ret,
         kind,
         catch: attrs.catch.is_some(),
-        structural: attrs.is_structural(),
-        variadic: attrs.variadic.is_some(),
         is_async,
         rust_attrs,
     })
@@ -845,7 +848,7 @@ fn parse_foreign_type(t: syn::ForeignItemType, attrs: BindgenAttrs) -> syn::Resu
         .unwrap_or_else(|| rust_name.to_string());
 
     let extends: Vec<Path> = attrs.extends.into_iter().map(|(_, p)| p).collect();
-    let typescript_type = attrs.typescript_type.map(|(_, t)| t);
+    let _typescript_type = attrs.typescript_type;
     let vendor_prefixes: Vec<Ident> = attrs.vendor_prefixes.into_iter().map(|(_, i)| i).collect();
     let is_type_of = attrs.is_type_of.map(|(_, e)| e);
 
@@ -860,12 +863,14 @@ fn parse_foreign_type(t: syn::ForeignItemType, attrs: BindgenAttrs) -> syn::Resu
     Ok(ImportType {
         vis: t.vis,
         rust_name,
+        generics: t.generics,
         js_name,
         extends,
-        typescript_type,
         derives,
         vendor_prefixes,
         is_type_of,
+        no_upcast: attrs.no_upcast.is_some(),
+        no_promising: attrs.no_promising.is_some(),
     })
 }
 

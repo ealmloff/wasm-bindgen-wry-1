@@ -41,6 +41,18 @@ export function set_on_error(callback) {
     window.addEventListener('error', function(event) {
         callback(event.message + ' at ' + event.filename + ':' + event.lineno + ':' + event.colno, event.error ? event.error.stack : '');
     });
+    window.addEventListener('unhandledrejection', function(event) {
+        const reason = event.reason;
+        let message = '';
+        let stack = '';
+        try {
+            message = reason && reason.message ? String(reason.message) : String(reason);
+            stack = reason && reason.stack ? String(reason.stack) : '';
+        } catch (e) {
+            message = '<unprintable rejection reason>';
+        }
+        callback('Unhandled promise rejection: ' + message, stack);
+    });
 }
 "#)]
 extern "C" {

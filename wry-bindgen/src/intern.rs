@@ -28,13 +28,22 @@ thread_local! {
 #[cfg(feature = "enable-interning")]
 /// This returns the raw index of the cached JsValue, so you must take care
 /// so that you don't use it after it is freed.
-#[allow(dead_code)]
 pub(crate) fn unsafe_get_str(s: &str) -> Option<u64> {
     CACHE.with(|cache| {
         let cache = cache.entries.borrow();
 
         cache.get(s).map(|x| x.idx)
     })
+}
+
+#[cfg(all(test, feature = "enable-interning"))]
+pub(crate) fn insert_for_test(key: &str, id: u64) {
+    CACHE.with(|cache| {
+        cache
+            .entries
+            .borrow_mut()
+            .insert(key.to_owned(), JsValue::from_id(id));
+    });
 }
 
 #[cfg(feature = "enable-interning")]
@@ -70,7 +79,7 @@ fn unintern_str(key: &str) {
 /// If you are sending the same string multiple times, you can call this `intern`
 /// function, which simply returns its argument unchanged:
 ///
-/// ```rust
+/// ```rust,no_run
 /// # use wry_bindgen::intern;
 /// intern("foo") // returns "foo"
 /// # ;

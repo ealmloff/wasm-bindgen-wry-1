@@ -4,6 +4,12 @@ export function is_undefined(x: any): boolean {
 export function is_null(x: any): boolean {
   return x === null;
 }
+export function is_null_or_undefined(x: any): boolean {
+  return x === null || x === undefined;
+}
+export function is_array(x: any): boolean {
+  return Array.isArray(x);
+}
 export function is_true(x: any): boolean {
   return x === true;
 }
@@ -34,6 +40,23 @@ export function is_symbol(x: any): boolean {
 export function is_bigint(x: any): boolean {
   return typeof x === "bigint";
 }
+export function bigint_from_str(x: string): bigint {
+  return BigInt(x);
+}
+export function symbol_new(description: string | null): symbol {
+  return Symbol(description ?? undefined);
+}
+export function bigint_get_as_i64(x: any): bigint | null {
+  // Return the bigint itself (not a lossy `Number`) so the i64 encoder can
+  // preserve all 64 bits; `Number(...)` would round magnitudes above 2^53.
+  return typeof x === "bigint" ? BigInt.asIntN(64, x) : null;
+}
+export function bigint_to_string(x: any): string | null {
+  return typeof x === "bigint" ? x.toString() : null;
+}
+export function reflect_get(target: any, key: any): any {
+  return Reflect.get(target, key);
+}
 export function as_string(x: any): string | null {
   return typeof x === "string" ? x : null;
 }
@@ -43,20 +66,25 @@ export function as_f64(x: any): number | null {
 export function debug_string(x: any): string {
   try {
     return x.toString();
-  } catch {
+  } catch (_error) {
     return "[unrepresentable]";
   }
 }
 
 // Arithmetic operators
 export function js_checked_div(a: any, b: any): any {
+  // Keep in sync with wasm-bindgen's `Intrinsic::CheckedDiv` JS emission.
   try {
     return a / b;
   } catch (e) {
-    return e;
+    if (e instanceof RangeError) {
+      return e;
+    }
+    throw e;
   }
 }
 export function js_pow(a: any, b: any): any {
+  // Keep in sync with wasm-bindgen's `Intrinsic::Pow` JS emission.
   return a ** b;
 }
 export function js_add(a: any, b: any): any {
@@ -129,7 +157,8 @@ export function is_error(x: any): boolean {
 }
 
 // Heap management - clone a value in the JS heap
-// Returns the value itself (not the ID) - HeapRefType.encode handles inserting it
+// Returns the value itself. HeapRefType.encode handles inserting it and
+// encoding the assigned ID when this is returned to Rust.
 export function clone_heap_ref(heapId: number): unknown {
   return window.jsHeap.get(heapId);
 }
@@ -137,6 +166,20 @@ export function clone_heap_ref(heapId: number): unknown {
 // Heap management - drop a value from the JS heap
 export function drop_heap_ref(heapId: number): void {
   window.jsHeap.remove(heapId);
+}
+
+export function dispose_rust_function(heapId: number): void {
+  const value = window.jsHeap.get(heapId) as
+    | {
+        __wryRustFunction?: {
+          disposeFromRust?: () => void;
+        };
+      }
+    | undefined;
+  const rustFunction = value && value.__wryRustFunction;
+  if (rustFunction && typeof rustFunction.disposeFromRust === "function") {
+    rustFunction.disposeFromRust();
+  }
 }
 
 // Create a wrapper object for an exported Rust struct

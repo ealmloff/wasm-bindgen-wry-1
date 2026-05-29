@@ -16,11 +16,11 @@ mod webview;
 use webview::{WryEvent, run_event_loop};
 
 // Re-export bindings for convenience
-pub use bindings::set_on_log;
+pub use bindings::{set_on_error, set_on_log};
 
 // Re-export prelude items that apps need
 pub use wasm_bindgen::JsValue;
-pub use wasm_bindgen::prelude::batch;
+pub use wasm_bindgen::batch::batch;
 
 // Re-export tao and wry for users to configure builders
 pub use tao;
@@ -147,8 +147,6 @@ impl LaunchBuilder {
     }
 }
 
-use crate::bindings::set_on_error;
-
 /// Run a webview application with the given app function.
 ///
 /// The app function will be spawned in a separate thread and can use
@@ -209,5 +207,12 @@ where
         .with_inner_size(LogicalSize::new(800.0, 600.0))
         .with_visible(false);
 
-    LaunchBuilder::new().window(window).run(app)
+    let webview = WebViewBuilder::new()
+        .with_devtools(true)
+        .with_background_throttling(wry::BackgroundThrottlingPolicy::Disabled);
+
+    LaunchBuilder::new()
+        .window(window)
+        .webview(webview)
+        .run(app)
 }

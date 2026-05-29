@@ -32,6 +32,22 @@ pub(crate) fn test_clamped_vec_is_uint8clampedarray() {
     );
 }
 
+/// Test that converting Clamped<Vec<u8>> into JsValue preserves the clamped type
+pub(crate) fn test_jsvalue_from_clamped_vec_is_uint8clampedarray() {
+    #[wasm_bindgen(inline_js = "export function is_js_value_uint8_clamped_array(arr) {
+        return arr instanceof Uint8ClampedArray;
+    }")]
+    extern "C" {
+        fn is_js_value_uint8_clamped_array(arr: &wasm_bindgen::JsValue) -> bool;
+    }
+
+    let value = wasm_bindgen::JsValue::from(Clamped(vec![0u8, 128u8, 255u8]));
+    assert!(
+        is_js_value_uint8_clamped_array(&value),
+        "JsValue::from(Clamped<Vec<u8>>) should produce a Uint8ClampedArray"
+    );
+}
+
 /// Test that Clamped values clamp correctly when set (JS behavior)
 pub(crate) fn test_clamped_js_clamping_behavior() {
     #[wasm_bindgen(inline_js = "export function test_clamping() {

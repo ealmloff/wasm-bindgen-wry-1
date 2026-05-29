@@ -65,6 +65,19 @@ function sync_request_binary(
   return null;
 }
 
+function sendEvaluateToRust(
+  encodePayload: (encoder: DataEncoder) => void
+): DataDecoder | null {
+  const pendingHeapRefs = window.jsHeap.deferHeapRefs();
+  const encoder = new DataEncoder(pendingHeapRefs);
+  encoder.pushU8(MessageType.Evaluate);
+  encodePayload(encoder);
+
+  return handleBinaryResponse(
+    sync_request_binary(`/__wbg__/handler`, encoder.finalize())
+  );
+}
+
 /**
  * Entry point for Rust to call JS functions using binary protocol.
  * Handles batched operations - reads and executes operations until buffer is exhausted.
@@ -126,6 +139,24 @@ function parseTypeInfo(decoder: DataDecoder): CachedTypeInfo {
   }
 }
 
+function takeIdList(decoder: DataDecoder): number[] {
+  const count = decoder.takeU32();
+  const ids: number[] = [];
+  for (let i = 0; i < count; i++) {
+    ids.push(decoder.takeU64());
+  }
+  return ids;
+}
+
+function installDeferredHeapRefs(decoder: DataDecoder): void {
+  // A single install id-list rides in every prelude. An empty list means the
+  // last inbound message carried no heap refs, so there is nothing to resolve.
+  const ids = takeIdList(decoder);
+  if (ids.length > 0) {
+    window.jsHeap.resolveDeferredHeapRefs(ids);
+  }
+}
+
 /**
  * Handle binary response from Rust.
  * May contain nested Evaluate calls (for callbacks).
@@ -138,62 +169,66 @@ function handleBinaryResponse(
   }
 
   const decoder = new DataDecoder(response);
-  const rawMsgType = decoder.takeU8();
-  const msgType: MessageType = rawMsgType;
+  const msgType = decoder.takeU8();
 
   if (msgType === MessageType.Respond) {
-    // Respond - just return the decoder for further processing
+    installDeferredHeapRefs(decoder);
     return decoder;
   } else if (msgType === MessageType.Evaluate) {
-    // Evaluate - Rust is calling JS functions (possibly multiple)
+    installDeferredHeapRefs(decoder);
 
-    // Read the reserved placeholder count and push a reservation scope
-    // This ensures nested callback allocations skip these reserved IDs
-    const reservedCount = decoder.takeU32();
-    window.jsHeap.pushReservationScope(reservedCount);
+    // Read the explicit placeholder IDs Rust reserved for this batch.
+    const reservedIds = takeIdList(decoder);
+    window.jsHeap.pushReservationScope(reservedIds);
 
-    const encoder = new DataEncoder();
+    const pendingHeapRefs = window.jsHeap.deferHeapRefs();
+    const encoder = new DataEncoder(pendingHeapRefs);
     encoder.pushU8(MessageType.Respond);
 
-    // Push a single borrow frame for this entire Evaluate message
-    // This frame persists across all operations and nested calls
+    // Push a single borrow frame for this entire Evaluate message.
+    // This frame persists across all operations and nested calls.
     window.jsHeap.pushBorrowFrame();
 
-    // Process all operations
-    while (decoder.hasMoreU32()) {
-      const fnId = decoder.takeU32();
-      // Parse type information (cached or full)
-      const typeInfo = parseTypeInfo(decoder);
+    // The borrow frame and reservation scope are popped in `finally` so a throw
+    // inside the op loop cannot leave either stack desynced. On the error path
+    // the reservation scope is popped without its fill-count check, so this
+    // cleanup never throws over and masks the original (e.g. decode) error.
+    let succeeded = false;
+    try {
+      while (decoder.hasMoreU32()) {
+        const fnId = decoder.takeU32();
+        const typeInfo = parseTypeInfo(decoder);
 
-      // Get the raw JS function
-      const functionRegistry = getFunctionRegistry();
-      const jsFunction = functionRegistry[fnId];
-      if (!jsFunction) {
-        throw new Error("Unknown function ID in response: " + fnId);
+        const functionRegistry = getFunctionRegistry();
+        const jsFunction = functionRegistry[fnId];
+        if (!jsFunction) {
+          throw new Error("Unknown function ID in response: " + fnId);
+        }
+
+        let params: unknown[];
+        try {
+          params = typeInfo.paramTypes.map((paramType) => paramType.decode(decoder));
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const source = String(jsFunction).replace(/\s+/g, " ").slice(0, 160);
+          throw new Error(
+            `Failed to decode parameters for function ID ${fnId} (${source}): ${message}`
+          );
+        }
+
+        const result = jsFunction(...params);
+
+        if (typeInfo.returnType instanceof HeapRefType && reservedIds.length > 0) {
+          window.jsHeap.fillNextReserved(result);
+        } else {
+          typeInfo.returnType.encode(encoder, result);
+        }
       }
-
-      // Decode parameters using their respective types
-      const params = typeInfo.paramTypes.map((paramType) => paramType.decode(decoder));
-
-      // Call the original JS function with decoded parameters
-      const result = jsFunction(...params);
-
-      // If return type is HeapRef and we have reserved slots, fill the next reserved slot
-      // instead of calling encode(). This ensures the ID matches what Rust pre-allocated.
-      // When reservedCount is 0 (non-batch mode), fall back to normal encode() behavior.
-      if (typeInfo.returnType instanceof HeapRefType && reservedCount > 0) {
-        window.jsHeap.fillNextReserved(result);
-      } else {
-        // Encode the result using the return type
-        typeInfo.returnType.encode(encoder, result);
-      }
+      succeeded = true;
+    } finally {
+      window.jsHeap.popBorrowFrame();
+      window.jsHeap.popReservationScope(succeeded);
     }
-
-    // Pop the borrow frame after all operations complete
-    window.jsHeap.popBorrowFrame();
-
-    // Pop the reservation scope
-    window.jsHeap.popReservationScope();
 
     const nextResponse = sync_request_binary(
       `/__wbg__/handler`,
@@ -211,9 +246,7 @@ function handleBinaryResponse(
 
 export {
   evaluate_from_rust_binary,
-  handleBinaryResponse,
-  sync_request_binary,
-  MessageType,
+  sendEvaluateToRust,
   DROP_NATIVE_REF_FN_ID,
   CALL_EXPORT_FN_ID,
 };

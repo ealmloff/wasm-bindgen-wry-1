@@ -5,7 +5,7 @@ use tao::{
 };
 use wry::WebViewBuilder;
 
-use wasm_bindgen::{runtime::WryBindgenEvent, wry::WryBindgen};
+use wasm_bindgen::wry::{WryBindgen, WryBindgenEvent};
 
 use crate::home::root_response;
 

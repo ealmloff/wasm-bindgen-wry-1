@@ -16,6 +16,20 @@ extern "C" {
     fn get_count(s: &JsValue) -> i32;
 }
 
+#[wasm_bindgen(inline_js = r#"
+export function call_counter_then_heap_ref(cb, counter) {
+    cb(counter, { label: 123 });
+}
+
+export function heap_ref_label(obj) {
+    return obj.label;
+}
+"#)]
+extern "C" {
+    fn call_counter_then_heap_ref(cb: &mut dyn FnMut(Counter, JsValue), counter: &JsValue);
+    fn heap_ref_label(obj: &JsValue) -> u32;
+}
+
 #[wasm_bindgen]
 #[derive(Debug)]
 pub struct Counter {
@@ -52,4 +66,20 @@ pub(crate) fn test_struct_bindings() {
     assert_eq!(get_count(&as_js_value), 5);
     set_count(&as_js_value, 10);
     assert_eq!(get_count(&as_js_value), 20);
+}
+
+pub(crate) fn test_exported_struct_arg_before_heap_ref_arg() {
+    let counter = JsValue::from(Counter::new(7));
+    let mut called = false;
+
+    call_counter_then_heap_ref(
+        &mut |counter: Counter, value: JsValue| {
+            assert_eq!(counter.count(), 7);
+            assert_eq!(heap_ref_label(&value), 123);
+            called = true;
+        },
+        &counter,
+    );
+
+    assert!(called, "callback was not called");
 }

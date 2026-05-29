@@ -1,19 +1,23 @@
-import { RustFunction } from "./rust_function";
-
 /**
  * Encoder for building binary messages to send to Rust.
  */
-class DataEncoder {
-  private u8Buf: number[];
-  private u16Buf: number[];
-  private u32Buf: number[];
-  private strBuf: number[]; // UTF-8 bytes
+import { DeferredHeapRefs } from "./heap";
 
-  constructor() {
+const CACHED_STRING_SENTINEL = 0xffffffff;
+
+class DataEncoder {
+  declare private u8Buf: number[];
+  declare private u16Buf: number[];
+  declare private u32Buf: number[];
+  declare private strBuf: number[]; // UTF-8 bytes
+  declare private heapRefs?: DeferredHeapRefs;
+
+  constructor(heapRefs?: DeferredHeapRefs) {
     this.u8Buf = [];
     this.u16Buf = [];
     this.u32Buf = [];
     this.strBuf = [];
+    this.heapRefs = heapRefs;
   }
 
   pushU8(value: number) {
@@ -28,7 +32,15 @@ class DataEncoder {
     this.u32Buf.push(value >>> 0);
   }
 
-  pushU64(value: number) {
+  pushU64(value: number | bigint) {
+    // bigint inputs (e.g. an i64/u64 from a BigInt) are encoded losslessly;
+    // plain numbers keep the existing float-split path.
+    if (typeof value === "bigint") {
+      const v = BigInt.asUintN(64, value);
+      this.pushU32(Number(v & 0xffffffffn));
+      this.pushU32(Number(v >> 32n));
+      return;
+    }
     const low = value >>> 0;
     const high = Math.floor(value / 0x100000000) >>> 0;
     this.pushU32(low);
@@ -63,6 +75,15 @@ class DataEncoder {
     for (let i = 0; i < encoded.length; i++) {
       this.strBuf.push(encoded[i]);
     }
+  }
+
+  pushHeapRef(value: unknown) {
+    // JS never mints heap IDs. It records the value and waits for Rust to
+    // install an exact slot for this request.
+    if (!this.heapRefs) {
+      throw new Error("Cannot encode JS heap ref without a Rust allocation request");
+    }
+    this.heapRefs.push(value);
   }
 
   finalize(): ArrayBuffer {
@@ -108,17 +129,17 @@ class DataEncoder {
  * Decoder for reading binary messages from Rust.
  */
 class DataDecoder {
-  private u8Buf: Uint8Array;
-  private u8Offset: number;
+  declare private u8Buf: Uint8Array;
+  declare private u8Offset: number;
 
-  private u16Buf: Uint16Array;
-  private u16Offset: number;
+  declare private u16Buf: Uint16Array;
+  declare private u16Offset: number;
 
-  private u32Buf: Uint32Array;
-  private u32Offset: number;
+  declare private u32Buf: Uint32Array;
+  declare private u32Offset: number;
 
-  private strBuf: string;
-  private strOffset: number;
+  declare private strBuf: string;
+  declare private strOffset: number;
 
   constructor(data: ArrayBuffer) {
     const headerView = new DataView(data, 0, 12);
@@ -199,6 +220,15 @@ class DataDecoder {
 
   takeStr(): string {
     const len = this.takeU32();
+    if (len === CACHED_STRING_SENTINEL) {
+      const id = this.takeU64();
+      const value = window.jsHeap.get(id);
+      if (typeof value !== "string") {
+        throw new Error(`Cached string ID ${id} does not refer to a string`);
+      }
+      return value;
+    }
+
     const str = this.strBuf.substring(this.strOffset, this.strOffset + len);
     this.strOffset += len;
     return str;

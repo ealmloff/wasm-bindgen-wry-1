@@ -12,6 +12,8 @@ use alloc::vec::Vec;
 use base64::Engine;
 use core::fmt;
 
+pub(crate) const CACHED_STRING_SENTINEL: u32 = u32::MAX;
+
 /// Error type for decoding binary IPC messages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
@@ -98,20 +100,52 @@ pub(crate) enum MessageType {
     Respond = 1,
 }
 
+/// Message sent from Rust to JS.
+#[derive(Debug, Clone)]
+pub(crate) struct OutboundIPCMessage {
+    pub(crate) message: IPCMessage,
+    /// For Evaluate messages, whether this is a fresh top-level call from the
+    /// app future (delivered via `evaluate_script`) rather than a nested
+    /// response inside a JS→Rust callback (delivered through the parked XHR).
+    ///
+    /// This must be decided by the runtime, which alone knows its callback
+    /// depth: a parked-but-unprocessed callback XHR would otherwise make a
+    /// genuinely top-level eval look nested to the transport. Responds ignore
+    /// this flag — they always answer the parked XHR.
+    pub(crate) top_level: bool,
+}
+
+impl OutboundIPCMessage {
+    pub(crate) fn new(message: IPCMessage, top_level: bool) -> Self {
+        Self { message, top_level }
+    }
+}
+
 /// A binary IPC message.
 ///
 /// Message format in the u8 buffer:
 /// - First u8: message type (0 = Evaluate, 1 = Respond)
 /// - Remaining data depends on message type
 ///
+/// Under strict synchronous ping-pong, routing is fully determined by message
+/// polarity plus the per-side call stack. There are no per-message request IDs.
+///
+/// Rust-to-JS heap ID lists are encoded in the u32 buffer as `count: u32`
+/// followed by `count` u64 IDs, each split into low/high u32 words.
+///
 /// Evaluate format (supports batching - multiple operations in one message):
 /// - u8: message type (0)
+/// - install batches: heap IDs JS should install for previously deferred
+///   JS-originated values, in FIFO order
+/// - id list: heap IDs JS should reserve for Rust-to-JS return placeholders
 /// - For each operation (read until buffer exhausted):
 ///   - u32: function ID
 ///   - encoded arguments (varies by function)
 ///
 /// Respond format:
 /// - u8: message type (1)
+/// - install batches: heap IDs JS should install for previously deferred
+///   JS-originated values, in FIFO order
 /// - For each operation result:
 ///   - encoded return value (varies by function)
 #[derive(Debug, Clone)]
@@ -123,16 +157,6 @@ impl IPCMessage {
     /// Create a new IPCMessage from raw bytes.
     pub fn new(data: Vec<u8>) -> Self {
         Self { data }
-    }
-
-    /// Create a new respond message with the given data.
-    pub fn new_respond(push_data: impl FnOnce(&mut EncodedData)) -> Self {
-        let mut encoder = EncodedData::new();
-        encoder.push_u8(MessageType::Respond as u8);
-
-        push_data(&mut encoder);
-
-        IPCMessage::new(encoder.to_bytes())
     }
 
     /// Get the message type.
@@ -306,6 +330,11 @@ pub struct EncodedData {
     pub(crate) u16_buf: Vec<u16>,
     pub(crate) u32_buf: Vec<u32>,
     pub(crate) str_buf: Vec<u8>,
+    pub(crate) heap_ids_to_recycle_after_flush: Vec<u64>,
+    /// Type IDs whose `TYPE_FULL` definition was written into this encoder.
+    /// They become safe to send as `TYPE_CACHED` only after JS has parsed
+    /// this outbound, which the matching JS Respond signals.
+    pub(crate) pending_type_ids: Vec<u32>,
     /// Flag indicating that this batch must be flushed before returning.
     /// Used for stack-allocated callbacks that need synchronous invocation.
     pub(crate) needs_flush: bool,
@@ -319,6 +348,8 @@ impl EncodedData {
             u16_buf: Vec::new(),
             u32_buf: Vec::new(),
             str_buf: Vec::new(),
+            heap_ids_to_recycle_after_flush: Vec::new(),
+            pending_type_ids: Vec::new(),
             needs_flush: false,
         }
     }
@@ -327,6 +358,24 @@ impl EncodedData {
     /// Used for stack-allocated callbacks that require synchronous invocation.
     pub fn mark_needs_flush(&mut self) {
         self.needs_flush = true;
+    }
+
+    /// Record that this encoder's outbound is introducing a new type ID with
+    /// `TYPE_FULL`. The ID will be acked when JS responds to this outbound.
+    pub(crate) fn register_pending_type_id(&mut self, type_id: u32) {
+        self.pending_type_ids.push(type_id);
+    }
+
+    pub(crate) fn take_pending_type_ids(&mut self) -> Vec<u32> {
+        core::mem::take(&mut self.pending_type_ids)
+    }
+
+    pub(crate) fn defer_heap_id_recycle_until_flush(&mut self, id: u64) {
+        self.heap_ids_to_recycle_after_flush.push(id);
+    }
+
+    pub(crate) fn take_heap_ids_to_recycle_after_flush(&mut self) -> Vec<u64> {
+        core::mem::take(&mut self.heap_ids_to_recycle_after_flush)
     }
 
     /// Get the total byte length of the encoded data.
@@ -352,10 +401,14 @@ impl EncodedData {
         self.u32_buf.push(value);
     }
 
-    /// Prepend a u32 to the beginning of the buffer.
-    /// Used to add the reserved placeholder count at the start of batch messages.
-    pub fn prepend_u32(&mut self, value: u32) {
-        self.u32_buf.insert(0, value);
+    /// Insert u32 values at the given u32-buffer index, preserving order.
+    pub(crate) fn insert_u32s(&mut self, index: usize, values: &[u32]) {
+        let index = index.min(self.u32_buf.len());
+        let mut u32_buf = Vec::with_capacity(values.len() + self.u32_buf.len());
+        u32_buf.extend_from_slice(&self.u32_buf[..index]);
+        u32_buf.extend_from_slice(values);
+        u32_buf.extend_from_slice(&self.u32_buf[index..]);
+        self.u32_buf = u32_buf;
     }
 
     /// Push a u64 to the buffer (stored as two u32s).
@@ -372,7 +425,12 @@ impl EncodedData {
 
     /// Push a string to the buffer.
     pub(crate) fn push_str(&mut self, value: &str) {
-        self.push_u32(value.len() as u32);
+        let len = u32::try_from(value.len()).expect("string length exceeds u32::MAX");
+        assert_ne!(
+            len, CACHED_STRING_SENTINEL,
+            "string length conflicts with cached string sentinel"
+        );
+        self.push_u32(len);
         self.str_buf.extend_from_slice(value.as_bytes());
     }
 
@@ -415,6 +473,9 @@ impl EncodedData {
         self.u16_buf.extend_from_slice(&other.u16_buf);
         self.u32_buf.extend_from_slice(&other.u32_buf);
         self.str_buf.extend_from_slice(&other.str_buf);
+        self.heap_ids_to_recycle_after_flush
+            .extend_from_slice(&other.heap_ids_to_recycle_after_flush);
+        self.needs_flush |= other.needs_flush;
     }
 }
 
@@ -423,4 +484,49 @@ pub(crate) fn decode_data(bytes: &[u8]) -> Option<IPCMessage> {
     let engine = base64::engine::general_purpose::STANDARD;
     let data = engine.decode(bytes).ok()?;
     Some(IPCMessage { data })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_header_only_carries_message_type() {
+        let mut encoder = EncodedData::new();
+        encoder.push_u8(MessageType::Evaluate as u8);
+        encoder.push_u32(99);
+
+        let msg = IPCMessage::new(encoder.to_bytes());
+        assert_eq!(msg.ty().unwrap(), MessageType::Evaluate);
+
+        let DecodedVariant::Evaluate { mut data, .. } = msg.decoded().unwrap() else {
+            panic!("expected Evaluate message");
+        };
+        assert_eq!(data.take_u32().unwrap(), 99);
+    }
+
+    #[test]
+    fn deferred_recycle_ids_are_encoder_local() {
+        let mut queued = EncodedData::new();
+        queued.defer_heap_id_recycle_until_flush(10);
+
+        let mut unrelated = EncodedData::new();
+        unrelated.defer_heap_id_recycle_until_flush(20);
+
+        assert_eq!(unrelated.take_heap_ids_to_recycle_after_flush(), vec![20]);
+        assert_eq!(queued.take_heap_ids_to_recycle_after_flush(), vec![10]);
+    }
+
+    #[test]
+    fn deferred_recycle_ids_extend_with_encoder_data() {
+        let mut outer = EncodedData::new();
+        outer.defer_heap_id_recycle_until_flush(10);
+
+        let mut encoded_during_op = EncodedData::new();
+        encoded_during_op.defer_heap_id_recycle_until_flush(20);
+
+        outer.extend(&encoded_during_op);
+
+        assert_eq!(outer.take_heap_ids_to_recycle_after_flush(), vec![10, 20]);
+    }
 }

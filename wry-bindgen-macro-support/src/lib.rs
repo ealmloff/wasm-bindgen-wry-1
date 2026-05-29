@@ -9,9 +9,6 @@ mod parser;
 
 use proc_macro2::TokenStream;
 
-pub use ast::*;
-pub use parser::BindgenAttrs;
-
 /// Expand the wasm_bindgen attribute macro.
 ///
 /// This is the main entry point called by the proc-macro crate.
