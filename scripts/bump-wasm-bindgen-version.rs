@@ -87,7 +87,7 @@ fn run() -> Result<()> {
     let upstream_manifest = repo_root.join("wasm-bindgen/Cargo.toml");
     if !upstream_manifest.exists() {
         return Err(Error::new(format!(
-            "missing {}; initialize or update the wasm-bindgen submodule first",
+            "missing {}; generate or restore the vendored wasm-bindgen tree first",
             upstream_manifest.display()
         )));
     }

@@ -26,6 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const PACKAGE: &str = "wry-bindgen";
 const CURRENT_MANIFEST: &str = "wry-bindgen/Cargo.toml";
 const BASELINE_PACKAGE_NAME: &str = "wry-bindgen";
+const UPSTREAM_REMOTE: &str = "https://github.com/wasm-bindgen/wasm-bindgen.git";
 
 // Findings the script treats as known intentional desktop-vs-wasm differences and removes
 // from the report (see `filter_ignored_failures`). The lints stay active, so other findings
@@ -90,34 +91,47 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = parse_args()?;
-    let upstream_ref = match args.upstream_ref {
-        Some(upstream_ref) => upstream_ref,
-        None => default_upstream_ref()?,
-    };
     let repo_root = repo_root()?;
-    let wasm_bindgen_submodule = repo_root.join("wasm-bindgen");
-    if !wasm_bindgen_submodule.is_dir() {
+    let wasm_bindgen_tree = repo_root.join("wasm-bindgen");
+    if !wasm_bindgen_tree.is_dir() {
         return Err(Error::new(format!(
-            "missing wasm-bindgen submodule at {}",
-            wasm_bindgen_submodule.display()
+            "missing vendored wasm-bindgen tree at {}",
+            wasm_bindgen_tree.display()
         )));
     }
-
-    verify_git_ref(&wasm_bindgen_submodule, &upstream_ref)?;
+    let upstream_ref = match args.upstream_ref {
+        Some(upstream_ref) => upstream_ref,
+        None => default_upstream_ref(&repo_root, &wasm_bindgen_tree)?,
+    };
 
     let tmp = TempDir::new("check-wasm-bindgen-api")?;
+    let upstream_repo = if has_nested_git_repo(&wasm_bindgen_tree) {
+        wasm_bindgen_tree.clone()
+    } else {
+        let upstream_repo = tmp.path().join("upstream-wasm-bindgen-repo");
+        clone_upstream_repo(&upstream_repo)?;
+        upstream_repo
+    };
+    ensure_git_ref(&upstream_repo, &upstream_ref)?;
+
     let baseline_root = tmp.path().join("upstream-wasm-bindgen");
     fs::create_dir_all(&baseline_root)?;
-    extract_git_archive(&wasm_bindgen_submodule, &upstream_ref, &baseline_root)?;
+    extract_git_archive(&upstream_repo, &upstream_ref, &baseline_root)?;
     hide_upstream_convert_module(&baseline_root)?;
     rename_baseline_package(&baseline_root)?;
 
-    println!("Checking wry-bindgen public API against upstream wasm-bindgen with cargo-semver-checks");
+    println!(
+        "Checking wry-bindgen public API against upstream wasm-bindgen with cargo-semver-checks"
+    );
     println!("baseline upstream ref: {upstream_ref}");
     println!("baseline root: {}", baseline_root.display());
     println!("current manifest: {CURRENT_MANIFEST}");
-    println!("baseline adjustments: #[doc(hidden)] on upstream convert APIs; package renamed to `{BASELINE_PACKAGE_NAME}` to match the crate under test");
-    println!("report adjustment: wasm-ABI-trait derive differences are ignored (convert/describe codegen traits)");
+    println!(
+        "baseline adjustments: #[doc(hidden)] on upstream convert APIs; package renamed to `{BASELINE_PACKAGE_NAME}` to match the crate under test"
+    );
+    println!(
+        "report adjustment: wasm-ABI-trait derive differences are ignored (convert/describe codegen traits)"
+    );
     if let Some(target) = args.target.as_deref() {
         println!("target: {target}");
     }
@@ -169,13 +183,12 @@ with `cargo semver-checks --baseline-root`. The shim itself cannot be diffed:
 cargo-semver-checks (rustdoc JSON) cannot see items through the shim's cross-crate
 re-exports, so the baseline package is renamed to `wry-bindgen` to line the paths up.
 
-If wasm-bindgen-ref is omitted, patches/wasm-bindgen/BASE is used when present,
-otherwise HEAD is used."
+If wasm-bindgen-ref is omitted, patches/wasm-bindgen/BASE is used when present.
+Otherwise the clean upstream tag matching wasm-bindgen/Cargo.toml is used."
     );
 }
 
-fn default_upstream_ref() -> Result<String> {
-    let repo_root = repo_root()?;
+fn default_upstream_ref(repo_root: &Path, wasm_bindgen_tree: &Path) -> Result<String> {
     let patch_base = repo_root.join("patches/wasm-bindgen/BASE");
     if patch_base.is_file() {
         let text = fs::read_to_string(patch_base)?;
@@ -188,7 +201,127 @@ fn default_upstream_ref() -> Result<String> {
             return Ok(line.to_string());
         }
     }
-    Ok("HEAD".to_string())
+    read_wasm_bindgen_version(&wasm_bindgen_tree.join("Cargo.toml"))
+}
+
+fn read_wasm_bindgen_version(manifest: &Path) -> Result<String> {
+    let text = fs::read_to_string(manifest)?;
+    let package = find_section(&text, "package").ok_or_else(|| {
+        Error::new(format!(
+            "{} is missing a [package] section",
+            manifest.display()
+        ))
+    })?;
+    let name = read_field(package, "name").ok_or_else(|| {
+        Error::new(format!(
+            "{} is missing package field `name`",
+            manifest.display()
+        ))
+    })?;
+    if name != "wasm-bindgen" && name != "not-wasm-bindgen" {
+        return Err(Error::new(format!(
+            "{} package name is `{name}`, expected `wasm-bindgen` or `not-wasm-bindgen`",
+            manifest.display()
+        )));
+    }
+
+    let version = read_field(package, "version").ok_or_else(|| {
+        Error::new(format!(
+            "{} is missing package field `version`",
+            manifest.display()
+        ))
+    })?;
+    if !is_stable_semver(version) {
+        return Err(Error::new(format!(
+            "{} package version `{version}` is not a stable semver release",
+            manifest.display()
+        )));
+    }
+    Ok(version.to_string())
+}
+
+fn find_section<'a>(text: &'a str, section: &str) -> Option<&'a str> {
+    let mut start = None;
+    for (index, line) in text.lines().enumerate() {
+        if let Some(name) = section_name(line) {
+            if let Some(start) = start {
+                return Some(slice_lines(text, start, index));
+            }
+            if name == section {
+                start = Some(index + 1);
+            }
+        }
+    }
+    start.map(|start| slice_lines(text, start, text.lines().count()))
+}
+
+fn section_name(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
+        return None;
+    }
+    let name = trimmed.trim_start_matches('[').trim_end_matches(']');
+    if name.starts_with('[') || name.ends_with(']') {
+        return None;
+    }
+    Some(name)
+}
+
+fn slice_lines(text: &str, start_line: usize, end_line: usize) -> &str {
+    let mut start_byte = text.len();
+    let mut end_byte = text.len();
+    let mut line = 0;
+
+    for (byte_index, _) in text.match_indices('\n') {
+        if line == start_line.saturating_sub(1) {
+            start_byte = byte_index + 1;
+        }
+        if line == end_line.saturating_sub(1) {
+            end_byte = byte_index;
+            break;
+        }
+        line += 1;
+    }
+
+    if start_line == 0 {
+        start_byte = 0;
+    }
+    if start_byte == text.len() && start_line == text.lines().count() {
+        start_byte = text.len();
+    }
+
+    &text[start_byte..end_byte]
+}
+
+fn read_field<'a>(section: &'a str, field: &str) -> Option<&'a str> {
+    for line in section.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix(field) else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('"') else {
+            continue;
+        };
+        let end = rest.find('"')?;
+        return Some(&rest[..end]);
+    }
+    None
+}
+
+fn is_stable_semver(version: &str) -> bool {
+    let mut parts = version.split('.');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(major), Some(minor), Some(patch), None)
+            if major.parse::<u64>().is_ok()
+                && minor.parse::<u64>().is_ok()
+                && patch.parse::<u64>().is_ok()
+    )
 }
 
 fn repo_root() -> Result<PathBuf> {
@@ -231,7 +364,58 @@ fn repo_root_from_source_env() -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-fn verify_git_ref(repo: &Path, git_ref: &str) -> Result<()> {
+fn has_nested_git_repo(repo: &Path) -> bool {
+    repo.join(".git").exists()
+}
+
+fn clone_upstream_repo(output_dir: &Path) -> Result<()> {
+    let status = Command::new("git")
+        .arg("clone")
+        .arg("--no-checkout")
+        .arg(UPSTREAM_REMOTE)
+        .arg(output_dir)
+        .status()
+        .map_err(|error| Error::new(format!("failed to run git clone: {error}")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Error::new(format!(
+            "failed to clone wasm-bindgen upstream repository from {UPSTREAM_REMOTE}"
+        )))
+    }
+}
+
+fn ensure_git_ref(repo: &Path, git_ref: &str) -> Result<()> {
+    if git_ref_exists(repo, git_ref)? {
+        return Ok(());
+    }
+
+    if is_stable_semver(git_ref) {
+        let tag_ref = format!("refs/tags/{git_ref}:refs/tags/{git_ref}");
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["fetch", "--tags", UPSTREAM_REMOTE])
+            .arg(&tag_ref)
+            .status()
+            .map_err(|error| Error::new(format!("failed to run git fetch: {error}")))?;
+        if !status.success() {
+            return Err(Error::new(format!(
+                "failed to fetch wasm-bindgen upstream tag `{git_ref}`"
+            )));
+        }
+    }
+
+    if git_ref_exists(repo, git_ref)? {
+        Ok(())
+    } else {
+        Err(Error::new(format!(
+            "could not resolve wasm-bindgen ref `{git_ref}`"
+        )))
+    }
+}
+
+fn git_ref_exists(repo: &Path, git_ref: &str) -> Result<bool> {
     let tree_ref = format!("{git_ref}^{{tree}}");
     let status = Command::new("git")
         .arg("-C")
@@ -242,13 +426,7 @@ fn verify_git_ref(repo: &Path, git_ref: &str) -> Result<()> {
         .stderr(Stdio::null())
         .status()
         .map_err(|error| Error::new(format!("failed to run git rev-parse: {error}")))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(Error::new(format!(
-            "could not resolve wasm-bindgen ref `{git_ref}`"
-        )))
-    }
+    Ok(status.success())
 }
 
 fn extract_git_archive(repo: &Path, git_ref: &str, output_dir: &Path) -> Result<()> {
@@ -394,7 +572,9 @@ fn run_semver_checks(repo_root: &Path, baseline_root: &Path, target: Option<&str
     // Echo progress (stderr) but drop the pre-filter verdict lines, which would be
     // misleading once the ignored ABI-trait derives are removed below.
     for line in stderr.lines() {
-        if line.contains("Summary semver requires") || (line.contains("checks:") && line.contains("fail")) {
+        if line.contains("Summary semver requires")
+            || (line.contains("checks:") && line.contains("fail"))
+        {
             continue;
         }
         eprintln!("{line}");
@@ -416,10 +596,14 @@ fn run_semver_checks(repo_root: &Path, baseline_root: &Path, target: Option<&str
         return Ok(());
     }
     if remaining_categories == 0 {
-        println!("public API diff: only known intentional differences remained; treating as compatible.");
+        println!(
+            "public API diff: only known intentional differences remained; treating as compatible."
+        );
         Ok(())
     } else {
-        Err(Error::new("public API differences found (see report above)"))
+        Err(Error::new(
+            "public API differences found (see report above)",
+        ))
     }
 }
 
@@ -450,7 +634,10 @@ fn filter_ignored_failures(stdout: &str) -> (String, usize, usize) {
     let mut remaining_categories = 0;
 
     for (position, &start) in block_starts.iter().enumerate() {
-        let end = block_starts.get(position + 1).copied().unwrap_or(lines.len());
+        let end = block_starts
+            .get(position + 1)
+            .copied()
+            .unwrap_or(lines.len());
         let block = &lines[start..end];
 
         let Some(is_ignored) = ignored_finding_predicate(lint_name(block[0])) else {
@@ -667,7 +854,8 @@ Failed in:
     #[test]
     fn renames_package_name() {
         let input = "[package]\nname = \"wasm-bindgen\"\nversion = \"0.2.122\"\n";
-        let output = rename_package_text(input, "wry-bindgen").expect("package name should be found");
+        let output =
+            rename_package_text(input, "wry-bindgen").expect("package name should be found");
         assert_eq!(
             output,
             "[package]\nname = \"wry-bindgen\"\nversion = \"0.2.122\"\n"
@@ -677,8 +865,10 @@ Failed in:
     #[test]
     fn rename_package_only_touches_first_match() {
         // Dependency entries must not be rewritten, only the `[package]` name.
-        let input = "[package]\nname = \"wasm-bindgen\"\n\n[dependencies]\nwasm-bindgen-macro = \"0.2\"\n";
-        let output = rename_package_text(input, "wry-bindgen").expect("package name should be found");
+        let input =
+            "[package]\nname = \"wasm-bindgen\"\n\n[dependencies]\nwasm-bindgen-macro = \"0.2\"\n";
+        let output =
+            rename_package_text(input, "wry-bindgen").expect("package name should be found");
         assert_eq!(
             output,
             "[package]\nname = \"wry-bindgen\"\n\n[dependencies]\nwasm-bindgen-macro = \"0.2\"\n"
