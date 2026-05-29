@@ -33,6 +33,7 @@ const LOCAL_CRATES: &[&str] = &[
     "wry-bindgen-macro",
     "wry-bindgen-macro-support",
 ];
+const UPSTREAM_PACKAGE_NAMES: &[&str] = &["wasm-bindgen", "not-wasm-bindgen"];
 
 #[derive(Debug)]
 struct Error(String);
@@ -82,7 +83,7 @@ fn run() -> Result<()> {
         )));
     }
 
-    let base_version = read_package_version(&upstream_manifest, Some("wasm-bindgen"))?;
+    let base_version = read_package_version(&upstream_manifest, Some(UPSTREAM_PACKAGE_NAMES))?;
     let version = target_version(&base_version, args.suffix.as_deref())?;
     let mut changes = Vec::new();
 
@@ -288,7 +289,7 @@ fn is_valid_suffix(suffix: &str) -> bool {
         })
 }
 
-fn read_package_version(path: &Path, expected_name: Option<&str>) -> Result<String> {
+fn read_package_version(path: &Path, expected_names: Option<&[&str]>) -> Result<String> {
     let text = fs::read_to_string(path)?;
     let package = find_section(&text, "package")
         .ok_or_else(|| Error::new(format!("{} is missing a [package] section", path.display())))?;
@@ -298,12 +299,19 @@ fn read_package_version(path: &Path, expected_name: Option<&str>) -> Result<Stri
             path.display()
         ))
     })?;
-    if let Some(expected_name) = expected_name {
-        if name != expected_name {
+    if let Some(expected_names) = expected_names {
+        if !expected_names.contains(&name) {
             return Err(Error::new(format!(
-                "{} package name is `{name}`, expected `{expected_name}`",
-                path.display()
+                "{} package name is `{name}`, expected one of: {}",
+                path.display(),
+                expected_names.join(", ")
             )));
+        }
+        if name != "wasm-bindgen" {
+            eprintln!(
+                "note: deriving wasm-bindgen version from patched upstream package `{name}` in {}",
+                path.display()
+            );
         }
     }
 
@@ -777,5 +785,11 @@ version = "0.2.106-alpha.1"
         assert!(
             output.contains("source = \"registry+https://github.com/rust-lang/crates.io-index\"")
         );
+    }
+
+    #[test]
+    fn upstream_package_names_include_patched_name() {
+        assert!(UPSTREAM_PACKAGE_NAMES.contains(&"wasm-bindgen"));
+        assert!(UPSTREAM_PACKAGE_NAMES.contains(&"not-wasm-bindgen"));
     }
 }

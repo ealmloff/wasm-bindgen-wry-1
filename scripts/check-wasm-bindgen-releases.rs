@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
 const DEFAULT_REMOTE: &str = "https://github.com/wasm-bindgen/wasm-bindgen.git";
+const UPSTREAM_PACKAGE_NAMES: &[&str] = &["wasm-bindgen", "not-wasm-bindgen"];
 
 #[derive(Debug)]
 struct Error(String);
@@ -194,11 +195,18 @@ fn read_current_version() -> Result<Version> {
             manifest.display()
         ))
     })?;
-    if name != "wasm-bindgen" {
+    if !UPSTREAM_PACKAGE_NAMES.contains(&name) {
         return Err(Error::new(format!(
-            "{} package name is `{name}`, expected `wasm-bindgen`",
-            manifest.display()
+            "{} package name is `{name}`, expected one of: {}",
+            manifest.display(),
+            UPSTREAM_PACKAGE_NAMES.join(", ")
         )));
+    }
+    if name != "wasm-bindgen" {
+        eprintln!(
+            "note: reading wasm-bindgen version from patched upstream package `{name}` in {}",
+            manifest.display()
+        );
     }
 
     let version = read_field(package, "version").ok_or_else(|| {
@@ -434,5 +442,11 @@ eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\trefs/tags/v0.2.123
     fn version_order_is_numeric() {
         assert!(parse_version("0.2.100").unwrap() > parse_version("0.2.99").unwrap());
         assert!(parse_version("0.3.0").unwrap() > parse_version("0.2.999").unwrap());
+    }
+
+    #[test]
+    fn accepts_patched_upstream_package_name() {
+        assert!(UPSTREAM_PACKAGE_NAMES.contains(&"wasm-bindgen"));
+        assert!(UPSTREAM_PACKAGE_NAMES.contains(&"not-wasm-bindgen"));
     }
 }
