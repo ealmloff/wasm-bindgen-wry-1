@@ -82,7 +82,7 @@ fn run() -> Result<()> {
     println!("baseline upstream ref: {upstream_ref}");
     println!("baseline root: {}", baseline_root.display());
     println!("current manifest: {CURRENT_MANIFEST}");
-    println!("baseline adjustment: #[doc(hidden)] on upstream wasm_bindgen::convert");
+    println!("baseline adjustment: #[doc(hidden)] on upstream wasm_bindgen::convert APIs");
     if let Some(target) = args.target.as_deref() {
         println!("target: {target}");
     }
@@ -265,18 +265,32 @@ fn hide_upstream_convert_module(baseline_root: &Path) -> Result<()> {
 }
 
 fn hide_convert_module_text(text: &str) -> Option<String> {
-    const DECLARATION: &str = "pub mod convert;";
-    const HIDDEN_DECLARATION: &str = "#[doc(hidden)]\npub mod convert;";
+    let replacements = [
+        ("pub mod convert;", "#[doc(hidden)]\npub mod convert;"),
+        (
+            "    pub use crate::convert::Upcast; // provides upcast() and upcast_ref()",
+            "    #[doc(hidden)]\n    pub use crate::convert::Upcast; // provides upcast() and upcast_ref()",
+        ),
+        (
+            "pub use crate::convert::{IntoJsGeneric, JsGeneric};",
+            "#[doc(hidden)]\npub use crate::convert::{IntoJsGeneric, JsGeneric};",
+        ),
+    ];
 
-    if text.contains(HIDDEN_DECLARATION) {
-        return Some(text.to_string());
+    let mut updated = text.to_string();
+    for (plain, hidden) in replacements {
+        if updated.contains(hidden) {
+            continue;
+        }
+
+        if !updated.contains(plain) {
+            return None;
+        }
+
+        updated = updated.replacen(plain, hidden, 1);
     }
 
-    if text.contains(DECLARATION) {
-        Some(text.replacen(DECLARATION, HIDDEN_DECLARATION, 1))
-    } else {
-        None
-    }
+    Some(updated)
 }
 
 fn run_semver_checks(repo_root: &Path, baseline_root: &Path, target: Option<&str>) -> Result<()> {
@@ -346,17 +360,45 @@ mod tests {
 
     #[test]
     fn hides_convert_module_declaration() {
-        let input = "pub mod closure;\npub mod convert;\npub mod describe;\n";
+        let input = "\
+pub mod prelude {
+    pub use crate::convert::Upcast; // provides upcast() and upcast_ref()
+}
+pub mod closure;
+pub mod convert;
+pub mod describe;
+pub use crate::convert::{IntoJsGeneric, JsGeneric};
+";
         let output = hide_convert_module_text(input).expect("convert module should be found");
         assert_eq!(
             output,
-            "pub mod closure;\n#[doc(hidden)]\npub mod convert;\npub mod describe;\n"
+            "\
+pub mod prelude {
+    #[doc(hidden)]
+    pub use crate::convert::Upcast; // provides upcast() and upcast_ref()
+}
+pub mod closure;
+#[doc(hidden)]
+pub mod convert;
+pub mod describe;
+#[doc(hidden)]
+pub use crate::convert::{IntoJsGeneric, JsGeneric};
+"
         );
     }
 
     #[test]
     fn hide_convert_module_is_idempotent() {
-        let input = "pub mod closure;\n#[doc(hidden)]\npub mod convert;\n";
+        let input = "\
+pub mod prelude {
+    #[doc(hidden)]
+    pub use crate::convert::Upcast; // provides upcast() and upcast_ref()
+}
+#[doc(hidden)]
+pub mod convert;
+#[doc(hidden)]
+pub use crate::convert::{IntoJsGeneric, JsGeneric};
+";
         let output = hide_convert_module_text(input).expect("convert module should be found");
         assert_eq!(output, input);
     }
