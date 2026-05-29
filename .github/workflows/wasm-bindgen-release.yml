@@ -1,0 +1,412 @@
+name: wasm-bindgen release update
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 9 * * 1"
+
+permissions:
+  # GitHub token permissions are repository-scoped. This workflow needs
+  # contents:write only to push the automation branch used for the PR; protect
+  # main with branch protection/rulesets so the token cannot update it directly.
+  contents: write
+  pull-requests: write
+  # Used only for the API compatibility comments on the automation PR.
+  issues: write
+
+concurrency:
+  group: wasm-bindgen-release-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Check and update wasm-bindgen
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Check upstream releases
+        id: release
+        shell: bash
+        run: |
+          set +e
+          release_output="$(./scripts/check-wasm-bindgen-releases.rs --check --list 2>&1)"
+          release_status=$?
+          set -e
+
+          printf '%s\n' "$release_output"
+          {
+            echo '## wasm-bindgen release check'
+            echo
+            echo '```text'
+            printf '%s\n' "$release_output"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          current="$(printf '%s\n' "$release_output" | sed -n 's/^current wasm-bindgen version:[[:space:]]*//p')"
+          latest="$(printf '%s\n' "$release_output" | sed -n 's/^latest upstream release:[[:space:]]*//p')"
+
+          if [[ "$release_status" -eq 0 ]]; then
+            echo "update_available=false" >>"$GITHUB_OUTPUT"
+            echo "current=$current" >>"$GITHUB_OUTPUT"
+            echo "latest=$latest" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$release_status" -eq 1 ]]; then
+            if [[ -z "$current" || -z "$latest" ]]; then
+              echo "failed to parse current/latest versions from release output" >&2
+              exit 2
+            fi
+            echo "update_available=true" >>"$GITHUB_OUTPUT"
+            echo "current=$current" >>"$GITHUB_OUTPUT"
+            echo "latest=$latest" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          exit "$release_status"
+
+      - name: Attempt wasm-bindgen update
+        id: upgrade
+        if: steps.release.outputs.update_available == 'true'
+        shell: bash
+        run: |
+          set -u
+
+          current="${{ steps.release.outputs.current }}"
+          latest="${{ steps.release.outputs.latest }}"
+          report="$RUNNER_TEMP/wasm-bindgen-upgrade-report.md"
+          log_dir="$RUNNER_TEMP/wasm-bindgen-upgrade-logs"
+          api_check_comment_dir="$RUNNER_TEMP/wasm-bindgen-api-check-comments"
+          failure_file="patches/wasm-bindgen/UPGRADE_FAILURE.md"
+          original_submodule="$(git -C wasm-bindgen rev-parse HEAD)"
+          failed=false
+          api_check_failed=false
+          failure_step=""
+          current_base="$current"
+          patch_count=0
+
+          mkdir -p "$log_dir"
+          rm -rf "$api_check_comment_dir"
+          mkdir -p "$api_check_comment_dir"
+          rm -f "$failure_file"
+
+          append_log() {
+            local title="$1"
+            local file="$2"
+            {
+              echo
+              echo "### $title"
+              echo
+              echo '```text'
+              cat "$file"
+              echo '```'
+            } >>"$report"
+          }
+
+          fail_step() {
+            local title="$1"
+            local file="$2"
+            failed=true
+            failure_step="$title"
+            append_log "$title" "$file"
+          }
+
+          write_api_check_comments() {
+            local title="$1"
+            local status="$2"
+            local file="${3:-}"
+            local summary_file="$api_check_comment_dir/00-summary.md"
+            local chunk_prefix="$api_check_comment_dir/api-check-chunk-"
+            local chunk_limit=45000
+            local byte_count=0
+            local chunk_count=0
+
+            rm -f "$api_check_comment_dir"/*.md "$chunk_prefix"*
+
+            if [[ -n "$file" && -f "$file" ]]; then
+              byte_count="$(wc -c <"$file" | tr -d ' ')"
+            fi
+
+            {
+              echo "## wasm-bindgen API compatibility"
+              echo
+              echo "$title"
+              echo
+              echo "- Compared upstream wasm-bindgen: $latest"
+              echo "- Compared local crate: shims/wasm-bindgen after this workflow attempt"
+              echo "- Tool: cargo-semver-checks 0.44.0 with --baseline-root"
+              echo "- Status: $status"
+              if [[ -n "$file" && -f "$file" ]]; then
+                echo "- Output bytes: $byte_count"
+              fi
+            } >"$summary_file"
+
+            if [[ -n "$file" && -f "$file" && "$byte_count" -le "$chunk_limit" ]]; then
+              {
+                echo
+                echo "```text"
+                cat "$file"
+                echo "```"
+              } >>"$summary_file"
+              return
+            fi
+
+            if [[ -n "$file" && -f "$file" ]]; then
+              split -b "$chunk_limit" -d -a 3 "$file" "$chunk_prefix"
+              chunk_count="$(find "$api_check_comment_dir" -name 'api-check-chunk-*' -type f | wc -l | tr -d ' ')"
+              {
+                echo
+                echo "The output is split across $chunk_count follow-up comment(s) because GitHub comments are size-limited."
+              } >>"$summary_file"
+
+              local index=1
+              local chunk
+              for chunk in "$chunk_prefix"*; do
+                local comment_file
+                comment_file="$api_check_comment_dir/$(printf '%02d' "$index")-output.md"
+                {
+                  echo "## wasm-bindgen API compatibility output ($index/$chunk_count)"
+                  echo
+                  echo "```text"
+                  cat "$chunk"
+                  echo
+                  echo "```"
+                } >"$comment_file"
+                rm -f "$chunk"
+                index=$((index + 1))
+              done
+              return
+            fi
+
+            {
+              echo
+              echo "No API compatibility output was captured."
+            } >>"$summary_file"
+          }
+
+          {
+            echo "# wasm-bindgen upgrade to $latest"
+            echo
+            echo "- Current submodule version: $current"
+            echo "- Latest upstream release: $latest"
+            echo "- Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo "## Result"
+            echo
+            echo "The workflow derives the patch stack from the current wasm-bindgen release tag ($current_base) and the commits currently applied on top of it, moves the submodule to the new upstream release, reapplies those derived patches, regenerates the patch files against the new base, and bumps local crate versions."
+          } >"$report"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          fetch_log="$log_dir/fetch-tags.log"
+          if git -C wasm-bindgen fetch --tags https://github.com/wasm-bindgen/wasm-bindgen.git \
+            "refs/tags/$current_base:refs/tags/$current_base" \
+            "refs/tags/$latest:refs/tags/$latest" >"$fetch_log" 2>&1; then
+            append_log "Fetched upstream release tags" "$fetch_log"
+          else
+            fail_step "Failed to fetch upstream release tags" "$fetch_log"
+          fi
+
+          if [[ "$failed" == "false" ]]; then
+            extract_log="$log_dir/extract-current-patches.log"
+            if scripts/wasm-bindgen-patches.sh regen "$current_base" >"$extract_log" 2>&1; then
+              patch_count="$(find patches/wasm-bindgen -name '*.patch' -type f 2>/dev/null | wc -l | tr -d ' ')"
+              append_log "Extracted current patch stack" "$extract_log"
+            elif grep -q "base-ref resolves to HEAD; no patches to generate" "$extract_log"; then
+              patch_count=0
+              append_log "No current patch stack to extract" "$extract_log"
+            else
+              fail_step "Failed to extract current patch stack" "$extract_log"
+            fi
+          fi
+
+          if [[ "$failed" == "false" ]]; then
+            bump_log="$log_dir/bump-submodule.log"
+            if [[ "$patch_count" -gt 0 ]]; then
+              if scripts/wasm-bindgen-patches.sh apply "$latest" >"$bump_log" 2>&1; then
+                append_log "Reapplied patch stack on $latest" "$bump_log"
+              else
+                {
+                  cat "$bump_log"
+                  echo
+                  echo "Submodule status after failed patch application:"
+                  git -C wasm-bindgen status --short || true
+                } >"$log_dir/bump-submodule-with-status.log"
+                fail_step "Failed to reapply patch stack on $latest" "$log_dir/bump-submodule-with-status.log"
+              fi
+            else
+              if git -C wasm-bindgen reset --hard "$latest" >"$bump_log" 2>&1; then
+                append_log "Moved submodule to $latest with no local patches" "$bump_log"
+              else
+                fail_step "Failed to move submodule to $latest" "$bump_log"
+              fi
+            fi
+          fi
+
+          if [[ "$failed" == "false" && "$patch_count" -gt 0 ]]; then
+            refresh_log="$log_dir/refresh-patches.log"
+            if scripts/wasm-bindgen-patches.sh regen "$latest" >"$refresh_log" 2>&1; then
+              append_log "Regenerated patch stack against $latest" "$refresh_log"
+            elif grep -q "base-ref resolves to HEAD; no patches to generate" "$refresh_log"; then
+              append_log "Patch stack is empty after moving to $latest" "$refresh_log"
+            else
+              fail_step "Failed to regenerate patch stack against $latest" "$refresh_log"
+            fi
+          fi
+
+          if [[ "$failed" == "false" ]]; then
+            version_log="$log_dir/bump-local-versions.log"
+            if ./scripts/bump-wasm-bindgen-version.rs >"$version_log" 2>&1; then
+              append_log "Bumped local crate versions" "$version_log"
+            else
+              fail_step "Failed to bump local crate versions" "$version_log"
+            fi
+          fi
+
+          if [[ "$failed" == "false" ]]; then
+            metadata_log="$log_dir/cargo-metadata.log"
+            if cargo metadata --no-deps --format-version 1 >"$metadata_log" 2>&1; then
+              append_log "Verified cargo metadata" "$metadata_log"
+            else
+              fail_step "Cargo metadata failed after upgrade" "$metadata_log"
+            fi
+          fi
+
+          if [[ "$failed" == "false" ]]; then
+            install_api_tool_log="$log_dir/install-api-check-tool.log"
+            if cargo install cargo-semver-checks --version 0.44.0 --locked >"$install_api_tool_log" 2>&1; then
+              api_check_log="$log_dir/api-compatibility.log"
+              if ./scripts/check-wasm-bindgen-api.rs "$latest" >"$api_check_log" 2>&1; then
+                write_api_check_comments \
+                  "cargo-semver-checks completed; no semver-incompatible API differences were reported." \
+                  "passed" \
+                  "$api_check_log"
+              else
+                api_check_status=$?
+                api_check_failed=true
+                {
+                  echo "check-wasm-bindgen-api.rs failed with status $api_check_status"
+                  echo
+                  cat "$api_check_log"
+                } >"$log_dir/api-compatibility-with-status.log"
+                write_api_check_comments \
+                  "cargo-semver-checks reported semver-incompatible API differences; the upgrade PR still contains the attempted code changes." \
+                  "failed" \
+                  "$log_dir/api-compatibility-with-status.log"
+              fi
+            else
+              api_check_failed=true
+              write_api_check_comments \
+                "Failed to install cargo-semver-checks 0.44.0; the API compatibility check did not run." \
+                "failed" \
+                "$install_api_tool_log"
+            fi
+          fi
+
+          if [[ "$failed" == "true" ]]; then
+            git -C wasm-bindgen am --abort >/dev/null 2>&1 || true
+            git -C wasm-bindgen reset --hard "$original_submodule" >/dev/null 2>&1 || true
+            mkdir -p "$(dirname "$failure_file")"
+            {
+              echo
+              echo "## Manual work required"
+              echo
+              echo "Failed step: $failure_step"
+              echo
+              echo "The submodule was reset to its original commit after the failed attempt. See the committed failure report for logs."
+            } >>"$report"
+            echo "pr_title=Attempt wasm-bindgen update to $latest (manual fix needed)" >>"$GITHUB_OUTPUT"
+            echo "failed=true" >>"$GITHUB_OUTPUT"
+          else
+            {
+              echo
+              echo "## Upgrade completed"
+              echo
+              echo "The submodule, patch stack, and local bindgen crate versions were updated successfully."
+            } >>"$report"
+            echo "pr_title=Update wasm-bindgen to $latest" >>"$GITHUB_OUTPUT"
+            echo "failed=false" >>"$GITHUB_OUTPUT"
+          fi
+
+          if [[ ! -f "$api_check_comment_dir/00-summary.md" ]]; then
+            if [[ "$failed" == "true" ]]; then
+              write_api_check_comments \
+                "API compatibility check was not run because the upgrade failed before the check step: $failure_step." \
+                "skipped"
+            else
+              write_api_check_comments "API compatibility check was not run." "skipped"
+            fi
+          fi
+
+          {
+            echo
+            cat "$api_check_comment_dir/00-summary.md"
+          } >>"$report"
+
+          if [[ "$failed" == "true" ]]; then
+            cp "$report" "$failure_file"
+          fi
+
+          {
+            echo "pr_body<<PR_BODY_EOF"
+            cat "$report"
+            echo "PR_BODY_EOF"
+          } >>"$GITHUB_OUTPUT"
+
+          echo "api_check_comment_dir=$api_check_comment_dir" >>"$GITHUB_OUTPUT"
+          echo "api_check_failed=$api_check_failed" >>"$GITHUB_OUTPUT"
+
+          cat "$report" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Prepare optional pull request paths
+        if: steps.release.outputs.update_available == 'true'
+        run: mkdir -p patches/wasm-bindgen
+
+      - name: Open pull request
+        id: create_pr
+        if: steps.release.outputs.update_available == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: automation/wasm-bindgen-${{ steps.release.outputs.latest }}
+          base: main
+          delete-branch: true
+          title: ${{ steps.upgrade.outputs.pr_title }}
+          body: ${{ steps.upgrade.outputs.pr_body }}
+          commit-message: ${{ steps.upgrade.outputs.pr_title }}
+          labels: |
+            dependencies
+            automated
+          add-paths: |
+            Cargo.lock
+            wry-bindgen/Cargo.toml
+            wry-bindgen-macro/Cargo.toml
+            wry-bindgen-macro-support/Cargo.toml
+            shims/wasm-bindgen/Cargo.toml
+            shims/wasm-bindgen-macro/Cargo.toml
+            wasm-bindgen
+            patches/wasm-bindgen
+
+      - name: Comment with API compatibility check
+        if: steps.release.outputs.update_available == 'true' && steps.create_pr.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.create_pr.outputs.pull-request-number }}
+          API_CHECK_COMMENT_DIR: ${{ steps.upgrade.outputs.api_check_comment_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for comment_file in "$API_CHECK_COMMENT_DIR"/*.md; do
+            gh pr comment "$PR_NUMBER" --body-file "$comment_file"
+          done
+
+      - name: Mark manual repair as failed
+        if: steps.upgrade.outputs.failed == 'true' || steps.upgrade.outputs.api_check_failed == 'true'
+        run: exit 1
