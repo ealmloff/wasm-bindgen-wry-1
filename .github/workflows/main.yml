@@ -37,9 +37,9 @@ jobs:
           submodules: true
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@98e1b82157cd469e843cb7f524c1313b4ad9492c
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           cache-all-crates: "true"
 
@@ -50,106 +50,7 @@ jobs:
         run: cargo binstall cargo-semver-checks -y --force --version 0.44.0
 
       - name: Run public API diff
-        id: public_api
-        shell: bash
-        run: |
-          set +e
-          ./scripts/check-wasm-bindgen-api.rs >"$RUNNER_TEMP/public-api-diff.txt" 2>&1
-          status=$?
-          set -e
-
-          if [[ "$status" -eq 0 ]]; then
-            status_text="passed"
-          else
-            status_text="differences found"
-          fi
-
-          {
-            echo "status=$status"
-            echo "status_text=$status_text"
-            echo "output_file=$RUNNER_TEMP/public-api-diff.txt"
-            echo "comment_file=$RUNNER_TEMP/public-api-diff-comment.md"
-          } >>"$GITHUB_OUTPUT"
-
-          artifact_dir="$RUNNER_TEMP/public-api-diff-artifact"
-          mkdir -p "$artifact_dir"
-
-          max_output_bytes=55000
-          shown_output="$RUNNER_TEMP/public-api-diff-shown.txt"
-          output_bytes="$(wc -c <"$RUNNER_TEMP/public-api-diff.txt" | tr -d ' ')"
-          if [[ "$output_bytes" -gt "$max_output_bytes" ]]; then
-            head -c "$max_output_bytes" "$RUNNER_TEMP/public-api-diff.txt" >"$shown_output"
-            {
-              echo
-              echo
-              echo "... output truncated; see the workflow summary for the full report ..."
-            } >>"$shown_output"
-          else
-            cp "$RUNNER_TEMP/public-api-diff.txt" "$shown_output"
-          fi
-
-          {
-            echo "## Public API diff"
-            echo
-            echo "- Status: $status_text"
-            echo "- Tool: cargo-semver-checks 0.44.0"
-            echo "- Baseline: wasm-bindgen submodule, with upstream convert APIs hidden"
-            echo
-            echo "<details open>"
-            echo "<summary>Output</summary>"
-            echo
-            echo '```text'
-            cat "$shown_output"
-            echo '```'
-            echo "</details>"
-          } >"$RUNNER_TEMP/public-api-diff-comment.md"
-          cp "$RUNNER_TEMP/public-api-diff-comment.md" "$artifact_dir/comment.md"
-
-          ARTIFACT_DIR="$artifact_dir" python3 - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
-              event = json.load(event_file)
-
-          pull_request = event["pull_request"]
-          metadata = {
-              "schema_version": 1,
-              "kind": "wasm-bindgen-public-api-diff",
-              "repository": os.environ["GITHUB_REPOSITORY"],
-              "event_name": os.environ["GITHUB_EVENT_NAME"],
-              "pr_number": pull_request["number"],
-              "head_sha": pull_request["head"]["sha"],
-              "merge_sha": os.environ["GITHUB_SHA"],
-              "head_ref": pull_request["head"]["ref"],
-              "head_repo_id": pull_request["head"]["repo"]["id"],
-          }
-
-          Path(os.environ["ARTIFACT_DIR"], "metadata.json").write_text(
-              json.dumps(metadata, indent=2),
-              encoding="utf-8",
-          )
-          PY
-
-          {
-            echo "## Public API diff"
-            echo
-            echo "- Status: $status_text"
-            echo "- Tool: cargo-semver-checks 0.44.0"
-            echo "- Baseline: wasm-bindgen submodule, with upstream convert APIs hidden"
-            echo
-            echo '```text'
-            cat "$RUNNER_TEMP/public-api-diff.txt"
-            echo '```'
-          } >>"$GITHUB_STEP_SUMMARY"
-
-      - name: Upload public API diff report
-        uses: actions/upload-artifact@v4
-        with:
-          name: public-api-diff-${{ github.event.pull_request.number }}
-          path: ${{ runner.temp }}/public-api-diff-artifact
-          retention-days: 7
+        run: ./scripts/check-wasm-bindgen-api.rs
 
   fmt:
     if: github.event.pull_request.draft == false
@@ -159,7 +60,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
-      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: dtolnay/rust-toolchain@b5826f8eb73f40ac7c19ef631dce17a9680f8129
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
@@ -172,12 +73,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
-      - uses: awalsh128/cache-apt-pkgs-action@latest
+      - uses: awalsh128/cache-apt-pkgs-action@2c09a5e66da6c8016428a2172bd76e5e4f14bb17
         with:
           packages: libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
           version: 1.0
-      - uses: dtolnay/rust-toolchain@1.92.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b5826f8eb73f40ac7c19ef631dce17a9680f8129
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           cache-all-crates: "true"
       - run: cargo check --workspace --all-features
@@ -190,14 +91,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
-      - uses: awalsh128/cache-apt-pkgs-action@latest
+      - uses: awalsh128/cache-apt-pkgs-action@2c09a5e66da6c8016428a2172bd76e5e4f14bb17
         with:
           packages: libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
           version: 1.0
-      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: dtolnay/rust-toolchain@b5826f8eb73f40ac7c19ef631dce17a9680f8129
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           cache-all-crates: "true"
       # Workspace lints in Cargo.toml handle denying warnings for our code
@@ -211,12 +112,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
-      - uses: awalsh128/cache-apt-pkgs-action@latest
+      - uses: awalsh128/cache-apt-pkgs-action@2c09a5e66da6c8016428a2172bd76e5e4f14bb17
         with:
           packages: libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
           version: 1.0
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           cache-all-crates: "true"
       # Only document workspace members, not submodule packages
@@ -240,13 +141,13 @@ jobs:
       # Linux dependencies
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
-        uses: awalsh128/cache-apt-pkgs-action@latest
+        uses: awalsh128/cache-apt-pkgs-action@2c09a5e66da6c8016428a2172bd76e5e4f14bb17
         with:
           packages: libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxkbcommon-x11-dev xvfb
           version: 1.0
 
-      - uses: dtolnay/rust-toolchain@1.92.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b5826f8eb73f40ac7c19ef631dce17a9680f8129
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           cache-all-crates: "true"
 

@@ -11,8 +11,6 @@ permissions:
   # main with branch protection/rulesets so the token cannot update it directly.
   contents: write
   pull-requests: write
-  # Used only for the API compatibility comments on the automation PR.
-  issues: write
 
 concurrency:
   group: wasm-bindgen-release-update
@@ -27,8 +25,9 @@ jobs:
         with:
           fetch-depth: 0
           submodules: true
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@98e1b82157cd469e843cb7f524c1313b4ad9492c
 
       - name: Install cargo-binstall
         uses: cargo-bins/cargo-binstall@9d36bebae244fb1a7fd7831d3c5a4bc8f1cab230 # main
@@ -123,7 +122,6 @@ jobs:
           latest="${{ steps.release.outputs.latest }}"
           report="$RUNNER_TEMP/wasm-bindgen-upgrade-report.md"
           log_dir="$RUNNER_TEMP/wasm-bindgen-upgrade-logs"
-          api_check_comment_dir="$RUNNER_TEMP/wasm-bindgen-api-check-comments"
           failure_file="patches/wasm-bindgen/UPGRADE_FAILURE.md"
           original_submodule="$(git -C wasm-bindgen rev-parse HEAD)"
           failed=false
@@ -133,8 +131,6 @@ jobs:
           patch_count=0
 
           mkdir -p "$log_dir"
-          rm -rf "$api_check_comment_dir"
-          mkdir -p "$api_check_comment_dir"
           rm -f "$failure_file"
 
           append_log() {
@@ -156,81 +152,6 @@ jobs:
             failed=true
             failure_step="$title"
             append_log "$title" "$file"
-          }
-
-          write_api_check_comments() {
-            local title="$1"
-            local status="$2"
-            local file="${3:-}"
-            local summary_file="$api_check_comment_dir/00-summary.md"
-            local chunk_prefix="$api_check_comment_dir/api-check-chunk-"
-            local chunk_limit=45000
-            local byte_count=0
-            local chunk_count=0
-
-            rm -f "$api_check_comment_dir"/*.md "$chunk_prefix"*
-
-            if [[ -n "$file" && -f "$file" ]]; then
-              byte_count="$(wc -c <"$file" | tr -d ' ')"
-            fi
-
-            {
-              echo "## wasm-bindgen API compatibility"
-              echo
-              echo "$title"
-              echo
-              echo "- Compared upstream wasm-bindgen: $latest"
-              echo "- Compared local crate: shims/wasm-bindgen after this workflow attempt"
-              echo "- Tool: cargo-semver-checks 0.44.0 with --baseline-root"
-              echo "- Status: $status"
-              if [[ -n "$file" && -f "$file" ]]; then
-                echo "- Output bytes: $byte_count"
-              fi
-            } >"$summary_file"
-
-            if [[ -n "$file" && -f "$file" && "$byte_count" -le "$chunk_limit" ]]; then
-              local comment_file="$api_check_comment_dir/01-output.md"
-              {
-                echo "## wasm-bindgen API compatibility output"
-                echo
-                echo '```text'
-                cat "$file"
-                echo '```'
-              } >"$comment_file"
-              return
-            fi
-
-            if [[ -n "$file" && -f "$file" ]]; then
-              split -b "$chunk_limit" -d -a 3 "$file" "$chunk_prefix"
-              chunk_count="$(find "$api_check_comment_dir" -name 'api-check-chunk-*' -type f | wc -l | tr -d ' ')"
-              {
-                echo
-                echo "The output is split across $chunk_count follow-up comment(s) because GitHub comments are size-limited."
-              } >>"$summary_file"
-
-              local index=1
-              local chunk
-              for chunk in "$chunk_prefix"*; do
-                local comment_file
-                comment_file="$api_check_comment_dir/$(printf '%02d' "$index")-output.md"
-                {
-                  echo "## wasm-bindgen API compatibility output ($index/$chunk_count)"
-                  echo
-                  echo '```text'
-                  cat "$chunk"
-                  echo
-                  echo '```'
-                } >"$comment_file"
-                rm -f "$chunk"
-                index=$((index + 1))
-              done
-              return
-            fi
-
-            {
-              echo
-              echo "No API compatibility output was captured."
-            } >>"$summary_file"
           }
 
           {
@@ -330,12 +251,10 @@ jobs:
           if [[ "$failed" == "false" ]]; then
             install_api_tool_log="$log_dir/install-api-check-tool.log"
             if cargo binstall cargo-semver-checks -y --force --version 0.44.0 >"$install_api_tool_log" 2>&1; then
+              append_log "Installed cargo-semver-checks" "$install_api_tool_log"
               api_check_log="$log_dir/api-compatibility.log"
               if ./scripts/check-wasm-bindgen-api.rs "$latest" >"$api_check_log" 2>&1; then
-                write_api_check_comments \
-                  "cargo-semver-checks completed; no semver-incompatible API differences were reported." \
-                  "passed" \
-                  "$api_check_log"
+                append_log "API compatibility check passed" "$api_check_log"
               else
                 api_check_status=$?
                 api_check_failed=true
@@ -344,17 +263,11 @@ jobs:
                   echo
                   cat "$api_check_log"
                 } >"$log_dir/api-compatibility-with-status.log"
-                write_api_check_comments \
-                  "cargo-semver-checks reported semver-incompatible API differences; the upgrade PR still contains the attempted code changes." \
-                  "failed" \
-                  "$log_dir/api-compatibility-with-status.log"
+                append_log "API compatibility check failed" "$log_dir/api-compatibility-with-status.log"
               fi
             else
               api_check_failed=true
-              write_api_check_comments \
-                "Failed to install cargo-semver-checks 0.44.0 with cargo-binstall; the API compatibility check did not run." \
-                "failed" \
-                "$install_api_tool_log"
+              append_log "Failed to install cargo-semver-checks" "$install_api_tool_log"
             fi
           fi
 
@@ -383,21 +296,6 @@ jobs:
             echo "failed=false" >>"$GITHUB_OUTPUT"
           fi
 
-          if [[ ! -f "$api_check_comment_dir/00-summary.md" ]]; then
-            if [[ "$failed" == "true" ]]; then
-              write_api_check_comments \
-                "API compatibility check was not run because the upgrade failed before the check step: $failure_step." \
-                "skipped"
-            else
-              write_api_check_comments "API compatibility check was not run." "skipped"
-            fi
-          fi
-
-          {
-            echo
-            cat "$api_check_comment_dir/00-summary.md"
-          } >>"$report"
-
           if [[ "$failed" == "true" ]]; then
             cp "$report" "$failure_file"
           else
@@ -410,7 +308,6 @@ jobs:
             echo "PR_BODY_EOF"
           } >>"$GITHUB_OUTPUT"
 
-          echo "api_check_comment_dir=$api_check_comment_dir" >>"$GITHUB_OUTPUT"
           echo "api_check_failed=$api_check_failed" >>"$GITHUB_OUTPUT"
 
           cat "$report" >>"$GITHUB_STEP_SUMMARY"
@@ -422,7 +319,7 @@ jobs:
       - name: Open pull request
         id: create_pr
         if: steps.release.outputs.update_available == 'true' && steps.existing_pr.outputs.should_run == 'true'
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           branch: automation/wasm-bindgen-${{ steps.release.outputs.latest }}
@@ -443,19 +340,6 @@ jobs:
             shims/wasm-bindgen-macro/Cargo.toml
             wasm-bindgen
             patches/wasm-bindgen
-
-      - name: Comment with API compatibility check
-        if: steps.release.outputs.update_available == 'true' && steps.existing_pr.outputs.should_run == 'true' && steps.create_pr.outputs.pull-request-operation == 'created'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ steps.create_pr.outputs.pull-request-number }}
-          API_CHECK_COMMENT_DIR: ${{ steps.upgrade.outputs.api_check_comment_dir }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          for comment_file in "$API_CHECK_COMMENT_DIR"/*.md; do
-            gh pr comment "$PR_NUMBER" --body-file "$comment_file"
-          done
 
       - name: Mark manual repair as failed
         if: steps.release.outputs.update_available == 'true' && steps.existing_pr.outputs.should_run == 'true' && (steps.upgrade.outputs.failed == 'true' || steps.upgrade.outputs.api_check_failed == 'true')
