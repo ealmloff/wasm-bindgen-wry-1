@@ -74,9 +74,47 @@ jobs:
 
           exit "$release_status"
 
+      - name: Check for existing update PR
+        id: existing_pr
+        if: steps.release.outputs.update_available == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPDATE_BRANCH: automation/wasm-bindgen-${{ steps.release.outputs.latest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          pr_number="$(gh api \
+            "/repos/$GITHUB_REPOSITORY/pulls" \
+            -f state=open \
+            -f head="$GITHUB_REPOSITORY_OWNER:$UPDATE_BRANCH" \
+            -f base=main \
+            --jq '.[0].number // ""')"
+
+          if [[ -n "$pr_number" ]]; then
+            {
+              echo "exists=true"
+              echo "should_run=false"
+              echo "number=$pr_number"
+            } >>"$GITHUB_OUTPUT"
+            {
+              echo "## wasm-bindgen update skipped"
+              echo
+              echo "An open update PR already exists for $UPDATE_BRANCH: #$pr_number."
+              echo
+              echo "This workflow only opens one PR per new wasm-bindgen release, so this run left the existing PR unchanged."
+            } >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo "exists=false"
+            echo "should_run=true"
+          } >>"$GITHUB_OUTPUT"
+
       - name: Attempt wasm-bindgen update
         id: upgrade
-        if: steps.release.outputs.update_available == 'true'
+        if: steps.release.outputs.update_available == 'true' && steps.existing_pr.outputs.should_run == 'true'
         shell: bash
         run: |
           set -u
@@ -376,12 +414,12 @@ jobs:
           cat "$report" >>"$GITHUB_STEP_SUMMARY"
 
       - name: Prepare optional pull request paths
-        if: steps.release.outputs.update_available == 'true'
+        if: steps.release.outputs.update_available == 'true' && steps.existing_pr.outputs.should_run == 'true'
         run: mkdir -p patches/wasm-bindgen
 
       - name: Open pull request
         id: create_pr
-        if: steps.release.outputs.update_available == 'true'
+        if: steps.release.outputs.update_available == 'true' && steps.existing_pr.outputs.should_run == 'true'
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -405,7 +443,7 @@ jobs:
             patches/wasm-bindgen
 
       - name: Comment with API compatibility check
-        if: steps.release.outputs.update_available == 'true' && steps.create_pr.outputs.pull-request-number != ''
+        if: steps.release.outputs.update_available == 'true' && steps.existing_pr.outputs.should_run == 'true' && steps.create_pr.outputs.pull-request-operation == 'created'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.create_pr.outputs.pull-request-number }}
@@ -418,5 +456,5 @@ jobs:
           done
 
       - name: Mark manual repair as failed
-        if: steps.upgrade.outputs.failed == 'true' || steps.upgrade.outputs.api_check_failed == 'true'
+        if: steps.release.outputs.update_available == 'true' && steps.existing_pr.outputs.should_run == 'true' && (steps.upgrade.outputs.failed == 'true' || steps.upgrade.outputs.api_check_failed == 'true')
         run: exit 1
