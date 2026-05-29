@@ -3,7 +3,8 @@
 use core::{fmt, marker::PhantomData, ops::Deref};
 
 use crate::{
-    ErasableGeneric, IntoJsGeneric, JsCast, JsError, JsGeneric, JsValue, convert::UpcastFrom,
+    __rt::marker::ErasableGeneric, IntoJsGeneric, JsCast, JsError, JsGeneric, JsValue,
+    convert::UpcastFrom,
 };
 
 /// Marker trait for values that are either a resolution value or a promise-like value.

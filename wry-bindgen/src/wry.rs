@@ -21,7 +21,9 @@ use http::Response;
 use crate::batch::{Runtime, in_runtime};
 use crate::function_registry::FUNCTION_REGISTRY;
 use crate::ipc::{DecodedVariant, IPCMessage, MessageType, OutboundIPCMessage, decode_data};
-use crate::runtime::{AppEventVariant, IPCSenders, WryBindgenEvent, WryIPC, handle_callbacks};
+use crate::runtime::{AppEventVariant, IPCSenders, WryIPC, handle_callbacks};
+
+pub use crate::runtime::WryBindgenEvent;
 
 pub trait ImplWryBindgenResponder {
     fn respond(self: Box<Self>, response: Response<Vec<u8>>);

@@ -82,8 +82,6 @@ pub struct ImportType {
     pub js_name: String,
     /// Parent types (from `extends` attributes)
     pub extends: Vec<Path>,
-    /// TypeScript type override
-    pub typescript_type: Option<String>,
     /// User-provided derive attributes (e.g., Clone, Debug)
     pub derives: Vec<syn::Attribute>,
     /// Vendor prefixes for fallback (e.g., webkit, moz)
@@ -107,8 +105,6 @@ pub struct ImportFunction {
     pub generics: syn::Generics,
     /// JavaScript name (may differ from rust_name)
     pub js_name: String,
-    /// The class this method belongs to (if any)
-    pub js_class: Option<String>,
     /// JavaScript namespace
     pub js_namespace: Option<Vec<String>>,
     /// Function arguments (excluding self for methods)
@@ -119,10 +115,6 @@ pub struct ImportFunction {
     pub kind: ImportFunctionKind,
     /// Whether to catch JS exceptions
     pub catch: bool,
-    /// Whether this uses structural typing
-    pub structural: bool,
-    /// Whether this is variadic
-    pub variadic: bool,
     /// Whether this is an async function
     pub is_async: bool,
     /// User-provided attributes (like #[cfg(...)] and #[doc = "..."])
@@ -275,8 +267,6 @@ pub struct ExportMethod {
     pub arguments: Vec<FunctionArg>,
     /// Return type
     pub ret: Option<Type>,
-    /// Whether to wrap in try-catch
-    pub catch: bool,
     /// User-provided attributes (like #[cfg(...)] and #[doc = "..."])
     pub rust_attrs: Vec<syn::Attribute>,
     /// Method visibility
@@ -582,7 +572,6 @@ fn parse_impl_method(
         kind,
         arguments,
         ret,
-        catch: method_attrs.catch.is_some(),
         rust_attrs,
         vis: method.vis.clone(),
         body: method.block.clone(),
@@ -840,14 +829,11 @@ fn parse_foreign_fn(f: syn::ForeignItemFn, attrs: BindgenAttrs) -> syn::Result<I
         rust_name,
         generics: f.sig.generics,
         js_name,
-        js_class,
         js_namespace,
         arguments,
         ret,
         kind,
         catch: attrs.catch.is_some(),
-        structural: attrs.is_structural(),
-        variadic: attrs.variadic.is_some(),
         is_async,
         rust_attrs,
     })
@@ -862,7 +848,7 @@ fn parse_foreign_type(t: syn::ForeignItemType, attrs: BindgenAttrs) -> syn::Resu
         .unwrap_or_else(|| rust_name.to_string());
 
     let extends: Vec<Path> = attrs.extends.into_iter().map(|(_, p)| p).collect();
-    let typescript_type = attrs.typescript_type.map(|(_, t)| t);
+    let _typescript_type = attrs.typescript_type;
     let vendor_prefixes: Vec<Ident> = attrs.vendor_prefixes.into_iter().map(|(_, i)| i).collect();
     let is_type_of = attrs.is_type_of.map(|(_, e)| e);
 
@@ -880,7 +866,6 @@ fn parse_foreign_type(t: syn::ForeignItemType, attrs: BindgenAttrs) -> syn::Resu
         generics: t.generics,
         js_name,
         extends,
-        typescript_type,
         derives,
         vendor_prefixes,
         is_type_of,

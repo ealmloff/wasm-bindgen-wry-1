@@ -115,5 +115,5 @@ mod primitives;
 mod tests;
 mod values;
 
+pub use callbacks::CallbackKey;
 pub(crate) use callbacks::CallbackPolicy;
-pub use callbacks::{BorrowedFirstArg, CallbackKey};

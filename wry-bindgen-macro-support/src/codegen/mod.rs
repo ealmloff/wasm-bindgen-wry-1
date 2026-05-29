@@ -63,10 +63,10 @@ pub fn generate(program: &Program) -> syn::Result<TokenStream> {
         // Create a static and submit it to the inventory
         tokens.extend(quote_spanned! {span=>
             static #unique_ident: u64 = {
-                static __WRY_BINDGEN_INLINE_JS_MODULE: #krate::InlineJsModule = #krate::InlineJsModule::new(
+                static __WRY_BINDGEN_INLINE_JS_MODULE: #krate::__rt::InlineJsModule = #krate::__rt::InlineJsModule::new(
                     #content_expr
                 );
-                #krate::inventory::submit! {
+                #krate::__rt::inventory::submit! {
                     __WRY_BINDGEN_INLINE_JS_MODULE
                 }
                 __WRY_BINDGEN_INLINE_JS_MODULE.const_hash()

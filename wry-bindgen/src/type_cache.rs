@@ -8,18 +8,16 @@
 //! IDs onto `awaiting_ack_stack`, and the matching JS Respond pops and acks
 //! them. No request IDs needed.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
-
-struct TypeCacheEntry {
-    id: u32,
-    acked_by_js: bool,
-}
 
 /// Assigns stable IDs to encoded type definitions for a runtime.
 pub(crate) struct TypeCache {
-    cache: BTreeMap<Vec<u8>, TypeCacheEntry>,
-    types_by_id: BTreeMap<u32, Vec<u8>>,
+    /// Type definition bytes → assigned ID. The bytes are stored only here.
+    ids: BTreeMap<Vec<u8>, u32>,
+    /// IDs JS has acked, so future uses can send `TYPE_CACHED`. Keyed by ID
+    /// directly because both acking and the cached-check are ID-based.
+    acked: BTreeSet<u32>,
     /// Each frame is the set of type IDs introduced by one outbound Rust→JS
     /// Evaluate, in send order. The matching JS Respond pops the top frame.
     awaiting_ack_stack: Vec<Vec<u32>>,
@@ -29,8 +27,8 @@ pub(crate) struct TypeCache {
 impl TypeCache {
     pub(crate) fn new() -> Self {
         Self {
-            cache: BTreeMap::new(),
-            types_by_id: BTreeMap::new(),
+            ids: BTreeMap::new(),
+            acked: BTreeSet::new(),
             awaiting_ack_stack: Vec::new(),
             next_type_id: 0,
         }
@@ -43,19 +41,12 @@ impl TypeCache {
     pub(crate) fn get_or_create_type_id(&mut self, type_bytes: &[u8]) -> (u32, bool) {
         // `BTreeMap<Vec<u8>, _>` looks up by `&[u8]` via `Borrow`, so the common
         // cache-hit path performs no allocation; we only own the bytes on a miss.
-        if let Some(entry) = self.cache.get(type_bytes) {
-            (entry.id, entry.acked_by_js)
+        if let Some(&id) = self.ids.get(type_bytes) {
+            (id, self.acked.contains(&id))
         } else {
             let id = self.next_type_id;
             self.next_type_id += 1;
-            self.types_by_id.insert(id, type_bytes.to_vec());
-            self.cache.insert(
-                type_bytes.to_vec(),
-                TypeCacheEntry {
-                    id,
-                    acked_by_js: false,
-                },
-            );
+            self.ids.insert(type_bytes.to_vec(), id);
             (id, false)
         }
     }
@@ -77,13 +68,7 @@ impl TypeCache {
     /// `TYPE_CACHED`. Used for types introduced in an outbound Respond, which JS
     /// processes synchronously before Rust runs again (so no frame is needed).
     pub(crate) fn ack_type_ids(&mut self, type_ids: &[u32]) {
-        for &type_id in type_ids {
-            if let Some(type_bytes) = self.types_by_id.get(&type_id) {
-                if let Some(entry) = self.cache.get_mut(type_bytes) {
-                    entry.acked_by_js = true;
-                }
-            }
-        }
+        self.acked.extend(type_ids.iter().copied());
     }
 }
 

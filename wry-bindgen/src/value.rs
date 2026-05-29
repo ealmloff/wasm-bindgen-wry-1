@@ -749,14 +749,20 @@ where
     }
 }
 
-impl From<crate::Clamped<Vec<u8>>> for JsValue {
-    fn from(vector: crate::Clamped<Vec<u8>>) -> Self {
+impl<T> From<crate::Clamped<Vec<T>>> for JsValue
+where
+    crate::Clamped<Vec<T>>: crate::BinaryEncode + crate::EncodeTypeDef,
+{
+    fn from(vector: crate::Clamped<Vec<T>>) -> Self {
         crate::__rt::wbg_cast(vector)
     }
 }
 
-impl From<crate::Clamped<Box<[u8]>>> for JsValue {
-    fn from(vector: crate::Clamped<Box<[u8]>>) -> Self {
+impl<T> From<crate::Clamped<Box<[T]>>> for JsValue
+where
+    crate::Clamped<Vec<T>>: crate::BinaryEncode + crate::EncodeTypeDef,
+{
+    fn from(vector: crate::Clamped<Box<[T]>>) -> Self {
         crate::__rt::wbg_cast(crate::Clamped(vector.0.into_vec()))
     }
 }

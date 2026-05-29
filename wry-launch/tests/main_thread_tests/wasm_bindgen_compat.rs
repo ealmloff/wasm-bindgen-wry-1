@@ -32,13 +32,14 @@ pub(crate) fn test_generic_import_erases_promise_method_shape() {
     extern "C" {
         type CompatPromise<T = JsValue>;
 
-        #[allow(dead_code)]
         #[wasm_bindgen(method, js_name = then)]
         fn compat_then_map<'a, T, R: Promising>(
             this: &CompatPromise<T>,
             cb: &wasm_bindgen::ScopedClosure<'a, dyn FnMut(T) -> Result<R, JsError>>,
         ) -> CompatPromise<R::Resolution>;
     }
+
+    let _ = CompatPromise::<JsValue>::compat_then_map::<JsValue>;
 }
 
 pub(crate) fn test_convert_traits_are_marker_bounds() {
@@ -48,7 +49,13 @@ pub(crate) fn test_convert_traits_are_marker_bounds() {
     fn assert_option_from<T: OptionFromWasmAbi>() {}
     fn assert_wasm<T: WasmAbi>() {}
     fn assert_ref<T: RefFromWasmAbi>() {}
-    fn assert_error<T: std::error::Error>() {}
+    // Matches wasm-bindgen: `JsError` is *not* itself a `std::error::Error`, but it does
+    // implement `From<E> where E: std::error::Error` (so `?` works on `Result<_, JsError>`).
+    fn assert_jserror_from<E: std::error::Error>()
+    where
+        JsError: From<E>,
+    {
+    }
 
     assert_into::<JsValue>();
     assert_from::<JsValue>();
@@ -61,7 +68,7 @@ pub(crate) fn test_convert_traits_are_marker_bounds() {
     assert_option_from::<Option<u32>>();
     assert_wasm::<Option<u32>>();
 
-    assert_error::<JsError>();
+    assert_jserror_from::<std::io::Error>();
 }
 
 pub(crate) fn test_interned_string_roundtrip() {

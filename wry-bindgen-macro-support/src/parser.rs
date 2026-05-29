@@ -139,11 +139,6 @@ impl BindgenAttrs {
         self.js_class.as_ref().map(|(_, s)| s.as_str())
     }
 
-    /// Check if structural typing is enabled
-    pub fn is_structural(&self) -> bool {
-        self.structural.is_some()
-    }
-
     /// Check if this is a thread-local static
     pub fn is_thread_local_v2(&self) -> bool {
         self.thread_local_v2.is_some()

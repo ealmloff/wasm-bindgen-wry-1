@@ -36,6 +36,22 @@ impl From<JsValue> for JsError {
     }
 }
 
+// Matches wasm-bindgen: `JsError` implements `From<E> where E: std::error::Error`,
+// which is what enables `?` on `Result<_, JsError>`. For this blanket impl to avoid
+// colliding with core's reflexive `From<T> for T`, `JsError` itself must NOT implement
+// `std::error::Error` (upstream deliberately does not implement it either).
+#[cfg(feature = "std")]
+impl<E> From<E> for JsError
+where
+    E: std::error::Error,
+{
+    fn from(error: E) -> Self {
+        use alloc::string::ToString;
+
+        JsError::new(&error.to_string())
+    }
+}
+
 impl AsRef<JsValue> for JsError {
     fn as_ref(&self) -> &JsValue {
         &self.value
@@ -47,9 +63,6 @@ impl core::fmt::Display for JsError {
         write!(f, "JsError")
     }
 }
-
-#[cfg(feature = "std")]
-impl std::error::Error for JsError {}
 
 impl JsCast for JsError {
     fn instanceof(val: &JsValue) -> bool {

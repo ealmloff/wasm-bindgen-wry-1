@@ -168,7 +168,7 @@ pub(super) fn generate_type(ty: &ImportType, krate: &TokenStream) -> syn::Result
     // Generate BatchableResult implementation
     let batchable_impl = quote_spanned! {span=>
         impl #impl_generics #krate::BatchableResult for #rust_name #ty_generics #where_clause {
-            fn try_placeholder(batch: &mut #krate::batch::Runtime) -> ::core::option::Option<Self> {
+            fn try_placeholder(batch: &mut #krate::__rt::Runtime) -> ::core::option::Option<Self> {
                 ::core::option::Option::Some(::core::convert::Into::into(<#krate::JsValue as #krate::BatchableResult>::try_placeholder(batch)?))
             }
         }
@@ -255,7 +255,7 @@ pub(super) fn generate_type(ty: &ImportType, krate: &TokenStream) -> syn::Result
         quote! {}
     } else {
         quote_spanned! {span=>
-            impl #impl_generics #krate::sys::Promising for #rust_name #ty_generics #where_clause {
+            impl #impl_generics #krate::Promising for #rust_name #ty_generics #where_clause {
                 type Resolution = #rust_name #ty_generics;
             }
         }
@@ -265,14 +265,14 @@ pub(super) fn generate_type(ty: &ImportType, krate: &TokenStream) -> syn::Result
     if !ty.no_upcast {
         upcast_impls.extend(quote_spanned! {span=>
             impl #impl_generics #krate::convert::UpcastFrom<#rust_name #ty_generics> for #krate::JsValue #where_clause {}
-            impl #impl_generics #krate::convert::UpcastFrom<#rust_name #ty_generics> for #krate::sys::JsOption<#krate::JsValue> #where_clause {}
+            impl #impl_generics #krate::convert::UpcastFrom<#rust_name #ty_generics> for #krate::JsOption<#krate::JsValue> #where_clause {}
         });
 
         let class_type_params: Vec<_> = generics.type_params().collect();
         if class_type_params.is_empty() {
             upcast_impls.extend(quote_spanned! {span=>
                 impl #impl_generics #krate::convert::UpcastFrom<#rust_name #ty_generics> for #rust_name #ty_generics #where_clause {}
-                impl #impl_generics #krate::convert::UpcastFrom<#rust_name #ty_generics> for #krate::sys::JsOption<#rust_name #ty_generics> #where_clause {}
+                impl #impl_generics #krate::convert::UpcastFrom<#rust_name #ty_generics> for #krate::JsOption<#rust_name #ty_generics> #where_clause {}
             });
         } else {
             let mut target_generics = generics.clone();
@@ -334,14 +334,14 @@ pub(super) fn generate_type(ty: &ImportType, krate: &TokenStream) -> syn::Result
 
             upcast_impls.extend(quote_spanned! {span=>
                 impl #target_impl_generics #krate::convert::UpcastFrom<#rust_name #ty_generics> for #rust_name #target_ty_generics #target_where_clause {}
-                impl #target_impl_generics #krate::convert::UpcastFrom<#rust_name #ty_generics> for #krate::sys::JsOption<#rust_name #target_ty_generics> #target_where_clause {}
+                impl #target_impl_generics #krate::convert::UpcastFrom<#rust_name #ty_generics> for #krate::JsOption<#rust_name #target_ty_generics> #target_where_clause {}
             });
         }
 
         for parent in &ty.extends {
             upcast_impls.extend(quote_spanned! {span=>
                 impl #impl_generics #krate::convert::UpcastFrom<#rust_name #ty_generics> for #parent #where_clause {}
-                impl #impl_generics #krate::convert::UpcastFrom<#rust_name #ty_generics> for #krate::sys::JsOption<#parent> #where_clause {}
+                impl #impl_generics #krate::convert::UpcastFrom<#rust_name #ty_generics> for #krate::JsOption<#parent> #where_clause {}
             });
         }
     }

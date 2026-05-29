@@ -49,10 +49,10 @@ pub(super) fn generate_export_struct(
         "__DROP_SPEC",
         quote_spanned! {span=> #drop_fn_name },
         quote_spanned! {span=>
-            let handle = <#krate::object_store::ObjectHandle as #krate::BinaryDecode>::decode(
+            let handle = <#krate::__rt::object_store::ObjectHandle as #krate::BinaryDecode>::decode(
                 decoder
             )?;
-            #krate::object_store::drop_object(handle);
+            #krate::__rt::object_store::drop_object(handle);
             Ok(#krate::EncodedData::new())
         },
         krate,
@@ -70,9 +70,9 @@ pub(super) fn generate_export_struct(
     let into_jsvalue_impl = quote_spanned! {span=>
         impl ::core::convert::From<#rust_name> for #krate::JsValue {
             fn from(val: #rust_name) -> Self {
-                let handle = #krate::object_store::insert_object(val);
+                let handle = #krate::__rt::object_store::insert_object(val);
                 // Create a JS object wrapper with the handle
-                #krate::object_store::create_js_wrapper(handle, #js_name)
+                #krate::__rt::object_store::create_js_wrapper(handle, #js_name)
             }
         }
     };
@@ -81,7 +81,7 @@ pub(super) fn generate_export_struct(
     let encode_type_def_impl = quote_spanned! {span=>
         impl #krate::EncodeTypeDef for #rust_name {
             fn encode_type_def(buf: &mut #krate::alloc::vec::Vec<u8>) {
-                buf.push(#krate::encode::TypeTag::HeapRef as u8);
+                buf.push(#krate::__rt::TypeTag::HeapRef as u8);
             }
         }
     };
@@ -105,12 +105,12 @@ pub(super) fn generate_export_struct(
                 // Decode the JsValue
                 let js = #krate::JsValue::decode(decoder)?;
                 // Extract handle from JS wrapper
-                let handle = #krate::extract_rust_handle(&js)
+                let handle = #krate::__rt::extract_rust_handle(&js)
                     .ok_or_else(|| #krate::DecodeError::Custom(
                         #krate::alloc::string::String::from("expected Rust object wrapper")
                     ))?;
                 // Remove from object store and return owned value
-                Ok(#krate::object_store::remove_object::<#rust_name>(handle))
+                Ok(#krate::__rt::object_store::remove_object::<#rust_name>(handle))
             }
         }
     };
@@ -156,7 +156,7 @@ fn generate_field_accessor(
     // Generate getter
     let getter_body = if field.getter_with_clone {
         quote_spanned! {span=>
-            #krate::object_store::with_object::<#struct_name, _>(handle, |obj| {
+            #krate::__rt::object_store::with_object::<#struct_name, _>(handle, |obj| {
                 let val = ::core::clone::Clone::clone(&obj.#field_name);
                 let mut encoder = #krate::EncodedData::new();
                 <#field_ty as #krate::BinaryEncode>::encode(val, &mut encoder);
@@ -165,7 +165,7 @@ fn generate_field_accessor(
         }
     } else {
         quote_spanned! {span=>
-            #krate::object_store::with_object::<#struct_name, _>(handle, |obj| {
+            #krate::__rt::object_store::with_object::<#struct_name, _>(handle, |obj| {
                 let val = obj.#field_name;
                 let mut encoder = #krate::EncodedData::new();
                 <#field_ty as #krate::BinaryEncode>::encode(val, &mut encoder);
@@ -178,7 +178,7 @@ fn generate_field_accessor(
         "__GETTER_SPEC",
         quote_spanned! {span=> #getter_name },
         quote_spanned! {span=>
-            let handle = <#krate::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
+            let handle = <#krate::__rt::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
             #getter_body
         },
         krate,
@@ -191,9 +191,9 @@ fn generate_field_accessor(
             "__SETTER_SPEC",
             quote_spanned! {span=> #setter_name },
             quote_spanned! {span=>
-                let handle = <#krate::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
+                let handle = <#krate::__rt::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
                 let val = <#field_ty as #krate::BinaryDecode>::decode(decoder)?;
-                #krate::object_store::with_object_mut::<#struct_name, _>(handle, |obj| {
+                #krate::__rt::object_store::with_object_mut::<#struct_name, _>(handle, |obj| {
                     obj.#field_name = val;
                 });
                 Ok(#krate::EncodedData::new())
@@ -217,7 +217,7 @@ fn generate_field_accessor(
             export_name: quote_spanned! {span=> #getter_name },
             arg_count: quote_spanned! {span=> 0 },
             type_helpers: getter_type_helpers,
-            member_kind: quote_spanned! {span=> #krate::JsClassMemberKind::Getter },
+            member_kind: quote_spanned! {span=> #krate::__rt::JsClassMemberKind::Getter },
         },
         krate,
         span,
@@ -236,7 +236,7 @@ fn generate_field_accessor(
                 export_name: quote_spanned! {span=> #setter_name },
                 arg_count: quote_spanned! {span=> 1 },
                 type_helpers: setter_type_helpers,
-                member_kind: quote_spanned! {span=> #krate::JsClassMemberKind::Setter },
+                member_kind: quote_spanned! {span=> #krate::__rt::JsClassMemberKind::Setter },
             },
             krate,
             span,
@@ -288,8 +288,8 @@ fn generate_inspectable(
         "__TO_JSON_SPEC",
         quote_spanned! {span=> #to_json_name },
         quote_spanned! {span=>
-            let handle = <#krate::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
-            #krate::object_store::with_object::<#struct_name, _>(handle, |obj| {
+            let handle = <#krate::__rt::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
+            #krate::__rt::object_store::with_object::<#struct_name, _>(handle, |obj| {
                 // Create a simple JSON-like representation
                 let mut json = ::alloc::string::String::from("{");
                 #(
@@ -315,7 +315,7 @@ fn generate_inspectable(
             export_name: quote_spanned! {span=> #to_json_name },
             arg_count: quote_spanned! {span=> 0 },
             type_helpers: to_json_type_helpers,
-            member_kind: quote_spanned! {span=> #krate::JsClassMemberKind::Method },
+            member_kind: quote_spanned! {span=> #krate::__rt::JsClassMemberKind::Method },
         },
         krate,
         span,
@@ -324,8 +324,8 @@ fn generate_inspectable(
         "__TO_STRING_SPEC",
         quote_spanned! {span=> #to_string_name },
         quote_spanned! {span=>
-            let handle = <#krate::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
-            #krate::object_store::with_object::<#struct_name, _>(handle, |obj| {
+            let handle = <#krate::__rt::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
+            #krate::__rt::object_store::with_object::<#struct_name, _>(handle, |obj| {
                 let s = ::alloc::format!("[object {}]", #struct_name_str);
                 let mut encoder = #krate::EncodedData::new();
                 <::alloc::string::String as #krate::BinaryEncode>::encode(s, &mut encoder);
@@ -343,7 +343,7 @@ fn generate_inspectable(
             export_name: quote_spanned! {span=> #to_string_name },
             arg_count: quote_spanned! {span=> 0 },
             type_helpers: to_string_type_helpers,
-            member_kind: quote_spanned! {span=> #krate::JsClassMemberKind::Method },
+            member_kind: quote_spanned! {span=> #krate::__rt::JsClassMemberKind::Method },
         },
         krate,
         span,
@@ -387,9 +387,9 @@ pub(super) fn generate_export_method(
             quote_spanned! {span=>
                 #decode_args
                 let result = #class::#rust_name(#(#arg_names),*);
-                let handle = #krate::object_store::insert_object(result);
+                let handle = #krate::__rt::object_store::insert_object(result);
                 let mut encoder = #krate::EncodedData::new();
-                <#krate::object_store::ObjectHandle as #krate::BinaryEncode>::encode(handle, &mut encoder);
+                <#krate::__rt::object_store::ObjectHandle as #krate::BinaryEncode>::encode(handle, &mut encoder);
                 Ok(encoder)
             }
         }
@@ -398,14 +398,14 @@ pub(super) fn generate_export_method(
             let call = match self_ty {
                 SelfType::RefShared => {
                     quote_spanned! {span=>
-                        #krate::object_store::with_object::<#class, _>(handle, |obj| {
+                        #krate::__rt::object_store::with_object::<#class, _>(handle, |obj| {
                             obj.#rust_name(#(#arg_names),*)
                         })
                     }
                 }
                 SelfType::RefMutable => {
                     quote_spanned! {span=>
-                        #krate::object_store::with_object_mut::<#class, _>(handle, |obj| {
+                        #krate::__rt::object_store::with_object_mut::<#class, _>(handle, |obj| {
                             obj.#rust_name(#(#arg_names),*)
                         })
                     }
@@ -414,7 +414,7 @@ pub(super) fn generate_export_method(
                     // Consuming method: remove from store
                     quote_spanned! {span=>
                         {
-                            let obj = #krate::object_store::remove_object::<#class>(handle);
+                            let obj = #krate::__rt::object_store::remove_object::<#class>(handle);
                             obj.#rust_name(#(#arg_names),*)
                         }
                     }
@@ -424,7 +424,7 @@ pub(super) fn generate_export_method(
             if method.ret.is_some() {
                 let ret_ty = method.ret.as_ref().unwrap();
                 quote_spanned! {span=>
-                    let handle = <#krate::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
+                    let handle = <#krate::__rt::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
                     #decode_args
                     let result = #call;
                     let mut encoder = #krate::EncodedData::new();
@@ -433,7 +433,7 @@ pub(super) fn generate_export_method(
                 }
             } else {
                 quote_spanned! {span=>
-                    let handle = <#krate::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
+                    let handle = <#krate::__rt::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
                     #decode_args
                     #call;
                     Ok(#krate::EncodedData::new())
@@ -462,8 +462,8 @@ pub(super) fn generate_export_method(
             // Property getter: call the getter method
             if let Some(ret_ty) = &method.ret {
                 quote_spanned! {span=>
-                    let handle = <#krate::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
-                    #krate::object_store::with_object::<#class, _>(handle, |obj| {
+                    let handle = <#krate::__rt::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
+                    #krate::__rt::object_store::with_object::<#class, _>(handle, |obj| {
                         let result = obj.#rust_name();
                         let mut encoder = #krate::EncodedData::new();
                         <#ret_ty as #krate::BinaryEncode>::encode(result, &mut encoder);
@@ -484,9 +484,9 @@ pub(super) fn generate_export_method(
             let arg_name = method.arguments.first().map(|a| &a.name).unwrap();
 
             quote_spanned! {span=>
-                let handle = <#krate::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
+                let handle = <#krate::__rt::object_store::ObjectHandle as #krate::BinaryDecode>::decode(decoder)?;
                 let #arg_name = <#arg_ty as #krate::BinaryDecode>::decode(decoder)?;
-                #krate::object_store::with_object_mut::<#class, _>(handle, |obj| {
+                #krate::__rt::object_store::with_object_mut::<#class, _>(handle, |obj| {
                     obj.#rust_name(#arg_name);
                 });
                 Ok(#krate::EncodedData::new())
@@ -573,7 +573,7 @@ pub(super) fn generate_export_method(
         .collect();
     let member_return_type = match &method.kind {
         ExportMethodKind::Constructor => {
-            Some(quote_spanned! {span=> #krate::object_store::ObjectHandle })
+            Some(quote_spanned! {span=> #krate::__rt::object_store::ObjectHandle })
         }
         ExportMethodKind::Setter { .. } => None,
         _ => method.ret.as_ref().map(|ty| quote_spanned! {span=> #ty }),
@@ -583,23 +583,23 @@ pub(super) fn generate_export_method(
     let (member_name, member_kind) = match &method.kind {
         ExportMethodKind::Constructor => (
             js_name.clone(),
-            quote! { #krate::JsClassMemberKind::Constructor },
+            quote! { #krate::__rt::JsClassMemberKind::Constructor },
         ),
         ExportMethodKind::Method { .. } => (
             js_name.clone(),
-            quote! { #krate::JsClassMemberKind::Method },
+            quote! { #krate::__rt::JsClassMemberKind::Method },
         ),
         ExportMethodKind::StaticMethod => (
             js_name.clone(),
-            quote! { #krate::JsClassMemberKind::StaticMethod },
+            quote! { #krate::__rt::JsClassMemberKind::StaticMethod },
         ),
         ExportMethodKind::Getter { property } => (
             property.clone(),
-            quote! { #krate::JsClassMemberKind::Getter },
+            quote! { #krate::__rt::JsClassMemberKind::Getter },
         ),
         ExportMethodKind::Setter { property } => (
             property.clone(),
-            quote! { #krate::JsClassMemberKind::Setter },
+            quote! { #krate::__rt::JsClassMemberKind::Setter },
         ),
     };
 

@@ -1,7 +1,7 @@
 //! Runtime compatibility hooks used by generated wasm-bindgen-style code.
 
 use crate::{
-    __wry_submit_js_function, Closure, JsValue, LazyJsFunction,
+    __wry_submit_js_function, Closure, JsValue,
     encode::{BatchableResult, BinaryEncode, EncodeTypeDef},
 };
 use alloc::rc::Rc;
@@ -11,6 +11,28 @@ use core::{
     pin::Pin,
     task::{Context, Poll, Waker},
 };
+
+#[doc(hidden)]
+pub use crate::batch::Runtime;
+#[doc(hidden)]
+pub use crate::encode::TypeTag;
+#[doc(hidden)]
+pub use crate::function_registry::{
+    InlineJsModule, JsClassMemberKind, JsClassMemberSpec, JsExportSpec, JsFunctionSpec,
+    LazyJsFunction,
+};
+#[doc(hidden)]
+pub use crate::js_helpers::js_extract_rust_handle as extract_rust_handle;
+#[doc(hidden)]
+pub use inventory;
+
+#[doc(hidden)]
+pub mod object_store {
+    pub use crate::object_store::{
+        ObjectHandle, create_js_wrapper, drop_object, insert_object, remove_object, with_object,
+        with_object_mut,
+    };
+}
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

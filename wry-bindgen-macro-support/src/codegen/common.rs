@@ -56,14 +56,14 @@ pub(super) fn generate_js_export_spec(
     quote_spanned! {span=>
         const _: () = {
             #[allow(non_upper_case_globals)]
-            static #static_ident: #krate::JsExportSpec = #krate::JsExportSpec::new(
+            static #static_ident: #krate::__rt::JsExportSpec = #krate::__rt::JsExportSpec::new(
                 #export_name,
                 |decoder| {
                     #body
                 }
             );
 
-            #krate::inventory::submit! {
+            #krate::__rt::inventory::submit! {
                 #static_ident
             }
         };
@@ -101,7 +101,7 @@ pub(super) fn generate_js_class_member_spec(
             #type_helpers
 
             #[allow(non_upper_case_globals)]
-            static #static_ident: #krate::JsClassMemberSpec = #krate::JsClassMemberSpec::new(
+            static #static_ident: #krate::__rt::JsClassMemberSpec = #krate::__rt::JsClassMemberSpec::new(
                 #class_name,
                 #member_name,
                 #export_name,
@@ -111,7 +111,7 @@ pub(super) fn generate_js_class_member_spec(
                 #member_kind
             );
 
-            #krate::inventory::submit! {
+            #krate::__rt::inventory::submit! {
                 #static_ident
             }
         };

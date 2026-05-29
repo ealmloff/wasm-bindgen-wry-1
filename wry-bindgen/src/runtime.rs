@@ -232,7 +232,7 @@ fn handle_rust_callback(data: &mut DecodedData) {
                 crate::encode::BinaryDecode::decode(data).expect("Failed to decode export name");
 
             // Find the export handler
-            let export = crate::inventory::iter::<crate::JsExportSpec>()
+            let export = crate::__rt::inventory::iter::<crate::__rt::JsExportSpec>()
                 .find(|e| e.name == export_name)
                 .unwrap_or_else(|| panic!("Unknown export: {export_name}"));
 

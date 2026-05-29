@@ -142,7 +142,7 @@ pub trait TryFromJsValue: Sized {
 }
 
 use crate::ipc::{DecodeError, DecodedData};
-use crate::{ErasableGeneric, JsCast};
+use crate::{__rt::marker::ErasableGeneric, JsCast};
 use core::marker::PhantomData;
 
 /// Marker for type-safe generic upcast relationships.

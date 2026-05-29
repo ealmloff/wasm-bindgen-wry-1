@@ -78,7 +78,7 @@ pub(super) fn generate_string_enum(
         impl #krate::EncodeTypeDef for #enum_name {
             fn encode_type_def(buf: &mut #krate::alloc::vec::Vec<u8>) {
                 // Push StringEnum tag
-                buf.push(#krate::encode::TypeTag::StringEnum as u8);
+                buf.push(#krate::__rt::TypeTag::StringEnum as u8);
                 // Push variant count
                 buf.push(#variant_count_u8);
                 // Push each variant string (length as u32 + bytes)
