@@ -9,7 +9,7 @@
 //!
 //! - [`BinaryEncode`]/[`BinaryDecode`] - Core encoding/decoding traits for Rust types
 //! - [`JSFunction`] - JSFunction type for calling JavaScript functions
-//! - [`batch()`] - Batching helper for grouping multiple JS operations
+//! - [`batch`] - Batching helpers for grouping multiple JS operations
 //! - [`wry`] - Event loop and Wry integration
 
 #![no_std]
