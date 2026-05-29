@@ -400,6 +400,8 @@ jobs:
 
           if [[ "$failed" == "true" ]]; then
             cp "$report" "$failure_file"
+          else
+            rm -rf patches/wasm-bindgen
           fi
 
           {
