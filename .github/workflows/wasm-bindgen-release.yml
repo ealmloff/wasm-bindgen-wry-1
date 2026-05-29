@@ -128,10 +128,12 @@ jobs:
           api_check_failed=false
           failure_step=""
           current_base="$current"
+          existing_patch_count=0
           patch_count=0
 
           mkdir -p "$log_dir"
           rm -f "$failure_file"
+          existing_patch_count="$(find patches/wasm-bindgen -name '*.patch' -type f 2>/dev/null | wc -l | tr -d ' ')"
 
           append_log() {
             local title="$1"
@@ -163,7 +165,7 @@ jobs:
             echo
             echo "## Result"
             echo
-            echo "The workflow derives the patch stack from the current wasm-bindgen release tag ($current_base) and the commits currently applied on top of it, moves the submodule to the new upstream release, reapplies those derived patches, regenerates the patch files against the new base, and bumps local crate versions."
+            echo "The workflow derives the patch stack from the current wasm-bindgen release tag ($current_base) and the commits currently applied on top of it, moves the submodule to the new upstream release, reapplies those derived patches, regenerates the patch files against the new base, resets the submodule pointer to the reachable upstream release commit, and bumps local crate versions."
           } >"$report"
 
           git config user.name "github-actions[bot]"
@@ -185,6 +187,14 @@ jobs:
             if scripts/wasm-bindgen-patches.sh regen "$current_base" >"$extract_log" 2>&1; then
               patch_count="$(find patches/wasm-bindgen -name '*.patch' -type f 2>/dev/null | wc -l | tr -d ' ')"
               append_log "Extracted current patch stack" "$extract_log"
+            elif grep -q "base-ref resolves to HEAD; no patches to generate" "$extract_log" && [[ "$existing_patch_count" -gt 0 ]]; then
+              patch_count="$existing_patch_count"
+              {
+                cat "$extract_log"
+                echo
+                echo "Using $existing_patch_count committed patch file(s) from patches/wasm-bindgen because the submodule points at the upstream release commit."
+              } >"$log_dir/use-committed-patches.log"
+              append_log "Using committed patch stack" "$log_dir/use-committed-patches.log"
             elif grep -q "base-ref resolves to HEAD; no patches to generate" "$extract_log"; then
               patch_count=0
               append_log "No current patch stack to extract" "$extract_log"
@@ -224,6 +234,15 @@ jobs:
               append_log "Patch stack is empty after moving to $latest" "$refresh_log"
             else
               fail_step "Failed to regenerate patch stack against $latest" "$refresh_log"
+            fi
+          fi
+
+          if [[ "$failed" == "false" ]]; then
+            reachable_submodule_log="$log_dir/reset-submodule-to-reachable-release.log"
+            if git -C wasm-bindgen reset --hard "$latest" >"$reachable_submodule_log" 2>&1; then
+              append_log "Reset submodule pointer to reachable $latest release" "$reachable_submodule_log"
+            else
+              fail_step "Failed to reset submodule pointer to reachable $latest release" "$reachable_submodule_log"
             fi
           fi
 
@@ -298,8 +317,6 @@ jobs:
 
           if [[ "$failed" == "true" ]]; then
             cp "$report" "$failure_file"
-          else
-            rm -rf patches/wasm-bindgen
           fi
 
           {
