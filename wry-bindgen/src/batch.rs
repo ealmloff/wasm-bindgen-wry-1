@@ -3,14 +3,14 @@
 //! This module provides the batching infrastructure that allows multiple
 //! JS operations to be grouped together for efficient execution.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::any::Any;
 use core::cell::RefCell;
 use std::boxed::Box;
 
 use crate::encode::{BatchableResult, BinaryDecode};
-use crate::id_allocator::{BorrowIds, HeapIds, InstallIdBatch, ObjectHandles};
+use crate::id_allocator::{BorrowIds, HeapIds, IdSlab, InstallIdBatch};
 use crate::ipc::DecodedData;
 use crate::ipc::{EncodedData, MessageType, OutboundIPCMessage};
 use crate::lazy::ThreadLocalKey;
@@ -41,14 +41,19 @@ pub struct Runtime {
     heap_ids: HeapIds,
     /// Borrow-stack IDs for borrowed references within an operation.
     borrow_ids: BorrowIds,
-    /// Handles for Rust-owned exported objects.
-    object_handles: ObjectHandles,
+    /// Handles for Rust-owned exported objects. Rust controls allocation, so
+    /// handles are freed (released and recycled) immediately on removal.
+    object_handles: IdSlab<u32>,
     /// Whether we're inside a batch() call
     is_batching: bool,
     /// Function-type definitions JS has been told about.
     type_cache: TypeCache,
     /// Exported Rust structs and callbacks stored by handle.
     objects: BTreeMap<u32, Box<dyn Any>>,
+    /// Handles whose drop arrived while the object was checked out (taken out of
+    /// `objects` for a `with_object`/`with_object_mut` call). The drop is honored
+    /// when the checkout finishes instead of being lost.
+    pending_object_drops: BTreeSet<u32>,
     /// Per-operation deferred cleanup frames. Each in-flight operation pushes
     /// one frame; released heap IDs and object handles accumulate into the top
     /// frame and are flushed when the operation completes.
@@ -73,11 +78,12 @@ impl Runtime {
             encoder,
             heap_ids: HeapIds::new(),
             borrow_ids: BorrowIds::new(),
-            object_handles: ObjectHandles::new(),
+            object_handles: IdSlab::new(1),
             is_batching: false,
             type_cache: TypeCache::new(),
             // Object store starts empty
             objects: BTreeMap::new(),
+            pending_object_drops: BTreeSet::new(),
             op_free_stack: Vec::new(),
             ipc,
             webview_id,
@@ -196,10 +202,15 @@ impl Runtime {
         prepend_rust_to_js_prelude(&mut encoder, &install_ids, reserved_ids);
         let pending_type_ids = encoder.take_pending_type_ids();
         // Reserved-ids is only passed for outbound Evaluates; Responds pass
-        // None. Only Evaluates push a type-cache frame because JS will only
-        // send us an inbound Respond that closes one of those frames.
+        // None. Evaluates push a type-cache frame that the matching inbound JS
+        // Respond pops and acks. Responds have no such closing message, but JS
+        // processes a Respond synchronously before Rust runs again, so any types
+        // it introduced are already cached — ack them now rather than dropping
+        // them (otherwise they re-ship as TYPE_FULL on every later use).
         if reserved_ids.is_some() {
             self.type_cache.push_pending_frame(pending_type_ids);
+        } else {
+            self.type_cache.ack_type_ids(&pending_type_ids);
         }
         // Only Evaluates (reserved_ids is Some) can be top-level; they are
         // top-level exactly when no callback is currently on the stack.
@@ -286,7 +297,7 @@ impl Runtime {
 
     /// Get or create a type ID for a function-type definition. The second
     /// element is true if JS has already acked a `TYPE_FULL` for this ID.
-    pub(crate) fn get_or_create_type_id(&mut self, type_bytes: Vec<u8>) -> (u32, bool) {
+    pub(crate) fn get_or_create_type_id(&mut self, type_bytes: &[u8]) -> (u32, bool) {
         self.type_cache.get_or_create_type_id(type_bytes)
     }
 
@@ -298,7 +309,7 @@ impl Runtime {
 
     /// Insert an exported object and return its handle.
     pub(crate) fn insert_object<T: 'static>(&mut self, obj: T) -> u32 {
-        let handle = self.object_handles.next_handle();
+        let handle = self.object_handles.alloc();
         self.objects.insert(handle, Box::new(obj));
         handle
     }
@@ -338,6 +349,14 @@ impl Runtime {
     }
 
     pub(crate) fn reinsert_object<T: 'static>(&mut self, handle: u32, obj: T) {
+        // A drop (e.g. JS GC firing DROP_NATIVE_REF) may have arrived while this
+        // object was checked out. Honor it now instead of resurrecting the
+        // object: free the handle and let `obj` drop.
+        if self.pending_object_drops.remove(&handle) {
+            self.object_handles.free(handle);
+            drop(obj);
+            return;
+        }
         assert!(
             self.objects.insert(handle, Box::new(obj)).is_none(),
             "object handle {handle} was reinserted while occupied"
@@ -347,14 +366,21 @@ impl Runtime {
     /// Remove an exported object and return it.
     pub(crate) fn remove_object<T: 'static>(&mut self, handle: u32) -> T {
         let boxed = self.objects.remove(&handle).expect("invalid handle");
-        self.object_handles.release_handle(handle);
+        self.object_handles.free(handle);
         *boxed.downcast::<T>().expect("type mismatch")
     }
 
     pub(crate) fn remove_object_untyped(&mut self, handle: u32) -> Option<Box<dyn Any>> {
         let object = self.objects.remove(&handle);
         if object.is_some() {
-            self.object_handles.release_handle(handle);
+            self.object_handles.free(handle);
+        } else if self.object_handles.contains(handle) {
+            // The handle is live but absent from the map, so the object is
+            // currently checked out by a `with_object`/`with_object_mut` call
+            // (e.g. a method that triggered this drop through a nested
+            // callback). Defer the drop until the checkout finishes; the
+            // matching `reinsert_object` honors it.
+            self.pending_object_drops.insert(handle);
         }
         object
     }
@@ -700,5 +726,46 @@ mod take_encoder_tests {
         // The encoder holds only the single message-type byte — no per-message
         // request ID lives on the wire anymore.
         assert!(first.u32_buf.is_empty());
+    }
+
+    #[test]
+    fn object_drop_during_checkout_is_deferred_then_honored() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct DropFlag(Rc<Cell<bool>>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+
+        let mut runtime = test_runtime();
+        let dropped = Rc::new(Cell::new(false));
+        let handle = runtime.insert_object(DropFlag(dropped.clone()));
+
+        // `with_object`/`with_object_mut` take the object out of the map for the
+        // duration of a method call, leaving the handle live but the slot empty.
+        let checked_out = runtime.take_object::<DropFlag>(handle);
+
+        // A drop arrives mid-call (e.g. JS GC fires DROP_NATIVE_REF during a
+        // nested callback). It must be deferred, not silently lost.
+        assert!(runtime.remove_object_untyped(handle).is_none());
+        assert!(
+            !dropped.get(),
+            "object must not be dropped while it is checked out"
+        );
+
+        // Finishing the checkout honors the deferred drop instead of
+        // resurrecting the object.
+        runtime.reinsert_object(handle, checked_out);
+        assert!(
+            dropped.get(),
+            "deferred drop must run once the checkout completes"
+        );
+
+        // The handle was freed, so the next allocation reuses it (no leak).
+        let reused = runtime.insert_object(DropFlag(Rc::new(Cell::new(false))));
+        assert_eq!(reused, handle);
     }
 }

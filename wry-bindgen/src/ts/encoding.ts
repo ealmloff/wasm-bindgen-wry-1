@@ -32,7 +32,15 @@ class DataEncoder {
     this.u32Buf.push(value >>> 0);
   }
 
-  pushU64(value: number) {
+  pushU64(value: number | bigint) {
+    // bigint inputs (e.g. an i64/u64 from a BigInt) are encoded losslessly;
+    // plain numbers keep the existing float-split path.
+    if (typeof value === "bigint") {
+      const v = BigInt.asUintN(64, value);
+      this.pushU32(Number(v & 0xffffffffn));
+      this.pushU32(Number(v >> 32n));
+      return;
+    }
     const low = value >>> 0;
     const high = Math.floor(value / 0x100000000) >>> 0;
     this.pushU32(low);

@@ -40,15 +40,17 @@ impl TypeCache {
     ///
     /// Returns `(type_id, can_use_cached)`, where `can_use_cached` is true only
     /// after JS has acknowledged parsing a full definition for the ID.
-    pub(crate) fn get_or_create_type_id(&mut self, type_bytes: Vec<u8>) -> (u32, bool) {
-        if let Some(entry) = self.cache.get(&type_bytes) {
+    pub(crate) fn get_or_create_type_id(&mut self, type_bytes: &[u8]) -> (u32, bool) {
+        // `BTreeMap<Vec<u8>, _>` looks up by `&[u8]` via `Borrow`, so the common
+        // cache-hit path performs no allocation; we only own the bytes on a miss.
+        if let Some(entry) = self.cache.get(type_bytes) {
             (entry.id, entry.acked_by_js)
         } else {
             let id = self.next_type_id;
             self.next_type_id += 1;
-            self.types_by_id.insert(id, type_bytes.clone());
+            self.types_by_id.insert(id, type_bytes.to_vec());
             self.cache.insert(
-                type_bytes,
+                type_bytes.to_vec(),
                 TypeCacheEntry {
                     id,
                     acked_by_js: false,
@@ -66,10 +68,16 @@ impl TypeCache {
 
     /// Pop the top pending frame and mark its types as acked.
     pub(crate) fn pop_and_ack_pending_frame(&mut self) {
-        let Some(type_ids) = self.awaiting_ack_stack.pop() else {
-            return;
-        };
-        for type_id in type_ids {
+        if let Some(type_ids) = self.awaiting_ack_stack.pop() {
+            self.ack_type_ids(&type_ids);
+        }
+    }
+
+    /// Mark the given type IDs as acked by JS so future uses can send
+    /// `TYPE_CACHED`. Used for types introduced in an outbound Respond, which JS
+    /// processes synchronously before Rust runs again (so no frame is needed).
+    pub(crate) fn ack_type_ids(&mut self, type_ids: &[u32]) {
+        for &type_id in type_ids {
             if let Some(type_bytes) = self.types_by_id.get(&type_id) {
                 if let Some(entry) = self.cache.get_mut(type_bytes) {
                     entry.acked_by_js = true;
@@ -92,15 +100,15 @@ mod tests {
         let mut cache = TypeCache::new();
         let bytes = type_bytes(1);
 
-        let (id, cached) = cache.get_or_create_type_id(bytes.clone());
+        let (id, cached) = cache.get_or_create_type_id(&bytes);
         assert_eq!(id, 0);
         assert!(!cached);
 
         cache.push_pending_frame(vec![id]);
-        assert_eq!(cache.get_or_create_type_id(bytes.clone()), (id, false));
+        assert_eq!(cache.get_or_create_type_id(&bytes), (id, false));
 
         cache.pop_and_ack_pending_frame();
-        assert_eq!(cache.get_or_create_type_id(bytes), (id, true));
+        assert_eq!(cache.get_or_create_type_id(&bytes), (id, true));
     }
 
     #[test]
@@ -109,8 +117,8 @@ mod tests {
         let first = type_bytes(1);
         let second = type_bytes(2);
 
-        let (first_id, _) = cache.get_or_create_type_id(first.clone());
-        let (second_id, _) = cache.get_or_create_type_id(second.clone());
+        let (first_id, _) = cache.get_or_create_type_id(&first);
+        let (second_id, _) = cache.get_or_create_type_id(&second);
 
         // Two outbound Evaluates in flight; the inner one (second_id) gets
         // acked first via stack order.
@@ -119,15 +127,15 @@ mod tests {
 
         cache.pop_and_ack_pending_frame();
 
-        assert_eq!(cache.get_or_create_type_id(first), (first_id, false));
-        assert_eq!(cache.get_or_create_type_id(second), (second_id, true));
+        assert_eq!(cache.get_or_create_type_id(&first), (first_id, false));
+        assert_eq!(cache.get_or_create_type_id(&second), (second_id, true));
     }
 
     #[test]
     fn empty_pop_is_a_noop() {
         let mut cache = TypeCache::new();
         cache.pop_and_ack_pending_frame();
-        let (id, cached) = cache.get_or_create_type_id(type_bytes(1));
+        let (id, cached) = cache.get_or_create_type_id(&type_bytes(1));
         assert_eq!(id, 0);
         assert!(!cached);
     }

@@ -27,6 +27,20 @@ pub(crate) fn test_imported_type_promising_compat() {
     assert_manual::<ManualPromisingCompatType>();
 }
 
+pub(crate) fn test_generic_import_erases_promise_method_shape() {
+    #[wasm_bindgen]
+    extern "C" {
+        type CompatPromise<T = JsValue>;
+
+        #[allow(dead_code)]
+        #[wasm_bindgen(method, js_name = then)]
+        fn compat_then_map<'a, T, R: Promising>(
+            this: &CompatPromise<T>,
+            cb: &wasm_bindgen::ScopedClosure<'a, dyn FnMut(T) -> Result<R, JsError>>,
+        ) -> CompatPromise<R::Resolution>;
+    }
+}
+
 pub(crate) fn test_convert_traits_are_marker_bounds() {
     fn assert_into<T: IntoWasmAbi>() {}
     fn assert_from<T: FromWasmAbi>() {}
@@ -92,6 +106,31 @@ pub(crate) fn test_jsvalue_abi_ref_preserves_heap_ref() {
     let abi = owned.into_abi();
     let decoded = unsafe { JsValue::from_abi(abi) };
     assert_eq!(api_abi_read_label(&decoded), 314);
+}
+
+pub(crate) fn test_u64_try_from_bigint_preserves_range() {
+    #[wasm_bindgen(inline_js = r#"
+        export function api_u64_max_bigint() {
+            return (1n << 64n) - 1n;
+        }
+
+        export function api_u64_negative_bigint() {
+            return -1n;
+        }
+
+        export function api_u64_too_large_bigint() {
+            return 1n << 64n;
+        }
+    "#)]
+    extern "C" {
+        fn api_u64_max_bigint() -> JsValue;
+        fn api_u64_negative_bigint() -> JsValue;
+        fn api_u64_too_large_bigint() -> JsValue;
+    }
+
+    assert_eq!(u64::try_from(api_u64_max_bigint()).unwrap(), u64::MAX);
+    assert!(u64::try_from(api_u64_negative_bigint()).is_err());
+    assert!(u64::try_from(api_u64_too_large_bigint()).is_err());
 }
 
 pub(crate) fn test_u128_try_from_bigint_preserves_range() {
@@ -163,6 +202,52 @@ pub(crate) fn test_i128_try_from_bigint_preserves_full_width() {
     assert_eq!(i128::try_from(api_i128_min_bigint()).unwrap(), i128::MIN);
     assert!(i128::try_from(api_i128_too_large_bigint()).is_err());
     assert!(i128::try_from(api_i128_too_negative_bigint()).is_err());
+}
+
+pub(crate) fn test_i64_try_from_bigint_preserves_precision_above_f64() {
+    #[wasm_bindgen(inline_js = r#"
+        export function api_i64_2_pow_53_plus_one() {
+            return (1n << 53n) + 1n;
+        }
+
+        export function api_i64_max_bigint() {
+            return (1n << 63n) - 1n;
+        }
+
+        export function api_i64_min_bigint() {
+            return -(1n << 63n);
+        }
+
+        export function api_i64_large_negative_bigint() {
+            return -((1n << 53n) + 1n);
+        }
+    "#)]
+    extern "C" {
+        fn api_i64_2_pow_53_plus_one() -> JsValue;
+        fn api_i64_max_bigint() -> JsValue;
+        fn api_i64_min_bigint() -> JsValue;
+        fn api_i64_large_negative_bigint() -> JsValue;
+    }
+
+    // 2^53 + 1 is the smallest integer an `f64` cannot represent. The old
+    // `Number(BigInt.asIntN(64, x))` path silently rounded it down to 2^53;
+    // encoding the bigint directly preserves every bit.
+    assert_eq!(
+        <i64 as TryFromJsValue>::try_from_js_value(api_i64_2_pow_53_plus_one()).unwrap(),
+        (1_i64 << 53) + 1
+    );
+    assert_eq!(
+        <i64 as TryFromJsValue>::try_from_js_value(api_i64_max_bigint()).unwrap(),
+        i64::MAX
+    );
+    assert_eq!(
+        <i64 as TryFromJsValue>::try_from_js_value(api_i64_min_bigint()).unwrap(),
+        i64::MIN
+    );
+    assert_eq!(
+        <i64 as TryFromJsValue>::try_from_js_value(api_i64_large_negative_bigint()).unwrap(),
+        -((1_i64 << 53) + 1)
+    );
 }
 
 pub(crate) fn test_try_from_js_value_signed_numbers_preserve_negative_values() {

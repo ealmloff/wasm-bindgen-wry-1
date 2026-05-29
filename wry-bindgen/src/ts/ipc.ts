@@ -190,7 +190,10 @@ function handleBinaryResponse(
     window.jsHeap.pushBorrowFrame();
 
     // The borrow frame and reservation scope are popped in `finally` so a throw
-    // inside the op loop cannot leave either stack desynced.
+    // inside the op loop cannot leave either stack desynced. On the error path
+    // the reservation scope is popped without its fill-count check, so this
+    // cleanup never throws over and masks the original (e.g. decode) error.
+    let succeeded = false;
     try {
       while (decoder.hasMoreU32()) {
         const fnId = decoder.takeU32();
@@ -221,9 +224,10 @@ function handleBinaryResponse(
           typeInfo.returnType.encode(encoder, result);
         }
       }
+      succeeded = true;
     } finally {
       window.jsHeap.popBorrowFrame();
-      window.jsHeap.popReservationScope();
+      window.jsHeap.popReservationScope(succeeded);
     }
 
     const nextResponse = sync_request_binary(

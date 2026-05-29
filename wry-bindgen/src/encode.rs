@@ -659,7 +659,7 @@ macro_rules! slice_encode_via_copy {
 }
 
 slice_encode_via_copy!(
-    bool, u8, u16, u32, u64, i8, i16, i32, i64, f32, f64, usize, isize
+    bool, char, u8, u16, u32, u64, i8, i16, i32, i64, f32, f64, usize, isize
 );
 
 impl<T: crate::convert::JsGeneric> BinaryEncode for &T {
@@ -710,15 +710,18 @@ impl<T: ?Sized> EncodeTypeDef for crate::ScopedClosure<'_, T> {
 /// Usage: decode_args!(decoder; [type1, type2, ...] => body)
 /// The body can use the type names as variables containing the decoded arguments.
 macro_rules! decode_args {
-    // Main entry: decode each arg and call body
+    // Main entry: decode each arg and call body. A decode failure propagates as
+    // `Err` from the enclosing callback closure (which returns
+    // `Result<(), DecodeError>`) instead of panicking via `unwrap`.
     ($decoder:expr; [$first:ident, $($ty:ident,)*] => $body:expr) => {{
         #[allow(non_snake_case)]
-        let $first = <$first as BinaryDecode>::decode($decoder).unwrap();
+        let $first = <$first as BinaryDecode>::decode($decoder)?;
         decode_args!($decoder; [$($ty,)*] => $body);
     }};
-    // Nothing to decode, just execute body
+    // Nothing left to decode: run the body, then signal success to the closure.
     ($decoder:expr; [] => $body:expr) => {{
-        $body
+        $body;
+        return Ok(());
     }};
 }
 
@@ -1101,9 +1104,10 @@ macro_rules! impl_closure_ref_binary_encode {
                             core::mem::transmute((data_ptr, vtable_ptr))
                         };
                         let f: &mut dyn FnMut($($arg),*) -> R = unsafe { &mut *ptr };
-                        $(let $arg = <$arg as BinaryDecode>::decode(decoder).unwrap();)*
+                        $(let $arg = <$arg as BinaryDecode>::decode(decoder)?;)*
                         let result = f($($arg),*);
                         result.encode(encoder);
+                        Ok(())
                     },
                 );
                 let handle = crate::object_store::insert_object(callback);
@@ -1137,9 +1141,10 @@ macro_rules! impl_closure_ref_binary_encode {
                             core::mem::transmute((data_ptr, vtable_ptr))
                         };
                         let f: &dyn Fn($($arg),*) -> R = unsafe { &*ptr };
-                        $(let $arg = <$arg as BinaryDecode>::decode(decoder).unwrap();)*
+                        $(let $arg = <$arg as BinaryDecode>::decode(decoder)?;)*
                         let result = f($($arg),*);
                         result.encode(encoder);
+                        Ok(())
                     },
                 );
                 let handle = crate::object_store::insert_object(callback);
@@ -1266,10 +1271,11 @@ macro_rules! impl_fnmut_stub_ref {
             fn into_js_closure(mut boxed: Box<Self>) -> crate::Closure<Self> {
                 crate::Closure::wrap_encode_decode_mut::<fn(&$first, $($rest),*) -> R>(
                     move |decoder: &mut DecodedData, encoder: &mut EncodedData| {
-                        let anchor = <$first as RefFromBinaryDecode>::ref_decode(decoder).unwrap();
-                        $(let $rest = <$rest as BinaryDecode>::decode(decoder).unwrap();)*
+                        let anchor = <$first as RefFromBinaryDecode>::ref_decode(decoder)?;
+                        $(let $rest = <$rest as BinaryDecode>::decode(decoder)?;)*
                         let result = boxed(&*anchor, $($rest),*);
                         result.encode(encoder);
+                        Ok(())
                     },
                 )
             }
@@ -1300,10 +1306,11 @@ macro_rules! impl_fnmut_stub_ref {
             fn into_js_closure(boxed: Box<Self>) -> crate::Closure<Self> {
                 crate::Closure::wrap_encode_decode::<fn(&$first, $($rest),*) -> R>(
                     move |decoder: &mut DecodedData, encoder: &mut EncodedData| {
-                        let anchor = <$first as RefFromBinaryDecode>::ref_decode(decoder).unwrap();
-                        $(let $rest = <$rest as BinaryDecode>::decode(decoder).unwrap();)*
+                        let anchor = <$first as RefFromBinaryDecode>::ref_decode(decoder)?;
+                        $(let $rest = <$rest as BinaryDecode>::decode(decoder)?;)*
                         let result = boxed(&*anchor, $($rest),*);
                         result.encode(encoder);
+                        Ok(())
                     },
                 )
             }
@@ -1332,10 +1339,11 @@ macro_rules! impl_fnmut_stub_ref {
             fn into_closure(mut self) -> crate::Closure<dyn FnMut(&$first, $($rest),*) -> R> {
                 crate::Closure::wrap_encode_decode_mut::<fn(&$first, $($rest),*) -> R>(
                     move |decoder: &mut DecodedData, encoder: &mut EncodedData| {
-                        let anchor = <$first as RefFromBinaryDecode>::ref_decode(decoder).unwrap();
-                        $(let $rest = <$rest as BinaryDecode>::decode(decoder).unwrap();)*
+                        let anchor = <$first as RefFromBinaryDecode>::ref_decode(decoder)?;
+                        $(let $rest = <$rest as BinaryDecode>::decode(decoder)?;)*
                         let result = self(&*anchor, $($rest),*);
                         result.encode(encoder);
+                        Ok(())
                     },
                 )
             }
@@ -1353,10 +1361,11 @@ macro_rules! impl_fnmut_stub_ref {
             fn into_closure(self) -> crate::Closure<dyn Fn(&$first, $($rest),*) -> R> {
                 crate::Closure::wrap_encode_decode::<fn(&$first, $($rest),*) -> R>(
                     move |decoder: &mut DecodedData, encoder: &mut EncodedData| {
-                        let anchor = <$first as RefFromBinaryDecode>::ref_decode(decoder).unwrap();
-                        $(let $rest = <$rest as BinaryDecode>::decode(decoder).unwrap();)*
+                        let anchor = <$first as RefFromBinaryDecode>::ref_decode(decoder)?;
+                        $(let $rest = <$rest as BinaryDecode>::decode(decoder)?;)*
                         let result = self(&*anchor, $($rest),*);
                         result.encode(encoder);
+                        Ok(())
                     },
                 )
             }
@@ -1500,10 +1509,11 @@ macro_rules! impl_fn_once_ref {
                 crate::Closure::wrap_once_encode_decode_mut::<fn(&$first, $($rest),*) -> R>(
                     move |decoder: &mut DecodedData, encoder: &mut EncodedData| {
                         let f = me.take().expect("FnOnce closure called more than once");
-                        let anchor = <$first as RefFromBinaryDecode>::ref_decode(decoder).unwrap();
-                        $(let $rest = <$rest as BinaryDecode>::decode(decoder).unwrap();)*
+                        let anchor = <$first as RefFromBinaryDecode>::ref_decode(decoder)?;
+                        $(let $rest = <$rest as BinaryDecode>::decode(decoder)?;)*
                         let result = f(&*anchor, $($rest),*);
                         result.encode(encoder);
+                        Ok(())
                     },
                 )
             }

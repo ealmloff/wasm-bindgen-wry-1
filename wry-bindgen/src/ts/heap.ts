@@ -167,9 +167,13 @@ class JSHeap {
     }
   }
 
-  popReservationScope(): void {
+  // Pop the current reservation scope. `validate` defaults to true and asserts
+  // every reserved slot was filled. Callers pass false when the op loop aborted
+  // early (e.g. a decode error) so this cleanup does not throw over and mask the
+  // original error; the stack is still popped to stay balanced.
+  popReservationScope(validate = true): void {
     const scope = this.reservationStack.pop();
-    if (scope && scope.nextIndex !== scope.ids.length) {
+    if (validate && scope && scope.nextIndex !== scope.ids.length) {
       throw new Error(
         `Only filled ${scope.nextIndex} of ${scope.ids.length} reserved heap slots`
       );

@@ -13,6 +13,7 @@ use core::marker::PhantomData;
 
 use crate::batch::{force_flush, run_js_sync, with_runtime};
 use crate::encode::{BatchableResult, BinaryEncode, EncodeTypeDef, TYPE_CACHED, TYPE_FULL};
+use crate::ipc::DecodeError;
 use crate::ipc::DecodedData;
 use crate::ipc::EncodedData;
 
@@ -35,7 +36,7 @@ fn encode_function_types(encoder: &mut EncodedData, encode_types: impl FnOnce(&m
     encode_types(&mut type_buf);
 
     with_runtime(|state| {
-        let (id, can_use_cached) = state.get_or_create_type_id(type_buf.clone());
+        let (id, can_use_cached) = state.get_or_create_type_id(&type_buf);
         if can_use_cached {
             encoder.push_u8(TYPE_CACHED);
             encoder.push_u32(id);
@@ -147,20 +148,26 @@ impl_js_function_call!(32, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6,
 /// Always stores as `Rc<dyn Fn(...)>` for uniform handling.
 /// - For `Fn` closures: stored directly, supports reentrant calls
 /// - For `FnMut` closures: wrapped in RefCell internally, panics on reentrant calls
+type CallbackFn = dyn Fn(&mut DecodedData, &mut EncodedData) -> Result<(), DecodeError>;
+
 pub(crate) struct RustCallback {
-    f: alloc::rc::Rc<dyn Fn(&mut DecodedData, &mut EncodedData)>,
+    f: alloc::rc::Rc<CallbackFn>,
 }
 
 impl RustCallback {
-    /// Create a callback from an `Fn` closure (supports reentrant calls)
+    /// Create a callback from an `Fn` closure (supports reentrant calls).
+    ///
+    /// The closure returns `Err` if an argument from JS fails to decode; the
+    /// caller surfaces that instead of letting an `unwrap` panic propagate.
     pub fn new_fn<F>(f: F) -> Self
     where
-        F: Fn(&mut DecodedData, &mut EncodedData) + 'static,
+        F: Fn(&mut DecodedData, &mut EncodedData) -> Result<(), DecodeError> + 'static,
     {
         Self {
             f: alloc::rc::Rc::new(move |data: &mut DecodedData, encoder: &mut EncodedData| {
-                f(data, encoder);
+                let result = f(data, encoder);
                 force_flush();
+                result
             }),
         }
     }
@@ -168,23 +175,24 @@ impl RustCallback {
     /// Create a callback from an `FnMut` closure (panics on reentrant calls)
     pub fn new_fn_mut<F>(f: F) -> Self
     where
-        F: FnMut(&mut DecodedData, &mut EncodedData) + 'static,
+        F: FnMut(&mut DecodedData, &mut EncodedData) -> Result<(), DecodeError> + 'static,
     {
         // Wrap the FnMut in a RefCell, then create an Fn wrapper
         let cell = RefCell::new(f);
         Self {
             f: alloc::rc::Rc::new(move |data: &mut DecodedData, encoder: &mut EncodedData| {
-                {
+                let result = {
                     let mut f = cell.borrow_mut();
-                    f(data, encoder);
-                }
+                    f(data, encoder)
+                };
                 force_flush();
+                result
             }),
         }
     }
 
     /// Get a cloned Rc to the callback
-    pub fn clone_rc(&self) -> alloc::rc::Rc<dyn Fn(&mut DecodedData, &mut EncodedData)> {
+    pub fn clone_rc(&self) -> alloc::rc::Rc<CallbackFn> {
         self.f.clone()
     }
 }

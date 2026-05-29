@@ -5,6 +5,25 @@ use alloc::vec::Vec;
 
 use crate::value::{JSIDX_OFFSET, JSIDX_RESERVED};
 
+/// An integer usable as a slab ID. Implemented for the widths the slab is
+/// instantiated at (`u64` for heap IDs, `u32` for object handles).
+pub(crate) trait SlabId: Ord + Copy + core::fmt::Display {
+    /// The next ID after `self`, or `None` if the ID space is exhausted.
+    fn next(self) -> Option<Self>;
+}
+
+impl SlabId for u32 {
+    fn next(self) -> Option<Self> {
+        self.checked_add(1)
+    }
+}
+
+impl SlabId for u64 {
+    fn next(self) -> Option<Self> {
+        self.checked_add(1)
+    }
+}
+
 /// A small ID-only slab.
 ///
 /// IDs move through three states:
@@ -14,14 +33,14 @@ use crate::value::{JSIDX_OFFSET, JSIDX_RESERVED};
 ///
 /// Keeping `release` and `recycle` separate lets callers delay reuse until the
 /// remote side has completed any required cleanup.
-struct IdSlab {
-    live_ids: BTreeSet<u64>,
-    free_ids: BTreeSet<u64>,
-    next_id: u64,
+pub(crate) struct IdSlab<T: SlabId> {
+    live_ids: BTreeSet<T>,
+    free_ids: BTreeSet<T>,
+    next_id: T,
 }
 
-impl IdSlab {
-    fn new(first_id: u64) -> Self {
+impl<T: SlabId> IdSlab<T> {
+    pub(crate) fn new(first_id: T) -> Self {
         Self {
             live_ids: BTreeSet::new(),
             free_ids: BTreeSet::new(),
@@ -29,7 +48,7 @@ impl IdSlab {
         }
     }
 
-    fn alloc(&mut self) -> u64 {
+    pub(crate) fn alloc(&mut self) -> T {
         if let Some(id) = self.free_ids.iter().next().copied() {
             self.free_ids.remove(&id);
             self.mark_live(id);
@@ -37,27 +56,27 @@ impl IdSlab {
         }
 
         let id = self.next_id;
-        self.next_id = self.next_id.checked_add(1).expect("u64 ID space exhausted");
+        self.next_id = self.next_id.next().expect("ID space exhausted");
         self.mark_live(id);
         id
     }
 
-    fn reserve_exact(&mut self, id: u64) {
+    fn reserve_exact(&mut self, id: T) {
         self.free_ids.remove(&id);
         if id >= self.next_id {
-            self.next_id = id.checked_add(1).expect("u64 ID space exhausted");
+            self.next_id = id.next().expect("ID space exhausted");
         }
         self.mark_live(id);
     }
 
-    fn release(&mut self, id: u64) {
+    fn release(&mut self, id: T) {
         assert!(
             self.live_ids.remove(&id),
             "Attempted to release ID {id}, but it is not live"
         );
     }
 
-    fn recycle(&mut self, id: u64) {
+    fn recycle(&mut self, id: T) {
         assert!(
             !self.live_ids.contains(&id),
             "Attempted to recycle ID {id}, but it is still live"
@@ -66,7 +85,7 @@ impl IdSlab {
         self.free_ids.insert(id);
     }
 
-    fn recycle_if_released(&mut self, id: u64) -> bool {
+    fn recycle_if_released(&mut self, id: T) -> bool {
         if self.live_ids.contains(&id) {
             return false;
         }
@@ -75,17 +94,25 @@ impl IdSlab {
         true
     }
 
-    #[cfg(test)]
-    fn contains(&self, id: u64) -> bool {
+    /// Release and immediately recycle an ID. Used for IDs with no remote
+    /// cleanup to wait on (e.g. Rust-owned object handles), which can be reused
+    /// as soon as they are freed.
+    pub(crate) fn free(&mut self, id: T) {
+        self.release(id);
+        self.recycle(id);
+    }
+
+    /// Whether `id` is currently allocated (live).
+    pub(crate) fn contains(&self, id: T) -> bool {
         self.live_ids.contains(&id)
     }
 
     #[cfg(test)]
-    fn is_reusable(&self, id: u64) -> bool {
+    fn is_reusable(&self, id: T) -> bool {
         self.free_ids.contains(&id)
     }
 
-    fn mark_live(&mut self, id: u64) {
+    fn mark_live(&mut self, id: T) {
         assert!(self.live_ids.insert(id), "ID {id} is already live");
     }
 }
@@ -95,7 +122,7 @@ impl IdSlab {
 pub(crate) type InstallIdBatch = Vec<u64>;
 
 pub(crate) struct HeapIds {
-    slab: IdSlab,
+    slab: IdSlab<u64>,
     /// IDs allocated while decoding the current inbound message, awaiting the
     /// next outbound's install prelude. Every outbound drains this via
     /// `take_pending_install_ids`, and the protocol decodes exactly one inbound
@@ -212,54 +239,6 @@ impl BorrowIds {
         } else {
             panic!("pop_borrow_frame called with empty frame stack");
         }
-    }
-}
-
-pub(crate) struct ObjectHandles {
-    live_handles: BTreeSet<u32>,
-    free_handles: BTreeSet<u32>,
-    next_handle: u32,
-}
-
-impl ObjectHandles {
-    pub(crate) fn new() -> Self {
-        Self {
-            live_handles: BTreeSet::new(),
-            free_handles: BTreeSet::new(),
-            next_handle: 1,
-        }
-    }
-
-    /// Allocate a handle for a Rust-owned exported object.
-    pub(crate) fn next_handle(&mut self) -> u32 {
-        if let Some(handle) = self.free_handles.iter().next().copied() {
-            self.free_handles.remove(&handle);
-            self.mark_live(handle);
-            return handle;
-        }
-
-        let handle = self.next_handle;
-        self.next_handle = self
-            .next_handle
-            .checked_add(1)
-            .expect("u32 object handle space exhausted");
-        self.mark_live(handle);
-        handle
-    }
-
-    pub(crate) fn release_handle(&mut self, handle: u32) {
-        assert!(
-            self.live_handles.remove(&handle),
-            "Attempted to release object handle {handle}, but it is not live"
-        );
-        self.free_handles.insert(handle);
-    }
-
-    fn mark_live(&mut self, handle: u32) {
-        assert!(
-            self.live_handles.insert(handle),
-            "Object handle {handle} is already live"
-        );
     }
 }
 
@@ -399,24 +378,19 @@ mod tests {
 
     #[test]
     fn object_handles_reuse_released_handles() {
-        let mut handles = ObjectHandles::new();
-        let first = handles.next_handle();
-        let second = handles.next_handle();
+        let mut handles = IdSlab::new(1_u32);
+        let first = handles.alloc();
+        let second = handles.alloc();
         assert_eq!(first, 1);
-        handles.release_handle(first);
-        assert_eq!(handles.next_handle(), first);
+        handles.free(first);
+        assert_eq!(handles.alloc(), first);
         assert_eq!(second, first + 1);
     }
 
     #[test]
-    #[should_panic(expected = "u32 object handle space exhausted")]
+    #[should_panic(expected = "ID space exhausted")]
     fn object_handles_panic_on_overflow() {
-        let mut handles = ObjectHandles {
-            live_handles: BTreeSet::new(),
-            free_handles: BTreeSet::new(),
-            next_handle: u32::MAX,
-        };
-
-        handles.next_handle();
+        let mut handles = IdSlab::new(u32::MAX);
+        handles.alloc();
     }
 }

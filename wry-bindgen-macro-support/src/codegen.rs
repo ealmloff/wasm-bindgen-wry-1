@@ -645,9 +645,38 @@ fn generate_function(
     // For non-async functions, generate a simple closure that returns a constant string
     let js_code_str = generate_js_code(func, vendor_prefixes, prefix, false);
 
+    let erase = GenericEraseContext::new(func);
+    let call_ret_type = match &func.ret {
+        Some(ty) if erase.type_uses_erased_params(ty) => {
+            let concrete_ty = erase.concrete_type(ty, krate);
+            quote_spanned! {span=> #concrete_ty }
+        }
+        Some(_) => ret_type.clone(),
+        None => quote_spanned! {span=> () },
+    };
+
     // Generate the function body
-    let func_body = quote_spanned! {span=>
-        #krate::__wry_call_js_function!(#js_code_str, fn(#(#fn_types),*) -> #ret_type, (#(#call_values),*))
+    let func_body = if func
+        .ret
+        .as_ref()
+        .is_some_and(|ty| erase.type_uses_erased_params(ty))
+    {
+        quote_spanned! {span=>
+            let __wry_ret = #krate::__wry_call_js_function!(
+                #js_code_str,
+                fn(#(#fn_types),*) -> #call_ret_type,
+                (#(#call_values),*)
+            );
+            unsafe {
+                ::core::mem::transmute_copy(
+                    &::core::mem::ManuallyDrop::new(__wry_ret)
+                )
+            }
+        }
+    } else {
+        quote_spanned! {span=>
+            #krate::__wry_call_js_function!(#js_code_str, fn(#(#fn_types),*) -> #call_ret_type, (#(#call_values),*))
+        }
     };
 
     // Get the rust attributes to forward (like #[cfg(...)] and #[doc = "..."])
@@ -1126,10 +1155,49 @@ fn async_promise_attach_js_code(js_code: &str) -> String {
 struct GeneratedArgs {
     /// Function parameter declarations: `arg1: T1, arg2: T2`
     fn_params: TokenStream,
-    /// Individual fn pointer type tokens (e.g. `&self.obj` slot type then `T1, T2`).
+    /// Individual JS call fn pointer type tokens, with function generics erased.
     fn_type_list: Vec<TokenStream>,
-    /// Individual values to pass to call (e.g. `&self.obj, arg1, arg2`).
+    /// Individual values to pass to the JS call, transmuted to erased types when needed.
     call_value_list: Vec<TokenStream>,
+}
+
+struct GenericEraseContext {
+    type_params: HashMap<String, Option<syn::Type>>,
+    lifetimes: HashSet<String>,
+}
+
+impl GenericEraseContext {
+    fn new(func: &ImportFunction) -> Self {
+        Self {
+            type_params: func
+                .generics
+                .type_params()
+                .map(|param| (param.ident.to_string(), param.default.clone()))
+                .collect(),
+            lifetimes: func
+                .generics
+                .lifetimes()
+                .map(|param| param.lifetime.ident.to_string())
+                .collect(),
+        }
+    }
+
+    fn type_uses_erased_params(&self, ty: &syn::Type) -> bool {
+        let known_type_params = self.type_params.keys().cloned().collect();
+        let mut found_type_params = HashSet::new();
+        collect_type_params(ty, &known_type_params, &mut found_type_params);
+
+        let mut found_lifetimes = HashSet::new();
+        collect_lifetime_params(ty, &self.lifetimes, &mut found_lifetimes);
+
+        !found_type_params.is_empty() || !found_lifetimes.is_empty()
+    }
+
+    fn concrete_type(&self, ty: &syn::Type, krate: &TokenStream) -> syn::Type {
+        let mut ty = ty.clone();
+        erase_type_params(&mut ty, self, krate);
+        ty
+    }
 }
 
 /// Generate argument lists
@@ -1138,6 +1206,7 @@ fn generate_args(func: &ImportFunction, krate: &TokenStream) -> syn::Result<Gene
     let mut fn_types = Vec::new();
     let mut call_values = Vec::new();
     let span = func.rust_name.span();
+    let erase = GenericEraseContext::new(func);
 
     // For methods, add self as first call arg (but not as fn param since we use &self)
     match &func.kind {
@@ -1158,8 +1227,20 @@ fn generate_args(func: &ImportFunction, krate: &TokenStream) -> syn::Result<Gene
         let name = &arg.name;
         let ty = &arg.ty;
         fn_params.push(quote_spanned! {span=> #name: #ty });
-        fn_types.push(quote_spanned! {span=> #ty });
-        call_values.push(quote_spanned! {span=> #name });
+        if erase.type_uses_erased_params(ty) {
+            let concrete_ty = erase.concrete_type(ty, krate);
+            fn_types.push(quote_spanned! {span=> #concrete_ty });
+            call_values.push(quote_spanned! {span=>
+                unsafe {
+                    ::core::mem::transmute_copy(
+                        &::core::mem::ManuallyDrop::new(#name)
+                    )
+                }
+            });
+        } else {
+            fn_types.push(quote_spanned! {span=> #ty });
+            call_values.push(quote_spanned! {span=> #name });
+        }
     }
 
     let fn_params_tokens = if fn_params.is_empty() {
@@ -1207,6 +1288,7 @@ fn add_js_call_bounds_to_generics(
     krate: &TokenStream,
     include_ret: bool,
 ) {
+    let erase = GenericEraseContext::new(func);
     let known_type_params: std::collections::HashSet<String> = func
         .generics
         .type_params()
@@ -1214,23 +1296,30 @@ fn add_js_call_bounds_to_generics(
         .collect();
 
     for arg in &func.arguments {
+        if erase.type_uses_erased_params(&arg.ty) {
+            let concrete_ty = erase.concrete_type(&arg.ty, krate);
+            push_erasure_bound(generics, &arg.ty, &concrete_ty, krate, false);
+        }
         if type_uses_type_params(&arg.ty, &known_type_params) {
             push_arg_type_bounds(generics, &arg.ty, krate);
         }
     }
 
-    if include_ret
-        && let Some(ret) = &func.ret
-        && type_uses_type_params(ret, &known_type_params)
-    {
-        push_type_bound(
-            generics,
-            ret,
-            &[
-                quote! { #krate::EncodeTypeDef },
-                quote! { #krate::BatchableResult },
-            ],
-        );
+    if include_ret && let Some(ret) = &func.ret {
+        if erase.type_uses_erased_params(ret) {
+            let concrete_ty = erase.concrete_type(ret, krate);
+            push_erasure_bound(generics, ret, &concrete_ty, krate, true);
+        }
+        if type_uses_type_params(ret, &known_type_params) {
+            push_type_bound(
+                generics,
+                ret,
+                &[
+                    quote! { #krate::EncodeTypeDef },
+                    quote! { #krate::BatchableResult },
+                ],
+            );
+        }
     }
 }
 
@@ -1281,6 +1370,36 @@ fn push_arg_type_bounds(generics: &mut syn::Generics, ty: &syn::Type, krate: &To
             );
         }
     }
+}
+
+fn push_erasure_bound(
+    generics: &mut syn::Generics,
+    ty: &syn::Type,
+    concrete_ty: &syn::Type,
+    krate: &TokenStream,
+    owned: bool,
+) {
+    let predicate = if !owned
+        && let syn::Type::Reference(reference) = ty
+        && let syn::Type::Reference(concrete_reference) = concrete_ty
+    {
+        let elem = &reference.elem;
+        let concrete_elem = &concrete_reference.elem;
+        if reference.mutability.is_some() {
+            syn::parse_quote! {
+                #elem: #krate::__rt::marker::ErasableGenericBorrowMut<#concrete_elem>
+            }
+        } else {
+            syn::parse_quote! {
+                #elem: #krate::__rt::marker::ErasableGenericBorrow<#concrete_elem>
+            }
+        }
+    } else {
+        syn::parse_quote! {
+            #ty: #krate::__rt::marker::ErasableGenericOwn<#concrete_ty>
+        }
+    };
+    generics.make_where_clause().predicates.push(predicate);
 }
 
 fn path_is_scoped_closure(path: &syn::TypePath) -> bool {
@@ -1445,6 +1564,267 @@ fn collect_type_params(
         syn::Type::Slice(slice) => collect_type_params(&slice.elem, known, found),
         syn::Type::Array(array) => collect_type_params(&array.elem, known, found),
         syn::Type::Ptr(ptr) => collect_type_params(&ptr.elem, known, found),
+        _ => {}
+    }
+}
+
+fn erase_type_params(ty: &mut syn::Type, context: &GenericEraseContext, krate: &TokenStream) {
+    match ty {
+        syn::Type::Reference(reference) => {
+            if let Some(lifetime) = &mut reference.lifetime
+                && context.lifetimes.contains(&lifetime.ident.to_string())
+            {
+                *lifetime = syn::Lifetime::new("'static", lifetime.span());
+            }
+            erase_type_params(&mut reference.elem, context, krate);
+        }
+        syn::Type::Path(path) => {
+            if let Some(qself) = &mut path.qself {
+                erase_type_params(&mut qself.ty, context, krate);
+            }
+
+            if path.qself.is_none()
+                && let Some(first_segment) = path.path.segments.first()
+            {
+                let ident = first_segment.ident.to_string();
+                if let Some(default) = context.type_params.get(&ident) {
+                    if let Some(default) = default {
+                        if path.path.segments.len() == 1 {
+                            *ty = default.clone();
+                            erase_type_params(ty, context, krate);
+                            return;
+                        }
+                        if let syn::Type::Path(default_path) = default {
+                            let remaining: Vec<_> =
+                                path.path.segments.iter().skip(1).cloned().collect();
+                            path.path.segments = default_path.path.segments.clone();
+                            path.path.segments.extend(remaining);
+                        } else {
+                            *ty = default.clone();
+                            erase_type_params(ty, context, krate);
+                            return;
+                        }
+                    } else {
+                        *ty = syn::parse_quote!(#krate::JsValue);
+                        return;
+                    }
+                }
+            }
+
+            if let syn::Type::Path(path) = ty {
+                for segment in &mut path.path.segments {
+                    erase_path_arguments(&mut segment.arguments, context, krate);
+                }
+            }
+        }
+        syn::Type::TraitObject(trait_object) => {
+            for bound in &mut trait_object.bounds {
+                erase_type_param_bound(bound, context, krate);
+            }
+        }
+        syn::Type::BareFn(function) => {
+            if let Some(lifetimes) = &mut function.lifetimes {
+                for param in &mut lifetimes.lifetimes {
+                    if let syn::GenericParam::Lifetime(param) = param
+                        && context
+                            .lifetimes
+                            .contains(&param.lifetime.ident.to_string())
+                    {
+                        param.lifetime = syn::Lifetime::new("'static", param.lifetime.span());
+                    }
+                }
+            }
+            for input in &mut function.inputs {
+                erase_type_params(&mut input.ty, context, krate);
+            }
+            if let syn::ReturnType::Type(_, output) = &mut function.output {
+                erase_type_params(output, context, krate);
+            }
+        }
+        syn::Type::Tuple(tuple) => {
+            for elem in &mut tuple.elems {
+                erase_type_params(elem, context, krate);
+            }
+        }
+        syn::Type::Paren(paren) => erase_type_params(&mut paren.elem, context, krate),
+        syn::Type::Group(group) => erase_type_params(&mut group.elem, context, krate),
+        syn::Type::Slice(slice) => erase_type_params(&mut slice.elem, context, krate),
+        syn::Type::Array(array) => erase_type_params(&mut array.elem, context, krate),
+        syn::Type::Ptr(ptr) => erase_type_params(&mut ptr.elem, context, krate),
+        _ => {}
+    }
+}
+
+fn erase_path_arguments(
+    arguments: &mut syn::PathArguments,
+    context: &GenericEraseContext,
+    krate: &TokenStream,
+) {
+    match arguments {
+        syn::PathArguments::AngleBracketed(args) => {
+            for arg in &mut args.args {
+                match arg {
+                    syn::GenericArgument::Lifetime(lifetime) => {
+                        if context.lifetimes.contains(&lifetime.ident.to_string()) {
+                            *lifetime = syn::Lifetime::new("'static", lifetime.span());
+                        }
+                    }
+                    syn::GenericArgument::Type(ty) => erase_type_params(ty, context, krate),
+                    syn::GenericArgument::AssocType(assoc) => {
+                        erase_type_params(&mut assoc.ty, context, krate);
+                    }
+                    syn::GenericArgument::Constraint(constraint) => {
+                        for bound in &mut constraint.bounds {
+                            erase_type_param_bound(bound, context, krate);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        syn::PathArguments::Parenthesized(args) => {
+            for input in &mut args.inputs {
+                erase_type_params(input, context, krate);
+            }
+            if let syn::ReturnType::Type(_, output) = &mut args.output {
+                erase_type_params(output, context, krate);
+            }
+        }
+        syn::PathArguments::None => {}
+    }
+}
+
+fn erase_type_param_bound(
+    bound: &mut syn::TypeParamBound,
+    context: &GenericEraseContext,
+    krate: &TokenStream,
+) {
+    match bound {
+        syn::TypeParamBound::Lifetime(lifetime) => {
+            if context.lifetimes.contains(&lifetime.ident.to_string()) {
+                *lifetime = syn::Lifetime::new("'static", lifetime.span());
+            }
+        }
+        syn::TypeParamBound::Trait(trait_bound) => {
+            for segment in &mut trait_bound.path.segments {
+                erase_path_arguments(&mut segment.arguments, context, krate);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_lifetime_params(ty: &syn::Type, known: &HashSet<String>, found: &mut HashSet<String>) {
+    match ty {
+        syn::Type::Reference(reference) => {
+            if let Some(lifetime) = &reference.lifetime
+                && known.contains(&lifetime.ident.to_string())
+            {
+                found.insert(lifetime.ident.to_string());
+            }
+            collect_lifetime_params(&reference.elem, known, found);
+        }
+        syn::Type::Path(path) => {
+            if let Some(qself) = &path.qself {
+                collect_lifetime_params(&qself.ty, known, found);
+            }
+            for segment in &path.path.segments {
+                collect_lifetime_params_from_path_arguments(&segment.arguments, known, found);
+            }
+        }
+        syn::Type::TraitObject(trait_object) => {
+            for bound in &trait_object.bounds {
+                collect_lifetime_params_from_bound(bound, known, found);
+            }
+        }
+        syn::Type::BareFn(function) => {
+            if let Some(lifetimes) = &function.lifetimes {
+                for param in &lifetimes.lifetimes {
+                    if let syn::GenericParam::Lifetime(param) = param
+                        && known.contains(&param.lifetime.ident.to_string())
+                    {
+                        found.insert(param.lifetime.ident.to_string());
+                    }
+                }
+            }
+            for input in &function.inputs {
+                collect_lifetime_params(&input.ty, known, found);
+            }
+            if let syn::ReturnType::Type(_, output) = &function.output {
+                collect_lifetime_params(output, known, found);
+            }
+        }
+        syn::Type::Tuple(tuple) => {
+            for elem in &tuple.elems {
+                collect_lifetime_params(elem, known, found);
+            }
+        }
+        syn::Type::Paren(paren) => collect_lifetime_params(&paren.elem, known, found),
+        syn::Type::Group(group) => collect_lifetime_params(&group.elem, known, found),
+        syn::Type::Slice(slice) => collect_lifetime_params(&slice.elem, known, found),
+        syn::Type::Array(array) => collect_lifetime_params(&array.elem, known, found),
+        syn::Type::Ptr(ptr) => collect_lifetime_params(&ptr.elem, known, found),
+        _ => {}
+    }
+}
+
+fn collect_lifetime_params_from_path_arguments(
+    arguments: &syn::PathArguments,
+    known: &HashSet<String>,
+    found: &mut HashSet<String>,
+) {
+    match arguments {
+        syn::PathArguments::AngleBracketed(args) => {
+            for arg in &args.args {
+                match arg {
+                    syn::GenericArgument::Lifetime(lifetime) => {
+                        if known.contains(&lifetime.ident.to_string()) {
+                            found.insert(lifetime.ident.to_string());
+                        }
+                    }
+                    syn::GenericArgument::Type(ty) => {
+                        collect_lifetime_params(ty, known, found);
+                    }
+                    syn::GenericArgument::AssocType(assoc) => {
+                        collect_lifetime_params(&assoc.ty, known, found);
+                    }
+                    syn::GenericArgument::Constraint(constraint) => {
+                        for bound in &constraint.bounds {
+                            collect_lifetime_params_from_bound(bound, known, found);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        syn::PathArguments::Parenthesized(args) => {
+            for input in &args.inputs {
+                collect_lifetime_params(input, known, found);
+            }
+            if let syn::ReturnType::Type(_, output) = &args.output {
+                collect_lifetime_params(output, known, found);
+            }
+        }
+        syn::PathArguments::None => {}
+    }
+}
+
+fn collect_lifetime_params_from_bound(
+    bound: &syn::TypeParamBound,
+    known: &HashSet<String>,
+    found: &mut HashSet<String>,
+) {
+    match bound {
+        syn::TypeParamBound::Lifetime(lifetime) => {
+            if known.contains(&lifetime.ident.to_string()) {
+                found.insert(lifetime.ident.to_string());
+            }
+        }
+        syn::TypeParamBound::Trait(bound) => {
+            for segment in &bound.path.segments {
+                collect_lifetime_params_from_path_arguments(&segment.arguments, known, found);
+            }
+        }
         _ => {}
     }
 }

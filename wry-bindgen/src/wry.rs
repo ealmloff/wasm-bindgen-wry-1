@@ -177,35 +177,39 @@ impl WebviewMessageLayer {
             return;
         }
 
-        match msg_type {
+        let top_level_responder = match msg_type {
             // New call from JS — park the XHR. Rust will reply via either a
             // Respond (the answer) or an Evaluate (a nested Rust→JS call
             // delivered through the suspended XHR).
             MessageType::Evaluate => {
                 self.current_xhr = Some(responder);
+                None
             }
             // Response from JS closes the most recent Rust Evaluate frame.
             // Nested frames hand the new XHR off as the next wait point;
             // top-level frames have no parent so we close the chain with a
-            // blank response right here.
+            // blank response after Rust has accepted the Respond.
             MessageType::Respond => match self.rust_eval_stack.pop() {
                 Some(RustEvalKind::Nested) => {
                     self.current_xhr = Some(responder);
+                    None
                 }
-                Some(RustEvalKind::TopLevel) => {
-                    responder.respond(blank_response());
-                }
+                Some(RustEvalKind::TopLevel) => Some(responder),
                 None => {
                     responder.respond(error_response());
                     return;
                 }
             },
-        }
+        };
 
-        if !self.sender.start_send(msg) {
-            if let Some(responder) = self.current_xhr.take() {
-                responder.respond(error_response());
+        if self.sender.start_send(msg) {
+            if let Some(responder) = top_level_responder {
+                responder.respond(blank_response());
             }
+        } else if let Some(responder) = top_level_responder {
+            responder.respond(error_response());
+        } else if let Some(responder) = self.current_xhr.take() {
+            responder.respond(error_response());
         }
     }
 
@@ -619,12 +623,15 @@ mod tests {
     use super::*;
     use crate::ipc::EncodedData;
 
-    fn handler_request(message_type: MessageType) -> http::Request<Vec<u8>> {
+    fn ipc_message(message_type: MessageType) -> IPCMessage {
         let mut data = EncodedData::new();
         data.push_u8(message_type as u8);
+        IPCMessage::new(data.to_bytes())
+    }
 
+    fn handler_request(message_type: MessageType) -> http::Request<Vec<u8>> {
         let engine = base64::engine::general_purpose::STANDARD;
-        let body_base64 = engine.encode(data.to_bytes());
+        let body_base64 = engine.encode(ipc_message(message_type).data());
 
         http::Request::builder()
             .uri("wry://index.html/__wbg__/handler")
@@ -643,6 +650,48 @@ mod tests {
         let response = Rc::new(RefCell::new(None));
         let captured_response = response.clone();
         let request = handler_request(MessageType::Evaluate);
+
+        let unhandled = protocol_handler.handle_request(
+            "wry",
+            |_| {},
+            &request,
+            move |response| *captured_response.borrow_mut() = Some(response),
+        );
+
+        assert!(unhandled.is_none());
+        let response = response
+            .borrow_mut()
+            .take()
+            .expect("closed runtime should receive an error response");
+        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn handler_responds_error_when_top_level_respond_arrives_after_runtime_drop() {
+        let bindgen = WryBindgen::new(|_| {});
+        let app_builder = bindgen.app_builder();
+        let webview_id = app_builder.webview_id;
+        let protocol_handler = app_builder.protocol_handler();
+
+        let evaluated_scripts = Rc::new(RefCell::new(Vec::new()));
+        let captured_scripts = evaluated_scripts.clone();
+        let prepared_app = app_builder.build(
+            || async {},
+            move |script| captured_scripts.borrow_mut().push(script.to_string()),
+        );
+
+        bindgen.handle_user_event(WryBindgenEvent::webview_loaded(webview_id));
+        bindgen.handle_user_event(WryBindgenEvent::ipc(
+            webview_id,
+            OutboundIPCMessage::new(ipc_message(MessageType::Evaluate), true),
+        ));
+        assert_eq!(evaluated_scripts.borrow().len(), 1);
+
+        drop(prepared_app);
+
+        let response = Rc::new(RefCell::new(None));
+        let captured_response = response.clone();
+        let request = handler_request(MessageType::Respond);
 
         let unhandled = protocol_handler.handle_request(
             "wry",

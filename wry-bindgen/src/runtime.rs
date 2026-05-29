@@ -206,10 +206,15 @@ fn handle_rust_callback(data: &mut DecodedData) {
             let _frame = BorrowFrameGuard::new();
 
             let mut encoder = respond_encoder();
-            // Call through the cloned Rc (uniform Fn interface)
-            (callback)(data, &mut encoder);
-
-            finish_respond_message(encoder)
+            // Call through the cloned Rc (uniform Fn interface). A decode error
+            // surfaces here with context instead of an opaque `unwrap` panic
+            // inside the callback trampoline (mirrors the export path below).
+            match (callback)(data, &mut encoder) {
+                Ok(()) => finish_respond_message(encoder),
+                Err(err) => {
+                    panic!("Rust callback {key} failed to decode arguments: {err}")
+                }
+            }
         }
         // Drop a native Rust object when JS GC'd the wrapper
         DROP_NATIVE_REF_FN_ID => {

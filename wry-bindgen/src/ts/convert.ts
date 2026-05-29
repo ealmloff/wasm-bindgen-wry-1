@@ -46,8 +46,10 @@ export function bigint_from_str(x: string): bigint {
 export function symbol_new(description: string | null): symbol {
   return Symbol(description ?? undefined);
 }
-export function bigint_get_as_i64(x: any): number | null {
-  return typeof x === "bigint" ? Number(BigInt.asIntN(64, x)) : null;
+export function bigint_get_as_i64(x: any): bigint | null {
+  // Return the bigint itself (not a lossy `Number`) so the i64 encoder can
+  // preserve all 64 bits; `Number(...)` would round magnitudes above 2^53.
+  return typeof x === "bigint" ? BigInt.asIntN(64, x) : null;
 }
 export function bigint_to_string(x: any): string | null {
   return typeof x === "bigint" ? x.toString() : null;
