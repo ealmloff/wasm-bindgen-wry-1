@@ -90,7 +90,7 @@ apply_patches() {
     ((${#patches[@]} > 0)) || die "no patchfiles found in $patch_dir"
 
     git -C "$submodule_dir" reset --hard "$base_commit"
-    git -C "$submodule_dir" am "${patches[@]}"
+    git -C "$submodule_dir" am -3 "${patches[@]}"
 
     printf 'applied %s patches on %s\n' "${#patches[@]}" "$base_commit"
     printf 'wasm-bindgen HEAD is now %s\n' "$(git -C "$submodule_dir" rev-parse HEAD)"
