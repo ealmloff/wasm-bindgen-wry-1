@@ -71,6 +71,13 @@ filter_cosmetic() {
         /from_abi/ { next }
         /::Abi/ { next }
         /::Anchor/ { next }
+        # Option ABI sentinels: OptionIntoWasmAbi::none / OptionFromWasmAbi::is_none.
+        # wry-bindgen models optionality with JsOption instead, so these never match.
+        /none\(\) -> u32$/ { next }
+        /is_none\(js: &u32\) -> bool$/ { next }
+        # WasmAbi word split/join for multi-word primitives (i128/u128) and the generic impl.
+        /::split\(self\) -> \(/ { next }
+        /::join\(.*_: \(\)/ { next }
         { print }
     '
 }
@@ -81,6 +88,16 @@ normalize_api() {
         s/\b(?:wasm_bindgen|crate)::__rt::marker::ErasableGeneric\b/ErasableGeneric/g;
         s/\b(?:wasm_bindgen|crate)::__rt::(RefMut|Ref|WasmWord)\b/$1/g;
         s/^pub unsafe trait wasm_bindgen::ErasableGeneric$/pub use wasm_bindgen::ErasableGeneric/;
+        # `From` conversions: the parameter name and the Self-vs-fully-qualified return
+        # spelling are not part of the API contract (e.g. wasm-bindgen prints
+        # `from(n: f32) -> wasm_bindgen::JsValue` where wry-bindgen prints
+        # `from(val: f32) -> Self`). Canonicalize both so only the argument type matters.
+        if (/::from\(/) {
+            s/::from\(\w+:/::from(_:/;
+            s/-> wasm_bindgen::JsValue$/-> Self/;
+        }
+        # `#[repr(...)]` is an implementation detail, not a semantic API difference here.
+        s/^#\[repr\([^\]]*\)\] //;
     '
 }
 

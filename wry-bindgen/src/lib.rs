@@ -9,7 +9,7 @@
 //!
 //! - [`BinaryEncode`]/[`BinaryDecode`] - Core encoding/decoding traits for Rust types
 //! - [`JSFunction`] - JSFunction type for calling JavaScript functions
-//! - [`batch`] - Batching helper for grouping multiple JS operations
+//! - [`batch()`] - Batching helper for grouping multiple JS operations
 //! - [`wry`] - Event loop and Wry integration
 
 #![no_std]
@@ -19,7 +19,7 @@ pub extern crate alloc;
 #[macro_use]
 extern crate std;
 
-pub mod batch;
+mod batch;
 mod cast;
 mod clamped;
 pub mod closure;
